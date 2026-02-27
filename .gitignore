@@ -1,0 +1,12 @@
+flagged/
+gromacs-env/
+data/
+static/
+__pycache__/
+.vs/
+
+*.log
+*.gro
+*.csv
+*.pdb
+*.html
