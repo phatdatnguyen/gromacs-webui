@@ -9,4 +9,16 @@ __pycache__/
 *.gro
 *.csv
 *.pdb
+*.mol
+*.mol2
+*.xyz
 *.html
+*.top
+*.itp
+*.itp*
+*.mdp
+*.tpr
+*.cpt
+*.edr
+*.trr
+*.xtc
