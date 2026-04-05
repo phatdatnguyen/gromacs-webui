@@ -1251,7 +1251,7 @@ def protein_ligand_complex_md_simulation_tab_content():
                                     protein_topology_output_topology_file_name_textbox = gr.Textbox(label="Output Topology File Name", value="topology.top")
                                 with gr.Column():
                                     protein_force_field_dropdown = gr.Dropdown(label="Force Field", choices=["AMBER94", "AMBER96", "AMBER99", "AMBER99SB", "AMBER99SB-ILDN", "AMBER03", "AMBERGS", "AMBER14SB", "AMBER19SB",
-                                                                                                    "CHARMM27", "GROMOS43A1", "GROMOS43A2", "GROMOS45A3", "GROMOS53A5", "GROMOS53A6", "GROMOS54A7", ("OPLS-AA", "OPLSAA")], value="AMBER99SB-ILDN")
+                                                                                                    "CHARMM27", "GROMOS43A1", "GROMOS43A2", "GROMOS45A3", "GROMOS53A5", "GROMOS53A6", "GROMOS54A7", ("OPLS-AA", "OPLSAA")], value="AMBER99SB-ILDN", allow_custom_value=True)
                                     water_model_dropdown = gr.Dropdown(label="Water Model", choices=["SELECT", "NONE", "OPC", "OPC3", "SPC", "SPCE", "TIP3P", "TIP4P", ("TIP4P-Ew", "TIP4PEW"), "TIP5P", "TIPS3P"], value="TIP3P")
                                     generate_protein_topology_button = gr.Button(value="Generate Topology")
                     with gr.Column(scale=1):
