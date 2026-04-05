@@ -12,8 +12,6 @@ import MDAnalysis as mda
 from MDAnalysis.analysis import rms
 import matplotlib.pyplot as plt
 from utils import *
-from rdkit import Chem
-from rdkit.Chem import AllChem
 
 
 def get_working_directories():
@@ -21,7 +19,7 @@ def get_working_directories():
     return [d for d in os.listdir(base_path) if os.path.isdir(os.path.join(base_path, d))]
 
 def get_files_in_working_directory(working_directory_path):
-    files = [f for f in os.listdir(working_directory_path) if not f.startswith('#')]
+    files = [f for f in os.listdir(working_directory_path) if not (f.startswith('#') or f.endswith("Zone.Identifier") or os.path.isdir(os.path.join(working_directory_path, f)))]
     return files
 
 def on_open_working_directory(working_directory):
@@ -304,7 +302,7 @@ def on_delete_file(working_directory_path, selected_file_name):
 
 def on_clean_working_directory(working_directory_path):
     try:
-        files_to_clean = [f for f in os.listdir(working_directory_path) if f.startswith('#')]
+        files_to_clean = [f for f in os.listdir(working_directory_path) if f.startswith('#') or f.endswith("Zone.Identifier")]
         for f in files_to_clean:
             file_path = os.path.join(working_directory_path, f)
             if os.path.isfile(file_path):
@@ -1407,9 +1405,9 @@ def protein_md_simulation_tab_content():
     prod_md_mdp_type_radio.change(on_change_mdp_type, prod_md_mdp_type_radio, [prod_md_random_seed_textbox, prod_md_parameter_file_name_textbox])
     prod_md_parameter_file_button.click(on_generate_prod_md_mdp_file, [working_directory_path_state, prod_md_time_scale_slider, prod_md_time_step_slider, prod_md_temperature_slider, prod_md_pressure_slider, prod_md_mdp_type_radio, prod_md_random_seed_textbox, prod_md_parameter_file_name_textbox], [working_directory_file_list_state, status_markdown])
     prod_md_run_input_file_button.click(on_generate_prod_md_tpr_file, [working_directory_path_state, prod_md_input_file_name_dropdown, prod_md_input_topology_file_name_dropdown, prod_md_parameter_file_dropdown, prod_md_run_input_file_name_textbox], [working_directory_file_list_state, status_markdown])
-    run_prod_md_button.click(on_run_prod_md, [working_directory_path_state, prod_md_run_input_file_name_textbox, mpi_rank_slider, omp_threads_slider, use_gpu, prod_md_initial_process_state], [working_directory_file_list_state, status_markdown])
+    run_prod_md_button.click(on_run_prod_md, [working_directory_path_state, prod_md_run_input_file_name_textbox, mpi_rank_slider, omp_threads_slider, use_gpu, prod_md_initial_process_state], [working_directory_file_list_state, status_markdown, prod_md_initial_process_state, run_prod_md_button])
     prod_md_initial_timer.tick(sync_button_state, prod_md_initial_process_state, run_prod_md_button)
-    continue_prod_md_button.click(on_continue_prod_md, [working_directory_path_state, prod_md_run_input_file_name_textbox, checkpoint_file_dropdown, mpi_rank_slider, omp_threads_slider, use_gpu, prod_md_continuation_process_state], [working_directory_file_list_state, status_markdown])
+    continue_prod_md_button.click(on_continue_prod_md, [working_directory_path_state, prod_md_run_input_file_name_textbox, checkpoint_file_dropdown, mpi_rank_slider, omp_threads_slider, use_gpu, prod_md_continuation_process_state], [working_directory_file_list_state, status_markdown, prod_md_continuation_process_state, continue_prod_md_button])
     prod_md_continuation_timer.tick(sync_button_state, prod_md_continuation_process_state, continue_prod_md_button)
 
     # Fix trajectory interaction

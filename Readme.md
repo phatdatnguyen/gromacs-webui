@@ -2,13 +2,15 @@
 This web UI is for running molecular dynamics simulation with [Gromacs](https://www.gromacs.org/):
 
 ## Installation  (Linux only)
+- Install [Anaconda](https://www.anaconda.com/download)
+
 - Clone this repo: Open terminal
 
 ```
 git clone https://github.com/phatdatnguyen/gromacs-webui
 ```
 
-- Create and activate virtual environment:
+- Create and activate conda virtual environment:
 
 ```
 cd gromacs-webui
@@ -30,6 +32,6 @@ conda install -c conda-forge mdanalysis
 To start the web UI:
 
 ```
-source gromacs-env/bin/activate
-python3 webui.py
+conda activate ./gromacs-env
+python webui.py
 ```
