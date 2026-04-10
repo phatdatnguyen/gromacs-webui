@@ -83,229 +83,257 @@ def on_file_list_change(working_directory_path,
 
     # Update protein topology input file name dropdown
     if protein_structure_file_name in structure_files:
-        protein_topology_input_file_name = protein_structure_file_name
+        protein_topology_input_file_name_value = protein_structure_file_name
     else:
-        protein_topology_input_file_name = structure_files[0] if structure_files else None
+        protein_topology_input_file_name_value = structure_files[0] if structure_files else None
 
     # Update ligand topology input file name dropdown
     if ligand_structure_file_name in structure_files:
-        ligand_topology_input_file_name = ligand_structure_file_name
+        ligand_topology_input_file_name_value = ligand_structure_file_name
     else:
-        ligand_topology_input_file_name = structure_files[0] if structure_files else None
+        ligand_topology_input_file_name_value = structure_files[0] if structure_files else None
     
     # Update merge structure protein input file name dropdown
     if protein_topology_output_file_name in structure_files:
-        merge_structure_protein_input_file_name = protein_topology_output_file_name
+        merge_structure_protein_input_file_name_value = protein_topology_output_file_name
     else:
-        merge_structure_protein_input_file_name = structure_files[0] if structure_files else None
+        merge_structure_protein_input_file_name_value = structure_files[0] if structure_files else None
     
     # Update merge structure ligand input file name dropdown
     if f"{ligand_output_file_name}_GMX.gro" in structure_files:
-        merge_structure_ligand_input_file_name = f"{ligand_output_file_name}_GMX.gro"
+        merge_structure_ligand_input_file_name_value = f"{ligand_output_file_name}_GMX.gro"
     else:
-        merge_structure_ligand_input_file_name = structure_files[0] if structure_files else None
+        merge_structure_ligand_input_file_name_value = structure_files[0] if structure_files else None
 
     # Update merge topology protein input file name dropdown
     if protein_topology_output_topology_file_name in topology_files:
-        merge_topology_protein_input_file_name = protein_topology_output_topology_file_name
+        merge_topology_protein_input_file_name_value = protein_topology_output_topology_file_name
     else:
-        merge_topology_protein_input_file_name = topology_files[0] if topology_files else None
+        merge_topology_protein_input_file_name_value = topology_files[0] if topology_files else None
     
     # Update merge topology ligand input file name dropdown
     if f"{ligand_output_file_name}_GMX.itp" in topology_files:
-        merge_topology_ligand_input_file_name = f"{ligand_output_file_name}_GMX.itp"
+        merge_topology_ligand_input_file_name_value = f"{ligand_output_file_name}_GMX.itp"
     else:
-        merge_topology_ligand_input_file_name = topology_files[0] if topology_files else None
+        merge_topology_ligand_input_file_name_value = topology_files[0] if topology_files else None
 
     # Update box input file name dropdown
     if merge_structures_output_file_name in structure_files:
-        box_input_file_name = merge_structures_output_file_name
+        box_input_file_name_value = merge_structures_output_file_name
     else:
-        box_input_file_name = structure_files[0] if structure_files else None
+        box_input_file_name_value = structure_files[0] if structure_files else None
 
     # Update solvation input file dropdown
     if box_output_file_name in structure_files:
-        solvation_input_file_name = box_output_file_name
+        solvation_input_file_name_value = box_output_file_name
     else:
-        solvation_input_file_name = structure_files[0] if structure_files else None
+        solvation_input_file_name_value = structure_files[0] if structure_files else None
 
     # Update solvation input topology file dropdown
     if merge_topologies_output_file_name in topology_files:
-        solvation_input_topology_file_name = merge_topologies_output_file_name
+        solvation_input_topology_file_name_value = merge_topologies_output_file_name
     else:
-        solvation_input_topology_file_name = topology_files[0] if topology_files else None
+        solvation_input_topology_file_name_value = topology_files[0] if topology_files else None
 
     # Update generate ions input file dropdown
     if solvation_output_file_name in structure_files:
-        generate_ions_input_file_name = solvation_output_file_name
+        generate_ions_input_file_name_value = solvation_output_file_name
     else:
-        generate_ions_input_file_name = structure_files[0] if structure_files else None
+        generate_ions_input_file_name_value = structure_files[0] if structure_files else None
 
     # Update generate ions input topology file dropdown
     if solvation_output_topology_file_name in topology_files:
-        generate_ions_input_topology_file_name = solvation_output_topology_file_name
+        generate_ions_input_topology_file_name_value = solvation_output_topology_file_name
     else:
-        generate_ions_input_topology_file_name = topology_files[0] if topology_files else None
+        generate_ions_input_topology_file_name_value = topology_files[0] if topology_files else None
 
     # Update generate ions parameter file dropdown
     if generate_ions_parameter_file_name in parameter_files:
-        generate_ions_parameter_file_name = generate_ions_parameter_file_name
+        generate_ions_parameter_file_name_value = generate_ions_parameter_file_name
     else:
-        generate_ions_parameter_file_name = parameter_files[0] if parameter_files else None
+        generate_ions_parameter_file_name_value = parameter_files[0] if parameter_files else None
 
     # Update generate ions run input file dropdown
     if generate_ions_run_input_file_name in run_input_files:
-        generate_ions_run_input_file_name = generate_ions_run_input_file_name
+        generate_ions_run_input_file_name_value = generate_ions_run_input_file_name
     else:
-        generate_ions_run_input_file_name = run_input_files[0] if run_input_files else None
+        generate_ions_run_input_file_name_value = run_input_files[0] if run_input_files else None
 
     # Update energy minimization input file dropdown
     if generate_ions_output_file_name in structure_files:
-        energy_minimization_input_file_name = generate_ions_output_file_name
+        energy_minimization_input_file_name_value = generate_ions_output_file_name
     else:
-        energy_minimization_input_file_name = structure_files[0] if structure_files else None
+        energy_minimization_input_file_name_value = structure_files[0] if structure_files else None
 
     # Update energy minimization run input topology file dropdown
     if generate_ions_output_topology_file_name in topology_files:
-        energy_minimization_input_topology_file_name = generate_ions_output_topology_file_name
+        energy_minimization_input_topology_file_name_value = generate_ions_output_topology_file_name
     else:
-        energy_minimization_input_topology_file_name = topology_files[0] if topology_files else None
+        energy_minimization_input_topology_file_name_value = topology_files[0] if topology_files else None
 
     # Update energy minimization parameter file dropdown
     if energy_minimization_parameter_file_name in parameter_files:
-        energy_minimization_parameter_file_name = energy_minimization_parameter_file_name
+        energy_minimization_parameter_file_name_value = energy_minimization_parameter_file_name
     else:
-        energy_minimization_parameter_file_name = parameter_files[0] if parameter_files else None
+        energy_minimization_parameter_file_name_value = parameter_files[0] if parameter_files else None
+
+    # Update energy minimization run input file dropdown
+    if energy_minimization_run_input_file_name in run_input_files:
+        energy_minimization_run_input_file_name_value = energy_minimization_run_input_file_name
+    else:
+        energy_minimization_run_input_file_name_value = run_input_files[0] if run_input_files else None
 
     # Update nvt equilibration input file dropdown
-    if energy_minimization_run_input_file_name in run_input_files:
-        nvt_equilibration_input_file_name = f"{energy_minimization_run_input_file_name.split('.')[0]}.gro"
+    if energy_minimization_run_input_file_name in run_input_files and f"{energy_minimization_run_input_file_name.split('.')[0]}.gro" in structure_files:
+        nvt_equilibration_input_file_name_value = f"{energy_minimization_run_input_file_name.split('.')[0]}.gro"
     else:
-        nvt_equilibration_input_file_name = structure_files[0] if structure_files else None
+        nvt_equilibration_input_file_name_value = structure_files[0] if structure_files else None
 
     # Update nvt equilibration run input topology file dropdown
     if generate_ions_output_topology_file_name in topology_files:
-        nvt_equilibration_input_topology_file_name = generate_ions_output_topology_file_name
+        nvt_equilibration_input_topology_file_name_value = generate_ions_output_topology_file_name
     else:
-        nvt_equilibration_input_topology_file_name = topology_files[0] if topology_files else None
+        nvt_equilibration_input_topology_file_name_value = topology_files[0] if topology_files else None
 
     # Update nvt equilibration parameter file dropdown
     if nvt_equilibration_parameter_file_name in parameter_files:
-        nvt_equilibration_parameter_file_name = nvt_equilibration_parameter_file_name
+        nvt_equilibration_parameter_file_name_value = nvt_equilibration_parameter_file_name
     else:
-        nvt_equilibration_parameter_file_name = parameter_files[0] if parameter_files else None
+        nvt_equilibration_parameter_file_name_value = parameter_files[0] if parameter_files else None
+
+    # Update nvt equilibration run input file dropdown
+    if nvt_equilibration_run_input_file_name in run_input_files:
+        nvt_equilibration_run_input_file_name_value = nvt_equilibration_run_input_file_name
+    else:
+        nvt_equilibration_run_input_file_name_value = run_input_files[0] if run_input_files else None
 
     # Update npt equilibration input file dropdown
-    if nvt_equilibration_run_input_file_name in run_input_files:
-        npt_equilibration_input_file_name = f"{nvt_equilibration_run_input_file_name.split('.')[0]}.gro"
+    if nvt_equilibration_run_input_file_name in run_input_files and f"{nvt_equilibration_run_input_file_name.split('.')[0]}.gro" in structure_files:
+        npt_equilibration_input_file_name_value = f"{nvt_equilibration_run_input_file_name.split('.')[0]}.gro"
     else:
-        npt_equilibration_input_file_name = structure_files[0] if structure_files else None
+        npt_equilibration_input_file_name_value = structure_files[0] if structure_files else None
     
     # Update npt equilibration run input topology file dropdown
     if generate_ions_output_topology_file_name in topology_files:
-        npt_equilibration_input_topology_file_name = generate_ions_output_topology_file_name
+        npt_equilibration_input_topology_file_name_value = generate_ions_output_topology_file_name
     else:
-        npt_equilibration_input_topology_file_name = topology_files[0] if topology_files else None
+        npt_equilibration_input_topology_file_name_value = topology_files[0] if topology_files else None
     
     # Update npt equilibration parameter file dropdown
     if npt_equilibration_parameter_file_name in parameter_files:
-        npt_equilibration_parameter_file_name = npt_equilibration_parameter_file_name
+        npt_equilibration_parameter_file_name_value = npt_equilibration_parameter_file_name
     else:
-        npt_equilibration_parameter_file_name = parameter_files[0] if parameter_files else None
+        npt_equilibration_parameter_file_name_value = parameter_files[0] if parameter_files else None
+
+    # Update npt equilibration run input file dropdown
+    if npt_equilibration_run_input_file_name in run_input_files:
+        npt_equilibration_run_input_file_name_value = npt_equilibration_run_input_file_name
+    else:
+        npt_equilibration_run_input_file_name_value = run_input_files[0] if run_input_files else None
 
     # Update production MD input file dropdown
-    if npt_equilibration_run_input_file_name in run_input_files:
-        prod_md_input_file_name = f"{npt_equilibration_run_input_file_name.split('.')[0]}.gro"
+    if npt_equilibration_run_input_file_name in run_input_files and f"{npt_equilibration_run_input_file_name.split('.')[0]}.gro" in structure_files:
+        prod_md_input_file_name_value = f"{npt_equilibration_run_input_file_name.split('.')[0]}.gro"
     else:
-        prod_md_input_file_name = structure_files[0] if structure_files else None
+        prod_md_input_file_name_value = structure_files[0] if structure_files else None
     
     # Update production MD run input topology file dropdown
     if generate_ions_output_topology_file_name in topology_files:
-        prod_md_input_topology_file_name = generate_ions_output_topology_file_name
+        prod_md_input_topology_file_name_value = generate_ions_output_topology_file_name
     else:
-        prod_md_input_topology_file_name = topology_files[0] if topology_files else None
+        prod_md_input_topology_file_name_value = topology_files[0] if topology_files else None
     
     # Update production MD parameter file dropdown
     if prod_md_parameter_file_name in parameter_files:
-        prod_md_parameter_file_name = prod_md_parameter_file_name
+        prod_md_parameter_file_name_value = prod_md_parameter_file_name
     else:
-        prod_md_parameter_file_name = parameter_files[0] if parameter_files else None
+        prod_md_parameter_file_name_value = parameter_files[0] if parameter_files else None
+
+    # Update production MD run input file dropdown
+    if prod_md_run_input_file_name in run_input_files:
+        prod_md_run_input_file_name_value = prod_md_run_input_file_name
+    else:
+        prod_md_run_input_file_name_value = run_input_files[0] if run_input_files else None
 
     # Update production MD checkpoint file dropdown
-    if prod_md_run_input_file_name in run_input_files:
-        prod_md_checkpoint_file_name = f"{prod_md_run_input_file_name.split('.')[0]}.cpt"
+    if prod_md_run_input_file_name in run_input_files and f"{prod_md_run_input_file_name.split('.')[0]}.cpt" in checkpoint_files:
+        prod_md_checkpoint_file_name_value = f"{prod_md_run_input_file_name.split('.')[0]}.cpt"
     else:
-        prod_md_checkpoint_file_name = checkpoint_files[0] if checkpoint_files else None
+        prod_md_checkpoint_file_name_value = checkpoint_files[0] if checkpoint_files else None
 
     # Update fix trajectory run input file dropdown
     if prod_md_run_input_file_name in run_input_files:
-        fix_traj_run_input_file_name = prod_md_run_input_file_name
+        fix_traj_run_input_file_name_value = prod_md_run_input_file_name
     else:
-        fix_traj_run_input_file_name = run_input_files[0] if run_input_files else None
+        fix_traj_run_input_file_name_value = run_input_files[0] if run_input_files else None
 
     # Update make molecule whole input trajectory file dropdown
-    if prod_md_run_input_file_name in run_input_files:
-        make_mol_whole_input_traj_file_name = f"{prod_md_run_input_file_name.split('.')[0]}.xtc"
+    if prod_md_run_input_file_name in run_input_files and f"{prod_md_run_input_file_name.split('.')[0]}.xtc" in trajectory_files:
+        make_mol_whole_input_traj_file_name_value = f"{prod_md_run_input_file_name.split('.')[0]}.xtc"
     else:
-        make_mol_whole_input_traj_file_name = trajectory_files[0] if trajectory_files else None
+        make_mol_whole_input_traj_file_name_value = trajectory_files[0] if trajectory_files else None
 
     # Update center protein input trajectory file dropdown
     if make_mol_whole_output_traj_file_name in trajectory_files:
-        center_protein_input_traj_file_name = make_mol_whole_output_traj_file_name
+        center_protein_input_traj_file_name_value = make_mol_whole_output_traj_file_name
     else:
-        center_protein_input_traj_file_name = trajectory_files[0] if trajectory_files else None
+        center_protein_input_traj_file_name_value = trajectory_files[0] if trajectory_files else None
 
     # Update fit backbone input trajectory file dropdown
     if center_protein_output_traj_file_name in trajectory_files:
-        fit_backbone_input_traj_file_name = center_protein_output_traj_file_name
+        fit_backbone_input_traj_file_name_value = center_protein_output_traj_file_name
     else:
-        fit_backbone_input_traj_file_name = trajectory_files[0] if trajectory_files else None
+        fit_backbone_input_traj_file_name_value = trajectory_files[0] if trajectory_files else None
 
     # Update analysis input file dropdown
-    if prod_md_run_input_file_name in run_input_files:
-        analysis_structure_file_name = f"{prod_md_run_input_file_name.split('.')[0]}.gro"
+    if prod_md_run_input_file_name in run_input_files and f"{prod_md_run_input_file_name.split('.')[0]}.gro" in structure_files:
+        analysis_structure_file_name_value = f"{prod_md_run_input_file_name.split('.')[0]}.gro"
     else:
-        analysis_structure_file_name = structure_files[0] if structure_files else None
+        analysis_structure_file_name_value = structure_files[0] if structure_files else None
 
     # Update analysis input trajectory file dropdown
     if fit_backbone_output_traj_file_name in trajectory_files:
-        analysis_input_traj_file_name = fit_backbone_output_traj_file_name
+        analysis_input_traj_file_name_value = fit_backbone_output_traj_file_name
     else:
-        analysis_input_traj_file_name = trajectory_files[0] if trajectory_files else None
+        analysis_input_traj_file_name_value = trajectory_files[0] if trajectory_files else None
 
     return file_df, \
-        gr.update(choices=structure_files, value=protein_topology_input_file_name), \
-        gr.update(choices=structure_files, value=ligand_topology_input_file_name), \
-        gr.update(choices=structure_files, value=merge_structure_protein_input_file_name), \
-        gr.update(choices=structure_files, value=merge_structure_ligand_input_file_name), \
-        gr.update(choices=topology_files, value=merge_topology_protein_input_file_name), \
-        gr.update(choices=topology_files, value=merge_topology_ligand_input_file_name), \
-        gr.update(choices=structure_files, value=box_input_file_name), \
-        gr.update(choices=structure_files, value=solvation_input_file_name), \
-        gr.update(choices=topology_files, value=solvation_input_topology_file_name), \
-        gr.update(choices=structure_files, value=generate_ions_input_file_name), \
-        gr.update(choices=topology_files, value=generate_ions_input_topology_file_name), \
-        gr.update(choices=parameter_files, value=generate_ions_parameter_file_name), \
-        gr.update(choices=run_input_files, value=generate_ions_run_input_file_name), \
-        gr.update(choices=structure_files, value=energy_minimization_input_file_name), \
-        gr.update(choices=topology_files, value=energy_minimization_input_topology_file_name), \
-        gr.update(choices=parameter_files, value=energy_minimization_parameter_file_name), \
-        gr.update(choices=structure_files, value=nvt_equilibration_input_file_name), \
-        gr.update(choices=topology_files, value=nvt_equilibration_input_topology_file_name), \
-        gr.update(choices=parameter_files, value=nvt_equilibration_parameter_file_name), \
-        gr.update(choices=structure_files, value=npt_equilibration_input_file_name), \
-        gr.update(choices=topology_files, value=npt_equilibration_input_topology_file_name), \
-        gr.update(choices=parameter_files, value=npt_equilibration_parameter_file_name), \
-        gr.update(choices=structure_files, value=prod_md_input_file_name), \
-        gr.update(choices=topology_files, value=prod_md_input_topology_file_name), \
-        gr.update(choices=parameter_files, value=prod_md_parameter_file_name), \
-        gr.update(choices=checkpoint_files, value=prod_md_checkpoint_file_name), \
-        gr.update(choices=run_input_files, value=fix_traj_run_input_file_name), \
-        gr.update(choices=trajectory_files, value=make_mol_whole_input_traj_file_name), \
-        gr.update(choices=trajectory_files, value=center_protein_input_traj_file_name), \
-        gr.update(choices=trajectory_files, value=fit_backbone_input_traj_file_name), \
-        gr.update(choices=structure_files, value=analysis_structure_file_name), \
-        gr.update(choices=trajectory_files, value=analysis_input_traj_file_name)
+        gr.update(choices=structure_files, value=protein_topology_input_file_name_value), \
+        gr.update(choices=structure_files, value=ligand_topology_input_file_name_value), \
+        gr.update(choices=structure_files, value=merge_structure_protein_input_file_name_value), \
+        gr.update(choices=structure_files, value=merge_structure_ligand_input_file_name_value), \
+        gr.update(choices=topology_files, value=merge_topology_protein_input_file_name_value), \
+        gr.update(choices=topology_files, value=merge_topology_ligand_input_file_name_value), \
+        gr.update(choices=structure_files, value=box_input_file_name_value), \
+        gr.update(choices=structure_files, value=solvation_input_file_name_value), \
+        gr.update(choices=topology_files, value=solvation_input_topology_file_name_value), \
+        gr.update(choices=structure_files, value=generate_ions_input_file_name_value), \
+        gr.update(choices=topology_files, value=generate_ions_input_topology_file_name_value), \
+        gr.update(choices=parameter_files, value=generate_ions_parameter_file_name_value), \
+        gr.update(choices=run_input_files, value=generate_ions_run_input_file_name_value), \
+        gr.update(choices=structure_files, value=energy_minimization_input_file_name_value), \
+        gr.update(choices=topology_files, value=energy_minimization_input_topology_file_name_value), \
+        gr.update(choices=parameter_files, value=energy_minimization_parameter_file_name_value), \
+        gr.update(choices=run_input_files, value=energy_minimization_run_input_file_name_value), \
+        gr.update(choices=structure_files, value=nvt_equilibration_input_file_name_value), \
+        gr.update(choices=topology_files, value=nvt_equilibration_input_topology_file_name_value), \
+        gr.update(choices=parameter_files, value=nvt_equilibration_parameter_file_name_value), \
+        gr.update(choices=run_input_files, value=nvt_equilibration_run_input_file_name_value), \
+        gr.update(choices=structure_files, value=npt_equilibration_input_file_name_value), \
+        gr.update(choices=topology_files, value=npt_equilibration_input_topology_file_name_value), \
+        gr.update(choices=parameter_files, value=npt_equilibration_parameter_file_name_value), \
+        gr.update(choices=run_input_files, value=npt_equilibration_run_input_file_name_value), \
+        gr.update(choices=structure_files, value=prod_md_input_file_name_value), \
+        gr.update(choices=topology_files, value=prod_md_input_topology_file_name_value), \
+        gr.update(choices=parameter_files, value=prod_md_parameter_file_name_value), \
+        gr.update(choices=run_input_files, value=prod_md_run_input_file_name_value), \
+        gr.update(choices=checkpoint_files, value=prod_md_checkpoint_file_name_value), \
+        gr.update(choices=run_input_files, value=fix_traj_run_input_file_name_value), \
+        gr.update(choices=trajectory_files, value=make_mol_whole_input_traj_file_name_value), \
+        gr.update(choices=trajectory_files, value=center_protein_input_traj_file_name_value), \
+        gr.update(choices=trajectory_files, value=fit_backbone_input_traj_file_name_value), \
+        gr.update(choices=structure_files, value=analysis_structure_file_name_value), \
+        gr.update(choices=trajectory_files, value=analysis_input_traj_file_name_value)
 
 def on_select_file(evt: gr.SelectData):
     selected_file_name = evt.row_value[0]
@@ -584,7 +612,7 @@ def on_generate_ions_mdp_file(working_directory_path, parameter_file_name):
     
     return get_files_in_working_directory(working_directory_path), "<span style='color:green;'>" + status + "</span>"
 
-def on_generate_ions_tpr_file(working_directory_path, input_file_name, input_topology_file_name, parameter_file_name, run_input_file_name):
+def on_generate_ions_tpr_file(working_directory_path, input_file_name, input_topology_file_name, parameter_file_name, run_input_file_name, max_warnings):
     try:
         cmd = [
             "gmx", "grompp",
@@ -592,7 +620,7 @@ def on_generate_ions_tpr_file(working_directory_path, input_file_name, input_top
             "-c", os.path.join(working_directory_path, input_file_name),
             "-p", os.path.join(working_directory_path, input_topology_file_name),
             "-o", os.path.join(working_directory_path, run_input_file_name),
-            "-maxwarn", "5"
+            "-maxwarn", str(max_warnings)
         ]
 
         print(f"Running command: {' '.join(cmd)}")
@@ -661,7 +689,7 @@ def on_generate_energy_minimization_mdp_file(working_directory_path, parameter_f
     
     return get_files_in_working_directory(working_directory_path), "<span style='color:green;'>" + status + "</span>"
 
-def on_generate_energy_minimization_tpr_file(working_directory_path, input_file_name, input_topology_file_name, parameter_file_name, run_input_file_name):
+def on_generate_energy_minimization_tpr_file(working_directory_path, input_file_name, input_topology_file_name, parameter_file_name, run_input_file_name, max_warnings):
     try:
         cmd = [
             "gmx", "grompp",
@@ -669,7 +697,7 @@ def on_generate_energy_minimization_tpr_file(working_directory_path, input_file_
             "-c", os.path.join(working_directory_path, input_file_name),
             "-p", os.path.join(working_directory_path, input_topology_file_name),
             "-o", os.path.join(working_directory_path, run_input_file_name),
-            "-maxwarn", "5"
+            "-maxwarn", str(max_warnings)
         ]
 
         print(f"Running command: {' '.join(cmd)}")
@@ -715,7 +743,7 @@ def on_generate_nvt_equilibration_mdp_file(working_directory_path, time_scale, t
     
     return get_files_in_working_directory(working_directory_path), "<span style='color:green;'>" + status + "</span>"
 
-def on_generate_nvt_equilibration_tpr_file(working_directory_path, input_file_name, input_topology_file_name, parameter_file_name, run_input_file_name):
+def on_generate_nvt_equilibration_tpr_file(working_directory_path, input_file_name, input_topology_file_name, parameter_file_name, run_input_file_name, max_warnings):
     try:
         cmd = [
             "gmx", "grompp",
@@ -724,7 +752,7 @@ def on_generate_nvt_equilibration_tpr_file(working_directory_path, input_file_na
             "-r", os.path.join(working_directory_path, input_file_name),
             "-p", os.path.join(working_directory_path, input_topology_file_name),
             "-o", os.path.join(working_directory_path, run_input_file_name),
-            "-maxwarn", "5"
+            "-maxwarn", str(max_warnings)
         ]
 
         print(f"Running command: {' '.join(cmd)}")
@@ -818,7 +846,7 @@ def on_generate_npt_equilibration_mdp_file(working_directory_path, time_scale, t
     
     return get_files_in_working_directory(working_directory_path), "<span style='color:green;'>" + status + "</span>"
 
-def on_generate_npt_equilibration_tpr_file(working_directory_path, input_file_name, input_topology_file_name, parameter_file_name, run_input_file_name):
+def on_generate_npt_equilibration_tpr_file(working_directory_path, input_file_name, input_topology_file_name, parameter_file_name, run_input_file_name, max_warnings):
     try:
         cmd = [
             "gmx", "grompp",
@@ -827,7 +855,7 @@ def on_generate_npt_equilibration_tpr_file(working_directory_path, input_file_na
             "-r", os.path.join(working_directory_path, input_file_name),
             "-p", os.path.join(working_directory_path, input_topology_file_name),
             "-o", os.path.join(working_directory_path, run_input_file_name),
-            "-maxwarn", "5"
+            "-maxwarn", str(max_warnings)
         ]
         
         print(f"Running command: {' '.join(cmd)}")
@@ -910,7 +938,7 @@ def on_generate_prod_md_mdp_file(working_directory_path, time_scale, time_step, 
     
     return get_files_in_working_directory(working_directory_path), "<span style='color:green;'>" + status + "</span>"
 
-def on_generate_prod_md_tpr_file(working_directory_path, input_file_name, input_topology_file_name, parameter_file_name, run_input_file_name):
+def on_generate_prod_md_tpr_file(working_directory_path, input_file_name, input_topology_file_name, parameter_file_name, run_input_file_name, max_warnings):
     try:
         cmd = [
             "gmx", "grompp",
@@ -918,7 +946,7 @@ def on_generate_prod_md_tpr_file(working_directory_path, input_file_name, input_
             "-c", os.path.join(working_directory_path, input_file_name),
             "-p", os.path.join(working_directory_path, input_topology_file_name),
             "-o", os.path.join(working_directory_path, run_input_file_name),
-            "-maxwarn", "5"
+            "-maxwarn", str(max_warnings)
         ]
 
         print(f"Running command: {' '.join(cmd)}")
@@ -1227,9 +1255,10 @@ def protein_ligand_complex_md_simulation_tab_content():
                     status_markdown = gr.Markdown()
                 with gr.Accordion(label="Settings", open=False):
                     with gr.Row():
-                        use_gpu = gr.Checkbox(label="Use GPU", value="True")
                         mpi_rank_slider = gr.Slider(label="MPI Ranks", minimum=1, maximum=psutil.cpu_count(logical=False), value=1, step=1)
                         omp_threads_slider = gr.Slider(label="OpenMP Threads", minimum=1, maximum=int(os.environ.get("OMP_NUM_THREADS")), value=int(os.environ.get("OMP_NUM_THREADS")), step=1)
+                        max_warns_slider = gr.Slider(label="Max Warnings", minimum=0, maximum=10, value=5, step=1)
+                        use_gpu = gr.Checkbox(label="Use GPU", value="True")
                 with gr.Row():
                     with gr.Column(scale=1):
                         with gr.Accordion(label="Upload Protein Structure", open=True):
@@ -1360,7 +1389,10 @@ def protein_ligand_complex_md_simulation_tab_content():
                             with gr.Row():
                                 gr.Markdown("***Run energy minimization***")
                             with gr.Row():
-                                run_energy_minimization_button = gr.Button(value="Run Energy Minimization")
+                                with gr.Column():
+                                    energy_minimization_run_input_file_dropdown = gr.Dropdown(label="Run Input File Name", choices=[], value=None)
+                                with gr.Column():
+                                    run_energy_minimization_button = gr.Button(value="Run Energy Minimization")
                 with gr.Accordion(label="NVT Equilibration", open=False):
                     with gr.Row():
                         with gr.Column():    
@@ -1391,9 +1423,12 @@ def protein_ligand_complex_md_simulation_tab_content():
                             with gr.Row():
                                 gr.Markdown("***Run NVT equilibration***")
                             with gr.Row():
-                                nvt_process_state = gr.State({"proc": None, "running": False})
-                                run_nvt_equilibration_button = gr.Button(value="Run NVT Equilibration")
-                                nvt_equilibration_timer = gr.Timer(1.0)
+                                with gr.Column():
+                                    nvt_equilibration_run_input_file_dropdown = gr.Dropdown(label="Run Input File Name", choices=[], value=None)
+                                with gr.Column():
+                                    nvt_process_state = gr.State({"proc": None, "running": False})
+                                    run_nvt_equilibration_button = gr.Button(value="Run NVT Equilibration")
+                                    nvt_equilibration_timer = gr.Timer(1.0)
                 with gr.Accordion(label="NPT Equilibration", open=False):
                     with gr.Row():
                         with gr.Column():    
@@ -1425,9 +1460,12 @@ def protein_ligand_complex_md_simulation_tab_content():
                             with gr.Row():
                                 gr.Markdown("***Run NPT equilibration***")
                             with gr.Row():
-                                npt_process_state = gr.State({"proc": None, "running": False})
-                                run_npt_equilibration_button = gr.Button(value="Run NPT Equilibration")
-                                npt_equilibration_timer = gr.Timer(1.0)
+                                with gr.Column():
+                                    npt_equilibration_run_input_file_dropdown = gr.Dropdown(label="Run Input File Name", choices=[], value=None)
+                                with gr.Column():
+                                    npt_process_state = gr.State({"proc": None, "running": False})
+                                    run_npt_equilibration_button = gr.Button(value="Run NPT Equilibration")
+                                    npt_equilibration_timer = gr.Timer(1.0)
                 with gr.Accordion(label="Production MD", open=False):
                     with gr.Row():
                         with gr.Column():    
@@ -1461,6 +1499,8 @@ def protein_ligand_complex_md_simulation_tab_content():
                             with gr.Row():
                                 gr.Markdown("***Run production MD simulation***")
                             with gr.Row():
+                                with gr.Column():
+                                    prod_md_run_input_file_dropdown = gr.Dropdown(label="Run Input File Name", choices=[], value=None)
                                 with gr.Column():
                                     gr.Markdown("*Run from beginning*")
                                     prod_md_initial_process_state = gr.State({"proc": None, "running": False})
@@ -1537,15 +1577,15 @@ def protein_ligand_complex_md_simulation_tab_content():
                                                                    prod_md_parameter_file_name_textbox, prod_md_run_input_file_name_textbox,
                                                                    make_mol_whole_output_traj_file_name_textbox, center_protein_output_traj_file_name_textbox, fit_backbone_output_traj_file_name_textbox],
                                              [working_directory_file_dataframe, protein_topology_input_file_name_dropdown, ligand_topology_input_file_name_dropdown,
-                                             merge_structures_protein_input_file_name_dropdown, merge_structures_ligand_input_file_name_dropdown, merge_topologies_protein_input_file_name_dropdown, merge_topologies_ligand_input_file_name_dropdown,
-                                             box_input_file_name_dropdown, solvation_input_file_name_dropdown, solvation_input_topology_file_name_dropdown,
-                                             generate_ions_input_file_name_dropdown, generate_ions_input_topology_file_name_dropdown, generate_ions_parameter_file_dropdown, generate_ions_run_input_file_dropdown,
-                                             energy_minimization_input_file_name_dropdown, energy_minimization_input_topology_file_name_dropdown, energy_minimization_parameter_file_dropdown,
-                                             nvt_equilibration_input_file_name_dropdown, nvt_equilibration_input_topology_file_name_dropdown, nvt_equilibration_parameter_file_dropdown,
-                                             npt_equilibration_input_file_name_dropdown, npt_equilibration_input_topology_file_name_dropdown, npt_equilibration_parameter_file_dropdown,
-                                             prod_md_input_file_name_dropdown, prod_md_input_topology_file_name_dropdown, prod_md_parameter_file_dropdown, checkpoint_file_dropdown,
-                                             fix_traj_run_input_file_name_dropdown, make_mol_whole_input_traj_file_name_dropdown, center_protein_input_traj_file_name_dropdown, fit_backbone_input_traj_file_name_dropdown,
-                                             analysis_structure_file_name_dropdown, analysis_input_traj_file_name_dropdown])
+                                              merge_structures_protein_input_file_name_dropdown, merge_structures_ligand_input_file_name_dropdown, merge_topologies_protein_input_file_name_dropdown, merge_topologies_ligand_input_file_name_dropdown,
+                                              box_input_file_name_dropdown, solvation_input_file_name_dropdown, solvation_input_topology_file_name_dropdown,
+                                              generate_ions_input_file_name_dropdown, generate_ions_input_topology_file_name_dropdown, generate_ions_parameter_file_dropdown, generate_ions_run_input_file_dropdown,
+                                              energy_minimization_input_file_name_dropdown, energy_minimization_input_topology_file_name_dropdown, energy_minimization_parameter_file_dropdown, energy_minimization_run_input_file_dropdown, energy_minimization_run_input_file_dropdown,
+                                              nvt_equilibration_input_file_name_dropdown, nvt_equilibration_input_topology_file_name_dropdown, nvt_equilibration_parameter_file_dropdown, nvt_equilibration_run_input_file_dropdown, nvt_equilibration_run_input_file_dropdown,
+                                              npt_equilibration_input_file_name_dropdown, npt_equilibration_input_topology_file_name_dropdown, npt_equilibration_parameter_file_dropdown, npt_equilibration_run_input_file_dropdown, npt_equilibration_run_input_file_dropdown,
+                                              prod_md_input_file_name_dropdown, prod_md_input_topology_file_name_dropdown, prod_md_parameter_file_dropdown, prod_md_run_input_file_dropdown, prod_md_run_input_file_dropdown, checkpoint_file_dropdown,
+                                              fix_traj_run_input_file_name_dropdown, make_mol_whole_input_traj_file_name_dropdown, center_protein_input_traj_file_name_dropdown, fit_backbone_input_traj_file_name_dropdown,
+                                              analysis_structure_file_name_dropdown, analysis_input_traj_file_name_dropdown])
     working_directory_file_dataframe.select(on_select_file, [], [selected_file_state, selected_structure_file_state, selected_text_file_state, delete_file_button])
     selected_structure_file_state.change(on_selected_structure_file_state_change, selected_structure_file_state, view_structure_button)
     selected_text_file_state.change(on_selected_text_file_state_change, selected_text_file_state, view_text_file_button)
@@ -1575,34 +1615,34 @@ def protein_ligand_complex_md_simulation_tab_content():
 
     # Generate ions interaction
     generate_ions_parameter_file_button.click(on_generate_ions_mdp_file, [working_directory_path_state, generate_ions_parameter_file_name_textbox], [working_directory_file_list_state, status_markdown])
-    generate_ions_run_input_file_button.click(on_generate_ions_tpr_file, [working_directory_path_state, generate_ions_input_file_name_dropdown, generate_ions_input_topology_file_name_dropdown, generate_ions_parameter_file_dropdown, generate_ions_run_input_file_name_textbox], [working_directory_file_list_state, status_markdown])
+    generate_ions_run_input_file_button.click(on_generate_ions_tpr_file, [working_directory_path_state, generate_ions_input_file_name_dropdown, generate_ions_input_topology_file_name_dropdown, generate_ions_parameter_file_dropdown, generate_ions_run_input_file_name_textbox, max_warns_slider], [working_directory_file_list_state, status_markdown])
     add_ion_method_radio.change(on_add_ions_method_change, add_ion_method_radio, [concentration_slider, cation_charge_slider, anion_charge_slider, number_of_cations_slider, number_of_anions_slider])
     add_ions_button.click(on_add_ions, [working_directory_path_state, generate_ions_run_input_file_dropdown, generate_ions_output_file_name_textbox, generate_ions_input_topology_file_name_dropdown, generate_ions_output_topology_file_name_textbox, cation_name_textbox, anion_name_textbox, add_ion_method_radio, concentration_slider, cation_charge_slider, anion_charge_slider, number_of_cations_slider, number_of_anions_slider, netralize_checkbox], [working_directory_file_list_state, status_markdown])
     
     # Energy minimization interaction
     energy_minimization_parameter_file_button.click(on_generate_energy_minimization_mdp_file, [working_directory_path_state, energy_minimization_parameter_file_name_textbox], [working_directory_file_list_state, status_markdown])
-    energy_minimization_run_input_file_button.click(on_generate_energy_minimization_tpr_file, [working_directory_path_state, energy_minimization_input_file_name_dropdown, energy_minimization_input_topology_file_name_dropdown, energy_minimization_parameter_file_dropdown, energy_minimization_run_input_file_name_textbox], [working_directory_file_list_state, status_markdown])
-    run_energy_minimization_button.click(on_run_energy_minimization, [working_directory_path_state, energy_minimization_run_input_file_name_textbox, mpi_rank_slider, omp_threads_slider], [working_directory_file_list_state, status_markdown])
+    energy_minimization_run_input_file_button.click(on_generate_energy_minimization_tpr_file, [working_directory_path_state, energy_minimization_input_file_name_dropdown, energy_minimization_input_topology_file_name_dropdown, energy_minimization_parameter_file_dropdown, energy_minimization_run_input_file_name_textbox, max_warns_slider], [working_directory_file_list_state, status_markdown])
+    run_energy_minimization_button.click(on_run_energy_minimization, [working_directory_path_state, energy_minimization_run_input_file_dropdown, mpi_rank_slider, omp_threads_slider], [working_directory_file_list_state, status_markdown])
 
     # NVT equilibration interaction
     nvt_equilibration_parameter_file_button.click(on_generate_nvt_equilibration_mdp_file, [working_directory_path_state, nvt_time_scale_slider, nvt_time_step_slider, nvt_temperature_slider, nvt_equilibration_parameter_file_name_textbox], [working_directory_file_list_state, status_markdown])
-    nvt_equilibration_run_input_file_button.click(on_generate_nvt_equilibration_tpr_file, [working_directory_path_state, nvt_equilibration_input_file_name_dropdown, nvt_equilibration_input_topology_file_name_dropdown, nvt_equilibration_parameter_file_dropdown, nvt_equilibration_run_input_file_name_textbox], [working_directory_file_list_state, status_markdown])
-    run_nvt_equilibration_button.click(on_run_nvt_equilibration, [working_directory_path_state, nvt_equilibration_run_input_file_name_textbox, mpi_rank_slider, omp_threads_slider, nvt_process_state], [working_directory_file_list_state, status_markdown, nvt_process_state, run_nvt_equilibration_button])
+    nvt_equilibration_run_input_file_button.click(on_generate_nvt_equilibration_tpr_file, [working_directory_path_state, nvt_equilibration_input_file_name_dropdown, nvt_equilibration_input_topology_file_name_dropdown, nvt_equilibration_parameter_file_dropdown, nvt_equilibration_run_input_file_name_textbox, max_warns_slider], [working_directory_file_list_state, status_markdown])
+    run_nvt_equilibration_button.click(on_run_nvt_equilibration, [working_directory_path_state, nvt_equilibration_run_input_file_dropdown, mpi_rank_slider, omp_threads_slider, nvt_process_state], [working_directory_file_list_state, status_markdown, nvt_process_state, run_nvt_equilibration_button])
     nvt_equilibration_timer.tick(sync_button_state, nvt_process_state, run_nvt_equilibration_button)
 
     # NPT equilibration interaction
     npt_equilibration_parameter_file_button.click(on_generate_npt_equilibration_mdp_file, [working_directory_path_state, npt_time_scale_slider, npt_time_step_slider, npt_temperature_slider, npt_pressure_slider, npt_equilibration_parameter_file_name_textbox], [working_directory_file_list_state, status_markdown])
-    npt_equilibration_run_input_file_button.click(on_generate_npt_equilibration_tpr_file, [working_directory_path_state, npt_equilibration_input_file_name_dropdown, npt_equilibration_input_topology_file_name_dropdown, npt_equilibration_parameter_file_dropdown, npt_equilibration_run_input_file_name_textbox], [working_directory_file_list_state, status_markdown])
-    run_npt_equilibration_button.click(on_run_npt_equilibration, [working_directory_path_state, npt_equilibration_run_input_file_name_textbox, mpi_rank_slider, omp_threads_slider, npt_process_state], [working_directory_file_list_state, status_markdown, npt_process_state, run_npt_equilibration_button])
+    npt_equilibration_run_input_file_button.click(on_generate_npt_equilibration_tpr_file, [working_directory_path_state, npt_equilibration_input_file_name_dropdown, npt_equilibration_input_topology_file_name_dropdown, npt_equilibration_parameter_file_dropdown, npt_equilibration_run_input_file_name_textbox, max_warns_slider], [working_directory_file_list_state, status_markdown])
+    run_npt_equilibration_button.click(on_run_npt_equilibration, [working_directory_path_state, npt_equilibration_run_input_file_dropdown, mpi_rank_slider, omp_threads_slider, npt_process_state], [working_directory_file_list_state, status_markdown, npt_process_state, run_npt_equilibration_button])
     npt_equilibration_timer.tick(sync_button_state, npt_process_state, run_npt_equilibration_button)
 
     # Production MD interaction
     prod_md_mdp_type_radio.change(on_change_mdp_type, prod_md_mdp_type_radio, [prod_md_random_seed_textbox, prod_md_parameter_file_name_textbox])
     prod_md_parameter_file_button.click(on_generate_prod_md_mdp_file, [working_directory_path_state, prod_md_time_scale_slider, prod_md_time_step_slider, prod_md_temperature_slider, prod_md_pressure_slider, prod_md_mdp_type_radio, prod_md_random_seed_textbox, prod_md_parameter_file_name_textbox], [working_directory_file_list_state, status_markdown])
-    prod_md_run_input_file_button.click(on_generate_prod_md_tpr_file, [working_directory_path_state, prod_md_input_file_name_dropdown, prod_md_input_topology_file_name_dropdown, prod_md_parameter_file_dropdown, prod_md_run_input_file_name_textbox], [working_directory_file_list_state, status_markdown])
-    run_prod_md_button.click(on_run_prod_md, [working_directory_path_state, prod_md_run_input_file_name_textbox, mpi_rank_slider, omp_threads_slider, use_gpu, prod_md_initial_process_state], [working_directory_file_list_state, status_markdown, prod_md_initial_process_state, run_prod_md_button])
+    prod_md_run_input_file_button.click(on_generate_prod_md_tpr_file, [working_directory_path_state, prod_md_input_file_name_dropdown, prod_md_input_topology_file_name_dropdown, prod_md_parameter_file_dropdown, prod_md_run_input_file_name_textbox, max_warns_slider], [working_directory_file_list_state, status_markdown])
+    run_prod_md_button.click(on_run_prod_md, [working_directory_path_state, prod_md_run_input_file_dropdown, mpi_rank_slider, omp_threads_slider, use_gpu, prod_md_initial_process_state], [working_directory_file_list_state, status_markdown, prod_md_initial_process_state, run_prod_md_button])
     prod_md_initial_timer.tick(sync_button_state, prod_md_initial_process_state, run_prod_md_button)
-    continue_prod_md_button.click(on_continue_prod_md, [working_directory_path_state, prod_md_run_input_file_name_textbox, checkpoint_file_dropdown, mpi_rank_slider, omp_threads_slider, use_gpu, prod_md_continuation_process_state], [working_directory_file_list_state, status_markdown, prod_md_continuation_process_state, continue_prod_md_button])
+    continue_prod_md_button.click(on_continue_prod_md, [working_directory_path_state, prod_md_run_input_file_dropdown, checkpoint_file_dropdown, mpi_rank_slider, omp_threads_slider, use_gpu, prod_md_continuation_process_state], [working_directory_file_list_state, status_markdown, prod_md_continuation_process_state, continue_prod_md_button])
     prod_md_continuation_timer.tick(sync_button_state, prod_md_continuation_process_state, continue_prod_md_button)
 
     # Fix trajectory interaction
