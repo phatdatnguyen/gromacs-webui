@@ -1,4 +1,13 @@
 import os
+import threading
+
+class ProcessStateDict(dict):
+    """dict subclass for gr.State that creates a fresh lock on deep copy."""
+    def __init__(self):
+        super().__init__({"proc": None, "running": False, "lock": threading.Lock()})
+
+    def __deepcopy__(self, memo):
+        return ProcessStateDict()
 
 def get_default_ion_addition_mdp_file_content():
     return """

@@ -21,7 +21,7 @@ conda activate ./gromacs-env
 - Install packages:
 
 ```
-pip install gradio_modal
+pip install gradio
 pip install parmed
 pip install nglview==4.0
 conda install -c conda-forge acpype

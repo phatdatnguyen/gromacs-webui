@@ -1,4 +1,5 @@
 import os
+import re
 import time
 import threading
 import psutil
@@ -26,11 +27,16 @@ def on_open_working_directory(working_directory):
     if working_directory is None or working_directory.strip() == "":
         gr.Warning("Please specify a working directory.")
         return None, None, None, None, None
-    
-    working_directory_path = os.path.join("./data/", working_directory)
+
+    base = os.path.abspath("./data")
+    working_directory_path = os.path.abspath(os.path.join("./data/", working_directory))
+    if not (working_directory_path == base or working_directory_path.startswith(base + os.sep)):
+        gr.Warning("Invalid working directory: path must stay inside ./data/")
+        return None, None, None, None, None
+
     os.makedirs(working_directory_path, exist_ok=True)
     files = get_files_in_working_directory(working_directory_path)
-    
+
     return gr.update(choices=get_working_directories(), value=working_directory), working_directory_path, files, gr.update(interactive=True), gr.update(interactive=True)
 
 def on_file_list_change(working_directory_path,
@@ -69,7 +75,7 @@ def on_file_list_change(working_directory_path,
             file_type = "Other File"
         modified_time = time.ctime(os.path.getmtime(file_path))
         file_info.append([f, file_type, modified_time])
-        file_info.sort(key=lambda x: x[2].lower(), reverse=True) # Sort by modified time descending
+    file_info.sort(key=lambda x: x[2].lower(), reverse=True)
     file_df = pd.DataFrame(file_info, columns=["File", "Type", "Modified"])
 
     # Filter structure and text files
@@ -518,6 +524,33 @@ def on_add_ions_method_change(add_ions_method):
     else:  # add_ions_method == "Number"
         return gr.update(visible=False), gr.update(visible=True), gr.update(visible=True), gr.update(visible=True), gr.update(visible=True)
 
+def _find_sol_group(genion_cmd, working_directory_path):
+    tmp_gro = os.path.join(working_directory_path, ".probe_genion.gro")
+    tmp_top = os.path.join(working_directory_path, ".probe_genion.top")
+
+    probe_cmd = list(genion_cmd)
+    probe_cmd[probe_cmd.index("-o") + 1] = tmp_gro
+    top_idx = probe_cmd.index("-p") + 1
+    shutil.copy2(probe_cmd[top_idx], tmp_top)
+    probe_cmd[top_idx] = tmp_top
+
+    try:
+        probe = subprocess.Popen(probe_cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        _, stderr_probe = probe.communicate(input="0\n")
+    finally:
+        for f in [tmp_gro, tmp_top]:
+            try:
+                os.remove(f)
+            except OSError:
+                pass
+
+    for line in stderr_probe.splitlines():
+        m = re.search(r'Group\s+(\d+)\s+\(\s*SOL\s*\)', line)
+        if m:
+            return m.group(1)
+
+    raise Exception(f"Could not find SOL group in genion output:\n{stderr_probe}")
+
 def on_add_ions(working_directory_path, run_input_file_name, output_file_name, input_topology_file_name, output_topology_file_name, cation_name, anion_name, add_ion_method, concentration, cation_charge, anion_charge, number_of_cations, number_of_anions, neutralize):
     try:
         shutil.copy2(os.path.join(working_directory_path, input_topology_file_name), os.path.join(working_directory_path, output_topology_file_name))
@@ -541,9 +574,9 @@ def on_add_ions(working_directory_path, run_input_file_name, output_file_name, i
 
         print(f"Running command: {' '.join(cmd)}")
 
-        # genion requires user input to select a group; we will provide "SOL" (usually group 13)
+        sol_group = _find_sol_group(cmd, working_directory_path)
         process = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-        _, stderr = process.communicate(input="13\n")
+        _, stderr = process.communicate(input=f"{sol_group}\n")
 
         if process.returncode != 0:
             raise Exception(stderr)
@@ -645,18 +678,18 @@ def on_generate_nvt_equilibration_tpr_file(working_directory_path, input_file_na
     return get_files_in_working_directory(working_directory_path), "<span style='color:green;'>" + status + "</span>"
 
 def watch_process(proc, process_state):
-    proc.wait()  # wait until finished
+    proc.wait()
 
-    # If user already stopped it, do nothing
-    if not process_state["running"]:
-        return
-
-    # Process finished naturally
-    process_state["proc"] = None
-    process_state["running"] = False
+    with process_state["lock"]:
+        if not process_state["running"]:
+            return
+        process_state["proc"] = None
+        process_state["running"] = False
 
 def sync_button_state(process_state):
-    if process_state["running"]:
+    with process_state["lock"]:
+        running = process_state["running"]
+    if running:
         return gr.update(value="Stop", variant="stop")
     else:
         return gr.update(value="Start", variant="primary")
@@ -664,12 +697,12 @@ def sync_button_state(process_state):
 def on_run_nvt_equilibration(working_directory_path, run_input_file_name, mpi_rank, omp_threads, process_state):
     # ---------- STOP ----------
     if process_state["running"]:
-        proc = process_state["proc"]
+        with process_state["lock"]:
+            proc = process_state["proc"]
+            process_state["proc"] = None
+            process_state["running"] = False
         if proc and proc.poll() is None:
             proc.kill()
-
-        process_state["proc"] = None
-        process_state["running"] = False
 
         status = "NVT equilibration stopped by user."
 
@@ -691,8 +724,9 @@ def on_run_nvt_equilibration(working_directory_path, run_input_file_name, mpi_ra
 
         proc = subprocess.Popen(cmd, cwd='.', text=True)
 
-        process_state["proc"] = proc
-        process_state["running"] = True
+        with process_state["lock"]:
+            process_state["proc"] = proc
+            process_state["running"] = True
 
         threading.Thread(
             target=watch_process,
@@ -705,8 +739,9 @@ def on_run_nvt_equilibration(working_directory_path, run_input_file_name, mpi_ra
         return get_files_in_working_directory(working_directory_path), f"<span style='color:orange;'>{status}</span>", process_state, gr.update(value="Stop", variant="stop")
 
     except Exception as exc:
-        process_state["proc"] = None
-        process_state["running"] = False
+        with process_state["lock"]:
+            process_state["proc"] = None
+            process_state["running"] = False
 
         status = f"Error during NVT equilibration:<br>{exc}"
 
@@ -750,12 +785,12 @@ def on_generate_npt_equilibration_tpr_file(working_directory_path, input_file_na
 def on_run_npt_equilibration(working_directory_path, run_input_file_name, mpi_rank, omp_threads, process_state):
     # ---------- STOP ----------
     if process_state["running"]:
-        proc = process_state["proc"]
+        with process_state["lock"]:
+            proc = process_state["proc"]
+            process_state["proc"] = None
+            process_state["running"] = False
         if proc and proc.poll() is None:
             proc.kill()
-
-        process_state["proc"] = None
-        process_state["running"] = False
 
         status = "NPT equilibration stopped by user."
 
@@ -777,8 +812,9 @@ def on_run_npt_equilibration(working_directory_path, run_input_file_name, mpi_ra
 
         proc = subprocess.Popen(cmd, cwd='.', text=True)
 
-        process_state["proc"] = proc
-        process_state["running"] = True
+        with process_state["lock"]:
+            process_state["proc"] = proc
+            process_state["running"] = True
 
         threading.Thread(
             target=watch_process,
@@ -791,8 +827,9 @@ def on_run_npt_equilibration(working_directory_path, run_input_file_name, mpi_ra
         return get_files_in_working_directory(working_directory_path), f"<span style='color:orange;'>{status}</span>", process_state, gr.update(value="Stop", variant="stop")
 
     except Exception as exc:
-        process_state["proc"] = None
-        process_state["running"] = False
+        with process_state["lock"]:
+            process_state["proc"] = None
+            process_state["running"] = False
 
         status = f"Error during NPT equilibration:<br>{exc}"
 
@@ -841,12 +878,12 @@ def on_generate_prod_md_tpr_file(working_directory_path, input_file_name, input_
 def on_run_prod_md(working_directory_path, run_input_file_name, mpi_rank, omp_threads, use_gpu, process_state):
     # ---------- STOP ----------
     if process_state["running"]:
-        proc = process_state["proc"]
+        with process_state["lock"]:
+            proc = process_state["proc"]
+            process_state["proc"] = None
+            process_state["running"] = False
         if proc and proc.poll() is None:
             proc.kill()
-
-        process_state["proc"] = None
-        process_state["running"] = False
 
         status = "Production MD stopped by user."
 
@@ -877,8 +914,9 @@ def on_run_prod_md(working_directory_path, run_input_file_name, mpi_rank, omp_th
 
         proc = subprocess.Popen(cmd, cwd='.', text=True)
 
-        process_state["proc"] = proc
-        process_state["running"] = True
+        with process_state["lock"]:
+            process_state["proc"] = proc
+            process_state["running"] = True
 
         threading.Thread(
             target=watch_process,
@@ -889,10 +927,11 @@ def on_run_prod_md(working_directory_path, run_input_file_name, mpi_rank, omp_th
         status = "Production MD started."
 
         return get_files_in_working_directory(working_directory_path), f"<span style='color:orange;'>{status}</span>", process_state, gr.update(value="Stop", variant="stop")
-    
+
     except Exception as exc:
-        process_state["proc"] = None
-        process_state["running"] = False
+        with process_state["lock"]:
+            process_state["proc"] = None
+            process_state["running"] = False
 
         status = f"Error during Production MD:<br>{exc}"
 
@@ -901,12 +940,12 @@ def on_run_prod_md(working_directory_path, run_input_file_name, mpi_rank, omp_th
 def on_continue_prod_md(working_directory_path, run_input_file_name, checkpoint_file_name, mpi_rank, omp_threads, use_gpu, process_state):
     # ---------- STOP ----------
     if process_state["running"]:
-        proc = process_state["proc"]
+        with process_state["lock"]:
+            proc = process_state["proc"]
+            process_state["proc"] = None
+            process_state["running"] = False
         if proc and proc.poll() is None:
             proc.kill()
-
-        process_state["proc"] = None
-        process_state["running"] = False
 
         status = "Production MD stopped by user."
 
@@ -939,8 +978,9 @@ def on_continue_prod_md(working_directory_path, run_input_file_name, checkpoint_
 
         proc = subprocess.Popen(cmd, cwd='.', text=True)
 
-        process_state["proc"] = proc
-        process_state["running"] = True
+        with process_state["lock"]:
+            process_state["proc"] = proc
+            process_state["running"] = True
 
         threading.Thread(
             target=watch_process,
@@ -951,10 +991,11 @@ def on_continue_prod_md(working_directory_path, run_input_file_name, checkpoint_
         status = "Production MD started."
 
         return get_files_in_working_directory(working_directory_path), f"<span style='color:orange;'>{status}</span>", process_state, gr.update(value="Stop", variant="stop")
-    
+
     except Exception as exc:
-        process_state["proc"] = None
-        process_state["running"] = False
+        with process_state["lock"]:
+            process_state["proc"] = None
+            process_state["running"] = False
 
         status = f"Error during Production MD:<br>{exc}"
 
@@ -1246,7 +1287,7 @@ def protein_md_simulation_tab_content():
                                 with gr.Column():
                                     nvt_equilibration_run_input_file_dropdown = gr.Dropdown(label="Run Input File Name", choices=[], value=None)
                                 with gr.Column():
-                                    nvt_process_state = gr.State({"proc": None, "running": False})
+                                    nvt_process_state = gr.State(ProcessStateDict())
                                     run_nvt_equilibration_button = gr.Button(value="Run NVT Equilibration")
                                     nvt_equilibration_timer = gr.Timer(1.0)
                 with gr.Accordion(label="NPT Equilibration", open=False):
@@ -1283,7 +1324,7 @@ def protein_md_simulation_tab_content():
                                 with gr.Column():
                                     npt_equilibration_run_input_file_dropdown = gr.Dropdown(label="Run Input File Name", choices=[], value=None)
                                 with gr.Column():
-                                    npt_process_state = gr.State({"proc": None, "running": False})
+                                    npt_process_state = gr.State(ProcessStateDict())
                                     run_npt_equilibration_button = gr.Button(value="Run NPT Equilibration")
                                     npt_equilibration_timer = gr.Timer(1.0)
                 with gr.Accordion(label="Production MD", open=False):
@@ -1323,12 +1364,12 @@ def protein_md_simulation_tab_content():
                                     prod_md_run_input_file_dropdown = gr.Dropdown(label="Run Input File Name", choices=[], value=None)
                                 with gr.Column():
                                     gr.Markdown("*Run from beginning*")
-                                    prod_md_initial_process_state = gr.State({"proc": None, "running": False})
+                                    prod_md_initial_process_state = gr.State(ProcessStateDict())
                                     run_prod_md_button = gr.Button(value="Run production MD simulation")
                                     prod_md_initial_timer = gr.Timer(1.0)
                                 with gr.Column():
                                     gr.Markdown("*Run from a checkpoint*")
-                                    prod_md_continuation_process_state = gr.State({"proc": None, "running": False})
+                                    prod_md_continuation_process_state = gr.State(ProcessStateDict())
                                     checkpoint_file_dropdown = gr.Dropdown(label="Checkpoint File Name", choices=[], value=None)
                                     continue_prod_md_button = gr.Button(value="Continue production MD simulation")
                                     prod_md_continuation_timer = gr.Timer(1.0)
