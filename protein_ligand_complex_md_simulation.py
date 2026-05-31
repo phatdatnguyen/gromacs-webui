@@ -1,5 +1,6 @@
 import os
 import re
+import sys
 import time
 import threading
 import psutil
@@ -960,14 +961,41 @@ def on_run_npt_equilibration(working_directory_path, run_input_file_name, mpi_ra
 
         return get_files_in_working_directory(working_directory_path), f"<span style='color:red;'>{status}</span>", process_state, gr.update(value="Start", variant="primary")
 
+def on_toggle_nnpot(nnpot_active):
+    # Automatically download/generate the default NNPot checkpoint into the
+    # shared models directory the first time the option is enabled.
+    if not nnpot_active:
+        return ""
+
+    model_path = get_nnpot_model_path()
+    if os.path.exists(model_path):
+        return f"<span style='color:green;'>NNPot model '{model_path}' is ready.</span>"
+
+    try:
+        os.makedirs(NNPOT_MODEL_DIR, exist_ok=True)
+        script_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "generate_nnpot_model.py")
+
+        cmd = [sys.executable, script_path, model_path, DEFAULT_NNPOT_MODEL_NAME]
+        print(f"Running command: {' '.join(cmd)}")
+
+        subprocess.run(cmd, check=True)
+        status = f"NNPot model downloaded to '{model_path}'."
+    except Exception as exc:
+        status = "Error downloading neural network potential model!\n" + str(exc)
+        return "<span style='color:red;'>" + status + "</span>"
+
+    return "<span style='color:green;'>" + status + "</span>"
+
 def on_change_mdp_type(prod_md_mdp_type_radio):
     if prod_md_mdp_type_radio=="Initial":
         return gr.update(visible=True), "md_initial.mdp"
     else:
         return gr.update(visible=False), "md_continue.mdp"
 
-def on_generate_prod_md_mdp_file(working_directory_path, time_scale, time_step, temperature, pressure, mdp_type, random_seed, pparameter_file_name):
-    file_content = get_default_prod_md_mdp_file_content(time_scale_ps=time_scale*1000, time_step_ps=time_step, temperature=temperature, pressure=pressure, mdp_type=mdp_type, random_seed=random_seed, with_ligand=True)
+def on_generate_prod_md_mdp_file(working_directory_path, time_scale, time_step, temperature, pressure, mdp_type, random_seed, pparameter_file_name, nnpot_active, nnpot_input_group):
+    # The model checkpoint lives in the central models directory (relative to the
+    # repo root, which is the process working directory for grompp/mdrun).
+    file_content = get_default_prod_md_mdp_file_content(time_scale_ps=time_scale*1000, time_step_ps=time_step, temperature=temperature, pressure=pressure, mdp_type=mdp_type, random_seed=random_seed, with_ligand=True, nnpot_active=nnpot_active, nnpot_modelfile=get_nnpot_model_path(), nnpot_input_group=nnpot_input_group)
     file_path = os.path.join(working_directory_path, pparameter_file_name)
     try:
         with open(file_path, 'w') as file:
@@ -1529,8 +1557,12 @@ def protein_ligand_complex_md_simulation_tab_content():
                                     prod_md_random_seed_textbox = gr.Textbox(label="Random seed", value="0")
                                     prod_md_parameter_file_name_textbox = gr.Textbox(label="Parameter File Name", value="md_initial.mdp")
                                     prod_md_parameter_file_button = gr.Button(value="Generate Parameter File")
+                            with gr.Row():
+                                with gr.Column():
+                                    prod_md_nnpot_active_checkbox = gr.Checkbox(label="Use Machine Learning Potential (NNPot) — downloads the ANI-2x model automatically", value=False)
+                                    prod_md_nnpot_input_group_textbox = gr.Textbox(label="NNPot Input Group", value="System")
                     with gr.Row():
-                        with gr.Column():    
+                        with gr.Column():
                             with gr.Row():
                                 gr.Markdown("***Generate run input file for production MD simulation***")
                             with gr.Row():        
@@ -1685,7 +1717,8 @@ def protein_ligand_complex_md_simulation_tab_content():
 
     # Production MD interaction
     prod_md_mdp_type_radio.change(on_change_mdp_type, prod_md_mdp_type_radio, [prod_md_random_seed_textbox, prod_md_parameter_file_name_textbox])
-    prod_md_parameter_file_button.click(on_generate_prod_md_mdp_file, [working_directory_path_state, prod_md_time_scale_slider, prod_md_time_step_slider, prod_md_temperature_slider, prod_md_pressure_slider, prod_md_mdp_type_radio, prod_md_random_seed_textbox, prod_md_parameter_file_name_textbox], [working_directory_file_list_state, status_markdown])
+    prod_md_nnpot_active_checkbox.change(on_toggle_nnpot, prod_md_nnpot_active_checkbox, status_markdown)
+    prod_md_parameter_file_button.click(on_generate_prod_md_mdp_file, [working_directory_path_state, prod_md_time_scale_slider, prod_md_time_step_slider, prod_md_temperature_slider, prod_md_pressure_slider, prod_md_mdp_type_radio, prod_md_random_seed_textbox, prod_md_parameter_file_name_textbox, prod_md_nnpot_active_checkbox, prod_md_nnpot_input_group_textbox], [working_directory_file_list_state, status_markdown])
     prod_md_run_input_file_button.click(on_generate_prod_md_tpr_file, [working_directory_path_state, prod_md_input_file_name_dropdown, prod_md_input_topology_file_name_dropdown, prod_md_parameter_file_dropdown, prod_md_run_input_file_name_textbox, max_warns_slider], [working_directory_file_list_state, status_markdown])
     run_prod_md_button.click(on_run_prod_md, [working_directory_path_state, prod_md_run_input_file_dropdown, mpi_rank_slider, omp_threads_slider, use_gpu, prod_md_initial_process_state], [working_directory_file_list_state, status_markdown, prod_md_initial_process_state, run_prod_md_button])
     prod_md_initial_timer.tick(sync_button_state, prod_md_initial_process_state, run_prod_md_button)

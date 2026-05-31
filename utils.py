@@ -1,6 +1,16 @@
 import os
 import threading
 
+# Machine learning interatomic potential (NNPot) defaults.
+# Checkpoints are stored centrally in NNPOT_MODEL_DIR (relative to the repo root,
+# which is the process working directory for grompp/mdrun) and shared across runs.
+NNPOT_MODEL_DIR = "models"
+DEFAULT_NNPOT_MODEL_NAME = "ANI2x"
+DEFAULT_NNPOT_MODEL_FILE = "ani2x.pt"
+
+def get_nnpot_model_path():
+    return os.path.join(NNPOT_MODEL_DIR, DEFAULT_NNPOT_MODEL_FILE)
+
 class ProcessStateDict(dict):
     """dict subclass for gr.State that creates a fresh lock on deep copy."""
     def __init__(self):
@@ -77,7 +87,7 @@ rcoulomb        = 1.0
 coulombtype     = PME
 """
 
-def get_default_prod_md_mdp_file_content(time_scale_ps=1000, time_step_ps=0.002, temperature=300, pressure=1.0, mdp_type="Initial", random_seed=0, with_ligand=False):
+def get_default_prod_md_mdp_file_content(time_scale_ps=1000, time_step_ps=0.002, temperature=300, pressure=1.0, mdp_type="Initial", random_seed=0, with_ligand=False, nnpot_active=False, nnpot_modelfile="ani2x.pt", nnpot_input_group="System"):
     content = f"""
 integrator      = md
 dt              = {time_step_ps}
@@ -126,6 +136,18 @@ gen_seed        = {random_seed}
         content = content + f"""
 ; Continuation
 continuation    = yes
+"""
+
+    if nnpot_active:
+        content = content + f"""
+; Neural network potential (machine learning interatomic potential)
+nnpot-active          = true
+nnpot-modelfile       = {nnpot_modelfile}
+nnpot-input-group     = {nnpot_input_group}
+nnpot-model-input1    = atom-positions
+nnpot-model-input2    = atom-numbers
+nnpot-model-input3    = box
+nnpot-model-input4    = pbc
 """
 
     return content

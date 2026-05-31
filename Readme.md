@@ -21,11 +21,18 @@ conda activate ./gromacs-env
 - Install packages:
 
 ```
-pip install gradio
-pip install parmed
-pip install nglview==4.0
+python -m pip install gradio
+python -m pip install parmed
+python -m pip install nglview==4.0
 conda install -c conda-forge acpype
 conda install -c conda-forge mdanalysis
+```
+- To run MD with machine learning potentials:
+
+```
+python -m pip install torch==2.8 --index-url https://download.pytorch.org/whl/cu128
+python -m pip install torchani
+
 ```
 
 ## Start web UI

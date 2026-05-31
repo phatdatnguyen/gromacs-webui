@@ -1,5 +1,6 @@
 flagged/
 gromacs-env/
+models/
 data/
 static/
 __pycache__/
