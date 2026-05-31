@@ -29,36 +29,18 @@ emtol       = 1000.0
 """
 
 def get_default_nvt_equilibration_mdp_file_content(time_scale_ps=500, time_step_ps=0.002, temperature=300, with_ligand=False):
-    if with_ligand:
-        tc_grps_value = "Protein LIG Water_and_ions"
-        tau_t_value = "0.1 0.1 0.1"
-        temperature_value = f"{temperature} {temperature} {temperature}"
-    else:
-        tc_grps_value = "Protein Water_and_ions"
-        tau_t_value = "0.1 0.1"
-        temperature_value = f"{temperature} {temperature}"
-
     return f"""
 integrator  = md
 dt          = {time_step_ps}
 nsteps      = {int(time_scale_ps / time_step_ps)}
 tcoupl      = V-rescale
-tc-grps     = {tc_grps_value}
-tau_t       = {tau_t_value}
-ref_t       = {temperature_value}
+tc-grps     = System
+tau_t       = 0.1
+ref_t       = {temperature}
 constraints = h-bonds
 """
 
 def get_default_npt_equilibration_mdp_file_content(time_scale_ps=1000, time_step_ps=0.002, temperature=300, pressure=1.0, with_ligand=False):
-    if with_ligand:
-        tc_grps_value = "Protein LIG Water_and_ions"
-        tau_t_value = "0.1 0.1 0.1"
-        temperature_value = f"{temperature} {temperature} {temperature}"
-    else:
-        tc_grps_value = "Protein Water_and_ions"
-        tau_t_value = "0.1 0.1"
-        temperature_value = f"{temperature} {temperature}"
-    
     return f"""
 integrator      = md
 dt              = {time_step_ps}
@@ -72,9 +54,9 @@ nstlog          = 1000
 
 ; Temperature coupling
 tcoupl          = V-rescale
-tc-grps         = {tc_grps_value}
-tau_t           = {tau_t_value}
-ref_t           = {temperature_value}
+tc-grps         = System
+tau_t           = 0.1
+ref_t           = {temperature}
 
 ; Pressure coupling
 pcoupl          = Parrinello-Rahman
@@ -96,15 +78,6 @@ coulombtype     = PME
 """
 
 def get_default_prod_md_mdp_file_content(time_scale_ps=1000, time_step_ps=0.002, temperature=300, pressure=1.0, mdp_type="Initial", random_seed=0, with_ligand=False):
-    if with_ligand:
-        tc_grps_value = "Protein LIG Water_and_ions"
-        tau_t_value = "0.1 0.1 0.1"
-        temperature_value = f"{temperature} {temperature} {temperature}"
-    else:
-        tc_grps_value = "Protein Water_and_ions"
-        tau_t_value = "0.1 0.1"
-        temperature_value = f"{temperature} {temperature}"
-    
     content = f"""
 integrator      = md
 dt              = {time_step_ps}
@@ -126,9 +99,9 @@ coulombtype     = PME
 
 ; Temperature coupling
 tcoupl          = V-rescale
-tc-grps         = {tc_grps_value}
-tau_t           = {tau_t_value}
-ref_t           = {temperature_value}
+tc-grps         = System
+tau_t           = 0.1
+ref_t           = {temperature}
 
 ; Pressure coupling
 pcoupl          = Parrinello-Rahman
