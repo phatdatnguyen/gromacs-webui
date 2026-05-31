@@ -30,8 +30,9 @@ conda install -c conda-forge mdanalysis
 - To run MD with machine learning potentials:
 
 ```
-python -m pip install torch==2.8 --index-url https://download.pytorch.org/whl/cu128
-python -m pip install torchani
+python -m pip install torch==2.8 --index-url https://download.pytorch.org/whl/cu129
+python -m pip install -v --no-build-isolation --config-settings=--global-option=ext torchani
+ani build-extensions
 
 ```
 
