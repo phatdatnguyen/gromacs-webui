@@ -1,4 +1,6 @@
 import os
+os.environ.setdefault("MPLCONFIGDIR", "/tmp/matplotlib")
+os.environ.setdefault("XDG_CACHE_HOME", "/tmp")
 import re
 import time
 import threading
@@ -17,11 +19,17 @@ from utils import *
 
 def get_working_directories():
     base_path = "./data/"
+    os.makedirs(base_path, exist_ok=True)
     return [d for d in os.listdir(base_path) if os.path.isdir(os.path.join(base_path, d))]
 
 def get_files_in_working_directory(working_directory_path):
+    if working_directory_path is None or not os.path.isdir(working_directory_path):
+        return []
     files = [f for f in os.listdir(working_directory_path) if not (f.startswith('#') or f.endswith("Zone.Identifier") or os.path.isdir(os.path.join(working_directory_path, f)))]
     return files
+
+def get_default_cpu_count():
+    return max(1, psutil.cpu_count(logical=False) or os.cpu_count() or 1)
 
 def on_open_working_directory(working_directory):
     if working_directory is None or working_directory.strip() == "":
@@ -486,8 +494,8 @@ def on_solvate_protein(working_directory_path, input_file_name, output_file_name
 
 def on_generate_ions_mdp_file(working_directory_path, parameter_file_name):
     file_content = get_default_ion_addition_mdp_file_content()
-    file_path = os.path.join(working_directory_path, parameter_file_name)
     try:
+        file_path = os.path.join(working_directory_path, parameter_file_name)
         with open(file_path, 'w') as file:
             file.write(file_content)
         status = "Ion addition parameter file generated successfully."
@@ -590,8 +598,8 @@ def on_add_ions(working_directory_path, run_input_file_name, output_file_name, i
 
 def on_generate_energy_minimization_mdp_file(working_directory_path, parameter_file_name):
     file_content = get_default_energy_minimization_mdp_file_content()
-    file_path = os.path.join(working_directory_path, parameter_file_name)
     try:
+        file_path = os.path.join(working_directory_path, parameter_file_name)
         with open(file_path, 'w') as file:
             file.write(file_content)
         status = "Energy minimization parameter file generated successfully."
@@ -644,8 +652,8 @@ def on_run_energy_minimization(working_directory_path, run_input_file_name, mpi_
 
 def on_generate_nvt_equilibration_mdp_file(working_directory_path, time_scale, time_step, temperature, parameter_file_name):
     file_content = get_default_nvt_equilibration_mdp_file_content(time_scale_ps=time_scale, time_step_ps=time_step, temperature=temperature)
-    file_path = os.path.join(working_directory_path, parameter_file_name)
     try:
+        file_path = os.path.join(working_directory_path, parameter_file_name)
         with open(file_path, 'w') as file:
             file.write(file_content)
         status = "NVT equilibration parameter file generated successfully."
@@ -749,8 +757,8 @@ def on_run_nvt_equilibration(working_directory_path, run_input_file_name, mpi_ra
 
 def on_generate_npt_equilibration_mdp_file(working_directory_path, time_scale, time_step, temperature, pressure, parameter_file_name):
     file_content = get_default_npt_equilibration_mdp_file_content(time_scale_ps=time_scale, time_step_ps=time_step, temperature=temperature, pressure=pressure)
-    file_path = os.path.join(working_directory_path, parameter_file_name)
     try:
+        file_path = os.path.join(working_directory_path, parameter_file_name)
         with open(file_path, 'w') as file:
             file.write(file_content)
         status = "NPT equilibration parameter file generated successfully."
@@ -865,8 +873,8 @@ def on_generate_prod_md_mdp_file(working_directory_path, time_scale, time_step, 
             return get_files_in_working_directory(working_directory_path), "<span style='color:red;'>" + status + "</span>"
 
     file_content = get_default_prod_md_mdp_file_content(time_scale_ps=time_scale*1000, time_step_ps=time_step, temperature=temperature, pressure=pressure, mdp_type=mdp_type, random_seed=random_seed, nnpot_active=nnpot_active, nnpot_modelfile_path=nnpot_modelfile_path, nnpot_input_group=nnpot_input_group, nnpot_model_name=nnpot_model_name)
-    file_path = os.path.join(working_directory_path, parameter_file_name)
     try:
+        file_path = os.path.join(working_directory_path, parameter_file_name)
         with open(file_path, 'w') as file:
             file.write(file_content)
         status = "Production MD parameter file generated successfully."
@@ -1173,10 +1181,10 @@ def protein_md_simulation_tab_content():
                     status_markdown = gr.Markdown()
                 with gr.Accordion(label="Settings", open=False):
                     with gr.Row():
-                        mpi_rank_slider = gr.Slider(label="MPI Ranks", minimum=1, maximum=psutil.cpu_count(logical=False), value=1, step=1)
+                        mpi_rank_slider = gr.Slider(label="MPI Ranks", minimum=1, maximum=get_default_cpu_count(), value=1, step=1)
                         omp_threads_slider = gr.Slider(label="OpenMP Threads", minimum=1, maximum=128, value=1, step=1)
                         max_warns_slider = gr.Slider(label="Max Warnings", minimum=0, maximum=10, value=5, step=1)
-                        use_gpu = gr.Checkbox(label="Use GPU", value="True")
+                        use_gpu = gr.Checkbox(label="Use GPU", value=True)
                 with gr.Accordion(label="Upload Protein Structure", open=True):
                     with gr.Row():
                         protein_structure_file_name_textbox = gr.Textbox(label="Protein File Name", value="protein.pdb")
@@ -1368,7 +1376,7 @@ def protein_md_simulation_tab_content():
                                             prod_md_pressure_slider = gr.Slider(label="Pressure (atm)", minimum=0.1, maximum=10, value=1, step=0.1)
                                     with gr.Row():
                                         prod_md_nnpot_active_checkbox = gr.Checkbox(label="Use Machine Learning Potential (NNPot)", value=False)
-                                        prod_md_nnpot_model_dropdown = gr.Dropdown(label="Model", choices=["ani1x", "ani2x", "mace-small", "mace-medium", "mace-large", "aimnet2"], value="ani2x")
+                                        prod_md_nnpot_model_dropdown = gr.Dropdown(label="Model", choices=["ani1x", "ani2x", "ani2x-emle", "mace-small", "mace-medium", "mace-large", "aimnet2"], value="ani2x")
                                         prod_md_nnpot_input_group_textbox = gr.Textbox(label="NNPot Input Group", value="Protein")
                                 with gr.Column():
                                     prod_md_mdp_type_radio = gr.Radio(label="Initial or continuation", choices=["Initial", "Continuation"], value="Initial")

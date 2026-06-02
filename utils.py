@@ -1,7 +1,13 @@
 import os
 import threading
 import torch
-from nnpot_models import ANI1xModelWrapper, ANI2xModelWrapper, GmxAIMNet2Model, GmxMACEModel
+from nnpot_models import (
+    GmxAIMNet2Model,
+    GmxANI1xModel,
+    GmxANI2xEMLEModel,
+    GmxANI2xModel,
+    GmxMACEModel,
+)
 from e3nn.util.jit import script
 
 def get_torchani_install_error_message(exc):
@@ -22,6 +28,31 @@ def get_torchani_install_error_message(exc):
         f"Original import error: {message}"
     )
 
+def get_emle_install_error_message(model_name, exc):
+    if model_name != "ani2x-emle":
+        return None
+
+    message = str(exc)
+    if "pygit2" in message:
+        return (
+            "EMLE could not fetch its model resources because the Python "
+            "package 'pygit2' is missing.\n\n"
+            "Install it in the active environment, then regenerate the MDP:\n"
+            "  python -m pip install pygit2\n\n"
+            f"Original import error: {message}"
+        )
+    if "SpeciesEnergies" in message and "torchani" in message:
+        return (
+            "EMLE could not import TorchANI compatibility classes. The wrapper "
+            "adds a TorchANI 2.8 compatibility shim, but this EMLE/TorchANI "
+            "combination still appears incompatible.\n\n"
+            "Try reinstalling EMLE after TorchANI, or use the TorchANI version "
+            "recommended by your EMLE checkout.\n\n"
+            f"Original import error: {message}"
+        )
+
+    return None
+
 def get_nnpot_model_load_error_message(exc):
     message = str(exc)
     if "torch.classes.cuaev.CuaevComputer" not in message:
@@ -38,6 +69,8 @@ def get_nnpot_model_load_error_message(exc):
 def get_expected_nnpot_model_config(model_name):
     if model_name in ["ani1x", "ani2x"]:
         return f"{model_name}|torchani|pyaev|adaptive|extensions-disabled"
+    if model_name == "ani2x-emle":
+        return f"{model_name}|emle|empty-mm-environment|energy-only-pyaev-v2"
     if model_name.startswith("mace-"):
         return f"{model_name}|mace|internal-neighbors-singular-cell-v4"
     if model_name == "aimnet2":
@@ -104,6 +137,7 @@ def download_nnpot_model(model_name):
     os.environ.setdefault("AIMNET_CACHE_DIR", os.path.abspath("./models/aimnet-cache"))
     modelfile_path = os.path.join("./models", f"{model_name}.pt")
     is_ani_model = model_name in ["ani1x", "ani2x"]
+    is_emle_model = model_name == "ani2x-emle"
     
     if os.path.exists(modelfile_path):
         if not is_cached_nnpot_model_usable(model_name, modelfile_path):
@@ -117,14 +151,16 @@ def download_nnpot_model(model_name):
     # Download the model
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     try:
-        if is_ani_model:
+        if is_ani_model or model_name == "ani2x-emle":
             os.environ["TORCHANI_DISABLE_EXTENSIONS"] = "1"
         if model_name=="ani1x":
-            model = ANI1xModelWrapper(device)
+            model = GmxANI1xModel(device)
         elif model_name=="ani2x":
-            model = ANI2xModelWrapper(device)
+            model = GmxANI2xModel(device)
         elif model_name=="aimnet2":
             model = GmxAIMNet2Model(device)
+        elif model_name=="ani2x-emle":
+            model = GmxANI2xEMLEModel(device)
         else:
             model_size = model_name.split('-')[1]
             model = GmxMACEModel(model_size, device)
@@ -132,6 +168,9 @@ def download_nnpot_model(model_name):
         torchani_message = get_torchani_install_error_message(exc)
         if torchani_message is not None:
             raise RuntimeError(torchani_message) from exc
+        emle_message = get_emle_install_error_message(model_name, exc)
+        if emle_message is not None:
+            raise RuntimeError(emle_message) from exc
         raise
     
     # Save the model
@@ -140,6 +179,8 @@ def download_nnpot_model(model_name):
     if model_name == "aimnet2":
         scripted_model = trace_aimnet2_model(model)
         scripted_model.save(modelfile_path, _extra_files=extensions)
+    elif is_emle_model:
+        torch.jit.script(model).save(modelfile_path, _extra_files=extensions)
     elif not "mace" in model_name:
         torch.jit.script(model).save(modelfile_path, _extra_files=extensions)
     else:

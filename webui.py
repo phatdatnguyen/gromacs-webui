@@ -40,8 +40,6 @@ def find_available_port(start_port=7860):
             except OSError:
                 port += 1  # Try next port
 
-available_port = find_available_port()
-
 with gr.Blocks() as blocks:
     with gr.Tabs() as tabs:
         protein_md_simulation_tab_content()
@@ -52,4 +50,5 @@ app = gr.mount_gradio_app(app, blocks, css_paths=Path('./styles.css'), path="/")
 
 # serve the app
 if __name__ == "__main__":
+    available_port = find_available_port()
     uvicorn.run(app, host="127.0.0.1", port=available_port, access_log=False)

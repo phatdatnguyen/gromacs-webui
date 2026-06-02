@@ -1,9 +1,44 @@
+import os
 import torch
 from torch import nn
 from typing import Optional
-import os
 
-class ANI1xModelWrapper(nn.Module):
+def load_emle_model_classes():
+    # EMLE currently imports SpeciesEnergies from the TorchANI 2.7 location.
+    # TorchANI 2.8 moved it to torchani.tuples, so provide the old attribute
+    # before importing EMLE.
+    import torchani.aev as torchani_aev
+    import torchani.nn as torchani_nn
+    from torchani.tuples import SpeciesAEV, SpeciesEnergies
+
+    if not hasattr(torchani_nn, "SpeciesEnergies"):
+        torchani_nn.SpeciesEnergies = SpeciesEnergies
+    if not hasattr(torchani_aev, "SpeciesAEV"):
+        torchani_aev.SpeciesAEV = SpeciesAEV
+
+    from emle.models import ANI2xEMLE
+    from emle._units import _HARTREE_TO_KJ_MOL, _NANOMETER_TO_ANGSTROM
+
+    def _add_torchani28_hook(self):
+        from torch import Tensor
+        from typing import Optional, Tuple
+
+        self._ani2x.aev_computer._aev = torch.empty(0, device=self._device)
+
+        def hook(
+            module,
+            input: Tuple[Tensor, Optional[Tensor], Optional[Tensor], Optional[Tensor]],
+            output: Tensor,
+        ):
+            module._aev = output
+
+        self._aev_hook = self._ani2x.aev_computer.register_forward_hook(hook)
+
+    ANI2xEMLE._add_hook = _add_torchani28_hook
+
+    return ANI2xEMLE, _NANOMETER_TO_ANGSTROM, _HARTREE_TO_KJ_MOL
+
+class GmxANI1xModel(nn.Module):
     def __init__(self, device:str):
         super().__init__()
         from torchani.models import ANI1x
@@ -37,7 +72,7 @@ class ANI1xModelWrapper(nn.Module):
 
         return energy
 
-class ANI2xModelWrapper(nn.Module):
+class GmxANI2xModel(nn.Module):
     def __init__(self, device:str):
         super().__init__()
         from torchani.models import ANI2x
@@ -221,3 +256,37 @@ class GmxAIMNet2Model(torch.nn.Module):
         energy = result["energy"].reshape(-1)[0] * self.energy_conversion
 
         return energy
+
+class GmxANI2xEMLEModel(torch.nn.Module):
+    def __init__(self, device: str, qm_charge: int=0, **kwargs):
+        super().__init__()
+        ANI2xEMLE, length_conversion, energy_conversion = load_emle_model_classes()
+        kwargs.setdefault("device", torch.device(device))
+        self.model = ANI2xEMLE(**kwargs)
+        self.is_nnpops = self.model._is_nnpops
+        self.qm_charge = int(qm_charge)
+
+        self.length_conversion = length_conversion
+        self.energy_conversion = energy_conversion
+
+    def forward(self, positions_nn, atomic_numbers,
+                cell: Optional[torch.Tensor]=None, pbc: Optional[torch.Tensor]=None):
+        device = positions_nn.device
+        # convert units
+        positions_nn = positions_nn * self.length_conversion
+        if cell is not None:
+            cell = cell.to(dtype=positions_nn.dtype, device=device) * self.length_conversion
+        positions_mm = torch.zeros((0, 3), dtype=positions_nn.dtype, device=device)
+        charges_mm = torch.zeros((0,), dtype=positions_nn.dtype, device=device)
+        atomic_numbers = atomic_numbers.to(dtype=torch.int64, device=device)
+
+        if not self.is_nnpops:
+            positions_nn = positions_nn.unsqueeze(0)
+            positions_mm = positions_mm.unsqueeze(0)
+            atomic_numbers = atomic_numbers.unsqueeze(0)
+            charges_mm = charges_mm.unsqueeze(0)
+
+        E = self.model(atomic_numbers, charges_mm, positions_nn, positions_mm, cell, self.qm_charge)
+        E_tot = E.sum() * self.energy_conversion
+
+        return E_tot
