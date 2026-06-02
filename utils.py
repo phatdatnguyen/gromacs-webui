@@ -1,15 +1,154 @@
 import os
 import threading
+import torch
+from nnpot_models import ANI1xModelWrapper, ANI2xModelWrapper, GmxAIMNet2Model, GmxMACEModel
+from e3nn.util.jit import script
 
-# Machine learning interatomic potential (NNPot) defaults.
-# Checkpoints are stored centrally in NNPOT_MODEL_DIR (relative to the repo root,
-# which is the process working directory for grompp/mdrun) and shared across runs.
-NNPOT_MODEL_DIR = "models"
-DEFAULT_NNPOT_MODEL_NAME = "ANI2x"
-DEFAULT_NNPOT_MODEL_FILE = "ani2x.pt"
+def get_torchani_install_error_message(exc):
+    message = str(exc)
+    if "PERIODIC_TABLE" not in message or "torchani.utils" not in message:
+        return None
 
-def get_nnpot_model_path():
-    return os.path.join(NNPOT_MODEL_DIR, DEFAULT_NNPOT_MODEL_FILE)
+    return (
+        "TorchANI could not be imported because the current environment appears "
+        "to contain a mixed or stale TorchANI installation. This usually happens "
+        "after installing the newer pip package over the older conda package, "
+        "leaving incompatible files from both versions in site-packages.\n\n"
+        "Repair the conda environment, then try generating the MDP again:\n"
+        "  python -m pip uninstall -y torchani\n"
+        "  python -m pip uninstall -y torchani\n"
+        "  python -m pip install torchani\n"
+        "  ani build-extensions\n\n"
+        f"Original import error: {message}"
+    )
+
+def get_nnpot_model_load_error_message(exc):
+    message = str(exc)
+    if "torch.classes.cuaev.CuaevComputer" not in message:
+        return None
+
+    return (
+        "The cached ANI model was scripted with TorchANI's optional cuAEV "
+        "extension, but that custom class is not available when the model is "
+        "loaded. Rebuild the cached ANI model with the pure PyTorch AEV "
+        "strategy.\n\n"
+        f"Original model load error: {message}"
+    )
+
+def get_expected_nnpot_model_config(model_name):
+    if model_name in ["ani1x", "ani2x"]:
+        return f"{model_name}|torchani|pyaev|adaptive|extensions-disabled"
+    if model_name.startswith("mace-"):
+        return f"{model_name}|mace|internal-neighbors-singular-cell-v4"
+    if model_name == "aimnet2":
+        return f"{model_name}|aimnet|traced-positions-numbers-box-pbc-device-float64-v5"
+    return model_name
+
+def is_cached_nnpot_model_usable(model_name, modelfile_path):
+    extra_files = {"nnpot_model_config": ""}
+    try:
+        torch.jit.load(modelfile_path, map_location="cpu", _extra_files=extra_files)
+        cached_config = extra_files["nnpot_model_config"]
+        if isinstance(cached_config, bytes):
+            cached_config = cached_config.decode()
+        if cached_config != get_expected_nnpot_model_config(model_name):
+            backup_path = modelfile_path + ".invalid"
+            os.replace(modelfile_path, backup_path)
+            print(f"Moved outdated cached NNPot model to {backup_path}.")
+            return False
+        return True
+    except RuntimeError as exc:
+        if get_nnpot_model_load_error_message(exc) is not None:
+            backup_path = modelfile_path + ".invalid"
+            os.replace(modelfile_path, backup_path)
+            print(f"Moved unusable cached NNPot model to {backup_path}.")
+            return False
+        raise
+
+def checkExtensions():
+    ext_lib = []
+    for lib in torch.ops.loaded_libraries:
+        if lib:
+            ext_lib.append(lib)
+    ext_lib = ":".join(ext_lib)
+    print("Loaded extension libraries: ", ext_lib)
+    extra_files = {}
+    if ext_lib:
+        extra_files['extension_libs'] = ext_lib
+    return extra_files
+
+def trace_aimnet2_model(model):
+    model.eval()
+    try:
+        device = next(model.parameters()).device
+    except StopIteration:
+        device = torch.device("cpu")
+    positions = torch.tensor(
+        [[0.0, 0.0, 0.0], [0.09572, 0.0, 0.0], [-0.02399, 0.0927, 0.0]],
+        dtype=torch.float32,
+        device=device,
+    )
+    atomic_numbers = torch.tensor([8, 1, 1], dtype=torch.int64, device=device)
+    cell = torch.eye(3, dtype=torch.float32, device=device)
+    pbc = torch.tensor([True, True, True], device=device)
+    return torch.jit.trace(
+        model,
+        (positions, atomic_numbers, cell, pbc),
+        strict=False,
+        check_trace=False,
+    )
+
+def download_nnpot_model(model_name):
+    os.makedirs("./models", exist_ok=True)
+    os.environ.setdefault("WARP_CACHE_PATH", os.path.abspath("./models/warp-cache"))
+    os.environ.setdefault("AIMNET_CACHE_DIR", os.path.abspath("./models/aimnet-cache"))
+    modelfile_path = os.path.join("./models", f"{model_name}.pt")
+    is_ani_model = model_name in ["ani1x", "ani2x"]
+    
+    if os.path.exists(modelfile_path):
+        if not is_cached_nnpot_model_usable(model_name, modelfile_path):
+            print(f"Rebuilding {model_name}.")
+        else:
+            return modelfile_path
+
+    if os.path.exists(modelfile_path):
+        return modelfile_path
+
+    # Download the model
+    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    try:
+        if is_ani_model:
+            os.environ["TORCHANI_DISABLE_EXTENSIONS"] = "1"
+        if model_name=="ani1x":
+            model = ANI1xModelWrapper(device)
+        elif model_name=="ani2x":
+            model = ANI2xModelWrapper(device)
+        elif model_name=="aimnet2":
+            model = GmxAIMNet2Model(device)
+        else:
+            model_size = model_name.split('-')[1]
+            model = GmxMACEModel(model_size, device)
+    except ImportError as exc:
+        torchani_message = get_torchani_install_error_message(exc)
+        if torchani_message is not None:
+            raise RuntimeError(torchani_message) from exc
+        raise
+    
+    # Save the model
+    extensions = checkExtensions()
+    extensions["nnpot_model_config"] = get_expected_nnpot_model_config(model_name)
+    if model_name == "aimnet2":
+        scripted_model = trace_aimnet2_model(model)
+        scripted_model.save(modelfile_path, _extra_files=extensions)
+    elif not "mace" in model_name:
+        torch.jit.script(model).save(modelfile_path, _extra_files=extensions)
+    else:
+        # for MACE, we need to use the e3nn scipting function
+        scripted_model = script(model)
+        scripted_model.save(modelfile_path, _extra_files=extensions)
+    print(f"Saved wrapped model to {modelfile_path}.")
+    
+    return modelfile_path
 
 class ProcessStateDict(dict):
     """dict subclass for gr.State that creates a fresh lock on deep copy."""
@@ -87,7 +226,7 @@ rcoulomb        = 1.0
 coulombtype     = PME
 """
 
-def get_default_prod_md_mdp_file_content(time_scale_ps=1000, time_step_ps=0.002, temperature=300, pressure=1.0, mdp_type="Initial", random_seed=0, with_ligand=False, nnpot_active=False, nnpot_modelfile="ani2x.pt", nnpot_input_group="System"):
+def get_default_prod_md_mdp_file_content(time_scale_ps=1000, time_step_ps=0.002, temperature=300, pressure=1.0, mdp_type="Initial", random_seed=0, with_ligand=False, nnpot_active=False, nnpot_modelfile_path="models/ani2x.pt", nnpot_input_group="Protein", nnpot_model_name="ani2x"):
     content = f"""
 integrator      = md
 dt              = {time_step_ps}
@@ -113,16 +252,25 @@ tc-grps         = System
 tau_t           = 0.1
 ref_t           = {temperature}
 
+; Constraints
+constraints     = h-bonds
+constraint_algorithm = lincs
+"""
+    if nnpot_active:
+        content = content + """
+; Pressure coupling
+; NNPot wrappers currently return energies, not virials/stress. Keep the box
+; fixed after NPT equilibration to avoid unstable pressure scaling.
+pcoupl          = no
+"""
+    else:
+        content = content + f"""
 ; Pressure coupling
 pcoupl          = Parrinello-Rahman
 pcoupltype      = isotropic
 tau_p           = 2.0
 ref_p           = {pressure}
 compressibility = 4.5e-5
-
-; Constraints
-constraints     = h-bonds
-constraint_algorithm = lincs
 """
     if mdp_type=="Initial":
         content = content + f"""
@@ -139,16 +287,14 @@ continuation    = yes
 """
 
     if nnpot_active:
-        content = content + f"""
-; Neural network potential (machine learning interatomic potential)
-nnpot-active          = true
-nnpot-modelfile       = {nnpot_modelfile}
-nnpot-input-group     = {nnpot_input_group}
-nnpot-model-input1    = atom-positions
+        content = content + "\n; Neural network potential (machine learning interatomic potential)\n"
+        content = content + "nnpot-active          = true\n"
+        content = content + f"nnpot-modelfile       = {nnpot_modelfile_path}\n"
+        content = content + f"nnpot-input-group     = {nnpot_input_group}\n"
+        content = content + """nnpot-model-input1    = atom-positions
 nnpot-model-input2    = atom-numbers
 nnpot-model-input3    = box
-nnpot-model-input4    = pbc
-"""
+nnpot-model-input4    = pbc"""
 
     return content
 

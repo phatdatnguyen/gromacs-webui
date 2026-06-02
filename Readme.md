@@ -21,18 +21,20 @@ conda activate ./gromacs-env
 - Install packages:
 
 ```
-python -m pip install gradio
-python -m pip install parmed
-python -m pip install nglview==4.0
-conda install -c conda-forge acpype
-conda install -c conda-forge mdanalysis
+python -m pip install gradio parmed nglview==4.0
+conda install -c conda-forge acpype mdanalysis
 ```
 - To run MD with machine learning potentials:
 
 ```
 python -m pip install torch==2.8 --index-url https://download.pytorch.org/whl/cu129
+python -m pip install cuequivariance cuequivariance-torch
 python -m pip install -v --no-build-isolation --config-settings=--global-option=ext torchani
-ani build-extensions
+ani build-extensions --sm 8.9 # use --sm 8.9 for RTX 40X0, --sm 12.0 for RTX 50X0
+conda install -c conda-forge nnpops
+python -m pip install aimnet
+python -m pip install git+https://github.com/chemle/emle-engine
+python -m pip install mace-torch
 
 ```
 

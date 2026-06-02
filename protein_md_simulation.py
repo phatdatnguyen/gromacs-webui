@@ -1,6 +1,5 @@
 import os
 import re
-import sys
 import time
 import threading
 import psutil
@@ -837,29 +836,13 @@ def on_run_npt_equilibration(working_directory_path, run_input_file_name, mpi_ra
         return get_files_in_working_directory(working_directory_path), f"<span style='color:red;'>{status}</span>", process_state, gr.update(value="Start", variant="primary")
 
 def on_toggle_nnpot(nnpot_active):
-    # Automatically download/generate the default NNPot checkpoint into the
-    # shared models directory the first time the option is enabled.
+    # The actual model is built by wrap_gmx_model.py when the production MD
+    # parameter file is generated (it may need the input structure for atom
+    # typing), so here we just acknowledge the choice.
     if not nnpot_active:
         return ""
-
-    model_path = get_nnpot_model_path()
-    if os.path.exists(model_path):
-        return f"<span style='color:green;'>NNPot model '{model_path}' is ready.</span>"
-
-    try:
-        os.makedirs(NNPOT_MODEL_DIR, exist_ok=True)
-        script_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "generate_nnpot_model.py")
-
-        cmd = [sys.executable, script_path, model_path, DEFAULT_NNPOT_MODEL_NAME]
-        print(f"Running command: {' '.join(cmd)}")
-
-        subprocess.run(cmd, check=True)
-        status = f"NNPot model downloaded to '{model_path}'."
-    except Exception as exc:
-        status = "Error downloading neural network potential model!\n" + str(exc)
-        return "<span style='color:red;'>" + status + "</span>"
-
-    return "<span style='color:green;'>" + status + "</span>"
+    return ("<span style='color:green;'>Machine learning potential enabled. "
+            "The selected model will be built when you generate the production MD parameter file.</span>")
 
 def on_change_mdp_type(prod_md_mdp_type_radio):
     if prod_md_mdp_type_radio=="Initial":
@@ -867,11 +850,22 @@ def on_change_mdp_type(prod_md_mdp_type_radio):
     else:
         return gr.update(visible=False), "md_continue.mdp"
 
-def on_generate_prod_md_mdp_file(working_directory_path, time_scale, time_step, temperature, pressure, mdp_type, random_seed, pparameter_file_name, nnpot_active, nnpot_input_group):
-    # The model checkpoint lives in the central models directory (relative to the
-    # repo root, which is the process working directory for grompp/mdrun).
-    file_content = get_default_prod_md_mdp_file_content(time_scale_ps=time_scale*1000, time_step_ps=time_step, temperature=temperature, pressure=pressure, mdp_type=mdp_type, random_seed=random_seed, nnpot_active=nnpot_active, nnpot_modelfile=get_nnpot_model_path(), nnpot_input_group=nnpot_input_group)
-    file_path = os.path.join(working_directory_path, pparameter_file_name)
+def on_generate_prod_md_mdp_file(working_directory_path, time_scale, time_step, temperature, pressure, mdp_type, random_seed, parameter_file_name, nnpot_active, nnpot_model_name, nnpot_input_group):
+    if parameter_file_name is None or str(parameter_file_name).strip() == "":
+        parameter_file_name = "md_initial.mdp" if mdp_type == "Initial" else "md_continue.mdp"
+
+    # Build (or reuse) the requested NNPot model via the universal wrapper and
+    # collect the matching nnpot-model-input* keywords before writing the MDP.
+    nnpot_modelfile_path = None
+    if nnpot_active:
+        try:
+            nnpot_modelfile_path = download_nnpot_model(nnpot_model_name)
+        except Exception as exc:
+            status = "Error downloading NNPot model!\n" + str(exc)
+            return get_files_in_working_directory(working_directory_path), "<span style='color:red;'>" + status + "</span>"
+
+    file_content = get_default_prod_md_mdp_file_content(time_scale_ps=time_scale*1000, time_step_ps=time_step, temperature=temperature, pressure=pressure, mdp_type=mdp_type, random_seed=random_seed, nnpot_active=nnpot_active, nnpot_modelfile_path=nnpot_modelfile_path, nnpot_input_group=nnpot_input_group, nnpot_model_name=nnpot_model_name)
+    file_path = os.path.join(working_directory_path, parameter_file_name)
     try:
         with open(file_path, 'w') as file:
             file.write(file_content)
@@ -903,7 +897,7 @@ def on_generate_prod_md_tpr_file(working_directory_path, input_file_name, input_
         
     return get_files_in_working_directory(working_directory_path), "<span style='color:green;'>" + status + "</span>"
 
-def on_run_prod_md(working_directory_path, run_input_file_name, mpi_rank, omp_threads, use_gpu, process_state):
+def on_run_prod_md(working_directory_path, run_input_file_name, mpi_rank, omp_threads, prod_md_nnpot_active, use_gpu, process_state):
     # ---------- STOP ----------
     if process_state["running"]:
         with process_state["lock"]:
@@ -920,6 +914,8 @@ def on_run_prod_md(working_directory_path, run_input_file_name, mpi_rank, omp_th
     # ---------- START ----------
     try:
         base_name = os.path.splitext(run_input_file_name)[0]
+        if prod_md_nnpot_active:
+            mpi_rank = 1
 
         cmd = [
             "gmx", "mdrun",
@@ -928,7 +924,7 @@ def on_run_prod_md(working_directory_path, run_input_file_name, mpi_rank, omp_th
             "-ntomp", str(omp_threads),
             "-v"
         ]
-        if use_gpu:
+        if use_gpu and not prod_md_nnpot_active:
             cmd.extend([
                 "-nb", "gpu",
                 "-pme", "gpu",
@@ -965,7 +961,7 @@ def on_run_prod_md(working_directory_path, run_input_file_name, mpi_rank, omp_th
 
         return get_files_in_working_directory(working_directory_path), f"<span style='color:red;'>{status}</span>", process_state, gr.update(value="Start", variant="primary")
 
-def on_continue_prod_md(working_directory_path, run_input_file_name, checkpoint_file_name, mpi_rank, omp_threads, use_gpu, process_state):
+def on_continue_prod_md(working_directory_path, run_input_file_name, checkpoint_file_name, mpi_rank, omp_threads, prod_md_nnpot_active, use_gpu, process_state):
     # ---------- STOP ----------
     if process_state["running"]:
         with process_state["lock"]:
@@ -982,6 +978,8 @@ def on_continue_prod_md(working_directory_path, run_input_file_name, checkpoint_
     # ---------- START ----------
     try:
         base_name = os.path.splitext(run_input_file_name)[0]
+        if prod_md_nnpot_active:
+            mpi_rank = 1
 
         cmd = [
             "gmx", "mdrun",
@@ -992,7 +990,7 @@ def on_continue_prod_md(working_directory_path, run_input_file_name, checkpoint_
             "-append",
             "-v"
         ]
-        if use_gpu:
+        if use_gpu and not prod_md_nnpot_active:
             cmd.extend([
                 "-nb", "gpu",
                 "-pme", "gpu",
@@ -1176,7 +1174,7 @@ def protein_md_simulation_tab_content():
                 with gr.Accordion(label="Settings", open=False):
                     with gr.Row():
                         mpi_rank_slider = gr.Slider(label="MPI Ranks", minimum=1, maximum=psutil.cpu_count(logical=False), value=1, step=1)
-                        omp_threads_slider = gr.Slider(label="OpenMP Threads", minimum=1, maximum=int(os.environ.get("OMP_NUM_THREADS")), value=int(os.environ.get("OMP_NUM_THREADS")), step=1)
+                        omp_threads_slider = gr.Slider(label="OpenMP Threads", minimum=1, maximum=128, value=1, step=1)
                         max_warns_slider = gr.Slider(label="Max Warnings", minimum=0, maximum=10, value=5, step=1)
                         use_gpu = gr.Checkbox(label="Use GPU", value="True")
                 with gr.Accordion(label="Upload Protein Structure", open=True):
@@ -1362,19 +1360,22 @@ def protein_md_simulation_tab_content():
                                 gr.Markdown("***Generate parameter file for production MD simulation***")
                             with gr.Row():
                                 with gr.Column():
-                                    prod_md_time_scale_slider = gr.Slider(label="Production MD Time (ns)", minimum=1, maximum=1000, value=500, step=1)
-                                    prod_md_time_step_slider = gr.Slider(label="Time Step (ps)", minimum=0.001, maximum=0.005, value=0.002, step=0.001)
-                                    prod_md_temperature_slider = gr.Slider(label="Target Temperature (K)", minimum=100, maximum=500, value=300, step=10)
-                                    prod_md_pressure_slider = gr.Slider(label="Pressure (atm)", minimum=0.1, maximum=10, value=1, step=0.1)
+                                    with gr.Row():
+                                        with gr.Column():
+                                            prod_md_time_scale_slider = gr.Slider(label="Production MD Time (ns)", minimum=0.001, maximum=1000, value=500, step=1)
+                                            prod_md_time_step_slider = gr.Slider(label="Time Step (ps)", minimum=0.001, maximum=0.005, value=0.002, step=0.001)
+                                            prod_md_temperature_slider = gr.Slider(label="Target Temperature (K)", minimum=100, maximum=500, value=300, step=10)
+                                            prod_md_pressure_slider = gr.Slider(label="Pressure (atm)", minimum=0.1, maximum=10, value=1, step=0.1)
+                                    with gr.Row():
+                                        prod_md_nnpot_active_checkbox = gr.Checkbox(label="Use Machine Learning Potential (NNPot)", value=False)
+                                        prod_md_nnpot_model_dropdown = gr.Dropdown(label="Model", choices=["ani1x", "ani2x", "mace-small", "mace-medium", "mace-large", "aimnet2"], value="ani2x")
+                                        prod_md_nnpot_input_group_textbox = gr.Textbox(label="NNPot Input Group", value="Protein")
                                 with gr.Column():
                                     prod_md_mdp_type_radio = gr.Radio(label="Initial or continuation", choices=["Initial", "Continuation"], value="Initial")
                                     prod_md_random_seed_textbox = gr.Textbox(label="Random seed", value="0")
                                     prod_md_parameter_file_name_textbox = gr.Textbox(label="Parameter File Name", value="md_initial.mdp")
                                     prod_md_parameter_file_button = gr.Button(value="Generate Parameter File")
-                            with gr.Row():
-                                with gr.Column():
-                                    prod_md_nnpot_active_checkbox = gr.Checkbox(label="Use Machine Learning Potential (NNPot) — downloads the ANI-2x model automatically", value=False)
-                                    prod_md_nnpot_input_group_textbox = gr.Textbox(label="NNPot Input Group", value="System")
+
                     with gr.Row():
                         with gr.Column():
                             with gr.Row():
@@ -1517,11 +1518,11 @@ def protein_md_simulation_tab_content():
     # Production MD interaction
     prod_md_mdp_type_radio.change(on_change_mdp_type, prod_md_mdp_type_radio, [prod_md_random_seed_textbox, prod_md_parameter_file_name_textbox])
     prod_md_nnpot_active_checkbox.change(on_toggle_nnpot, prod_md_nnpot_active_checkbox, status_markdown)
-    prod_md_parameter_file_button.click(on_generate_prod_md_mdp_file, [working_directory_path_state, prod_md_time_scale_slider, prod_md_time_step_slider, prod_md_temperature_slider, prod_md_pressure_slider, prod_md_mdp_type_radio, prod_md_random_seed_textbox, prod_md_parameter_file_name_textbox, prod_md_nnpot_active_checkbox, prod_md_nnpot_input_group_textbox], [working_directory_file_list_state, status_markdown])
+    prod_md_parameter_file_button.click(on_generate_prod_md_mdp_file, [working_directory_path_state, prod_md_time_scale_slider, prod_md_time_step_slider, prod_md_temperature_slider, prod_md_pressure_slider, prod_md_mdp_type_radio, prod_md_random_seed_textbox, prod_md_parameter_file_name_textbox, prod_md_nnpot_active_checkbox, prod_md_nnpot_model_dropdown, prod_md_nnpot_input_group_textbox], [working_directory_file_list_state, status_markdown])
     prod_md_run_input_file_button.click(on_generate_prod_md_tpr_file, [working_directory_path_state, prod_md_input_file_name_dropdown, prod_md_input_topology_file_name_dropdown, prod_md_parameter_file_dropdown, prod_md_run_input_file_name_textbox, max_warns_slider], [working_directory_file_list_state, status_markdown])
-    run_prod_md_button.click(on_run_prod_md, [working_directory_path_state, prod_md_run_input_file_dropdown, mpi_rank_slider, omp_threads_slider, use_gpu, prod_md_initial_process_state], [working_directory_file_list_state, status_markdown, prod_md_initial_process_state, run_prod_md_button])
+    run_prod_md_button.click(on_run_prod_md, [working_directory_path_state, prod_md_run_input_file_dropdown, mpi_rank_slider, omp_threads_slider, prod_md_nnpot_active_checkbox, use_gpu, prod_md_initial_process_state], [working_directory_file_list_state, status_markdown, prod_md_initial_process_state, run_prod_md_button])
     prod_md_initial_timer.tick(sync_button_state, prod_md_initial_process_state, run_prod_md_button)
-    continue_prod_md_button.click(on_continue_prod_md, [working_directory_path_state, prod_md_run_input_file_dropdown, checkpoint_file_dropdown, mpi_rank_slider, omp_threads_slider, use_gpu, prod_md_continuation_process_state], [working_directory_file_list_state, status_markdown, prod_md_continuation_process_state, continue_prod_md_button])
+    continue_prod_md_button.click(on_continue_prod_md, [working_directory_path_state, prod_md_run_input_file_dropdown, checkpoint_file_dropdown, mpi_rank_slider, omp_threads_slider, prod_md_nnpot_active_checkbox, use_gpu, prod_md_continuation_process_state], [working_directory_file_list_state, status_markdown, prod_md_continuation_process_state, continue_prod_md_button])
     prod_md_continuation_timer.tick(sync_button_state, prod_md_continuation_process_state, continue_prod_md_button)
 
     # Fix trajectory interaction

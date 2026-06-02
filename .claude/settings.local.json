@@ -1,0 +1,31 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(ls *)",
+      "Bash(cd \"\\\\\\\\wsl.localhost\\\\Ubuntu-24.04\\\\home\\\\datnguyen\\\\github\\\\gromacs-webui\")",
+      "Bash(rm -f generate_nnpot_model.py)",
+      "Bash(python -m py_compile utils.py wrap_gmx_model.py protein_md_simulation.py protein_ligand_complex_md_simulation.py webui.py)",
+      "Bash(python -c ' *)",
+      "Bash(python -m py_compile wrap_gmx_model.py utils.py protein_md_simulation.py protein_ligand_complex_md_simulation.py)",
+      "Bash(python _eltest.py)",
+      "Bash(rm -f _eltest.py)",
+      "Bash(python -m py_compile wrap_gmx_model.py)",
+      "Bash(python -m py_compile wrap_gmx_model.py utils.py)",
+      "Bash(wsl *)",
+      "Bash(python -c \"import torchani; print\\(torchani.__version__\\); print\\(torchani.__file__\\)\")",
+      "Read(//c/Users/nguye/github/**)",
+      "Read(//c/Users/nguye/github/gromacs-webui/**)",
+      "WebSearch",
+      "Bash(wsl.exe -d Ubuntu-24.04 -- bash -lc \"cd ~/github/gromacs-webui && ls && echo '---ENV---' && head -5 environment.yml 2>/dev/null; echo '---'; ls gromacs-env 2>/dev/null | head\")",
+      "Bash(wsl.exe -d Ubuntu-24.04 -- bash -lc \"cd ~/github/gromacs-webui && ./gromacs-env/bin/python -c 'import torchani; print\\(\\\\\"version\\\\\", torchani.__version__\\); print\\(\\\\\"file\\\\\", torchani.__file__\\)'\")",
+      "Bash(wsl.exe -d Ubuntu-24.04 -- bash -lc \"cd ~/github/gromacs-webui && ./gromacs-env/bin/pip show torchani 2>/dev/null | head -6; echo '==='; ./gromacs-env/bin/python -c 'import torch; print\\(\\\\\"torch\\\\\", torch.__version__\\)'\")",
+      "Bash(wsl.exe -d Ubuntu-24.04 -- bash -lc 'cd ~/github/gromacs-webui && grep -n \"tpr\\\\|grompp\\\\|nnpot\\\\|nnp\\\\|NNPot\\\\|gmx\" protein_md_simulation.py | head -60')",
+      "WebFetch(domain:manual.gromacs.org)",
+      "Bash(wsl.exe -d Ubuntu-24.04 -- bash -lc 'cd ~/github/gromacs-webui && grep -n \"nnpot\\\\|model-input\\\\|model_input\\\\|def get_default_prod_md_mdp\" utils.py')",
+      "WebFetch(domain:arxiv.org)",
+      "WebFetch(domain:github.com)",
+      "Bash(wsl.exe -d Ubuntu-24.04 -- bash -lc 'cd /tmp && rm -rf gmx-nnpot-tools && git clone --depth 1 https://github.com/lmuellender/gmx-nnpot-tools 2>&1 | tail -3 && echo \"=== FILES ===\" && find gmx-nnpot-tools -name \"*.py\" -o -name \"*.ipynb\" | head -40')",
+      "Bash(wsl.exe *)"
+    ]
+  }
+}
