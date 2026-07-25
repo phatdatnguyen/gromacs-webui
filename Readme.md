@@ -45,3 +45,25 @@ To start the web UI:
 conda activate ./gromacs-env
 python webui.py
 ```
+
+## Tests
+The suite lives in `tests/` and uses only the standard library's `unittest`, so no
+extra packages are needed. Run it from the repository root:
+
+```
+conda activate ./gromacs-env
+python -m unittest discover
+```
+
+Most tests build their own structures and trajectories and run in a few seconds.
+The ones in `tests/test_gromacs_workflow.py` drive the real `gmx` binaries and skip
+themselves when GROMACS is not on `PATH`; the CHARMM tests additionally skip when
+`charmm36` is not installed in the GROMACS tree. Each test works inside a
+throwaway directory under `./data/`, cleaned up afterwards.
+
+To run one module or one test:
+
+```
+python -m unittest tests.test_utils_species
+python -m unittest tests.test_viewers.TrajectoryReductionTests.test_stride_is_computed_to_respect_the_cap
+```

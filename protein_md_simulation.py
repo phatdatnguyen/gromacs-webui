@@ -7,6 +7,7 @@ import threading
 import psutil
 import shutil
 import subprocess
+from pathlib import Path
 import pandas as pd
 import gradio as gr
 import nglview
@@ -14,30 +15,44 @@ import MDAnalysis as mda
 from MDAnalysis.analysis import rms
 import matplotlib.pyplot as plt
 from utils import *
+from collections.abc import Sequence
+from typing import Any
+
+# What gr.update() hands back to Gradio.
+GradioUpdate = dict[str, Any]
+from path_security import DATA_ROOT, secure_module_callbacks, validate_file_name
 
 
-def get_working_directories():
+def get_working_directories() -> list[str]:
+    """Names of the job directories that already exist under ./data."""
     base_path = "./data/"
     os.makedirs(base_path, exist_ok=True)
     return [d for d in os.listdir(base_path) if os.path.isdir(os.path.join(base_path, d))]
 
-def get_files_in_working_directory(working_directory_path):
+def get_files_in_working_directory(working_directory_path: str | None) -> list[str]:
+    """Visible files in a job directory, hiding GROMACS backups and Zone.Identifier files."""
     if working_directory_path is None or not os.path.isdir(working_directory_path):
         return []
     files = [f for f in os.listdir(working_directory_path) if not (f.startswith('#') or f.endswith("Zone.Identifier") or os.path.isdir(os.path.join(working_directory_path, f)))]
     return files
 
-def get_default_cpu_count():
+def get_default_cpu_count() -> int:
+    """Physical core count, used as the upper bound of the MPI rank slider."""
     return max(1, psutil.cpu_count(logical=False) or os.cpu_count() or 1)
 
-def on_open_working_directory(working_directory):
+def on_open_working_directory(working_directory: str | None) -> tuple[Any, ...]:
+    """Create or open a job directory under ./data and enable the file actions."""
     if working_directory is None or working_directory.strip() == "":
         gr.Warning("Please specify a working directory.")
         return None, None, None, None, None
 
-    base = os.path.abspath("./data")
-    working_directory_path = os.path.abspath(os.path.join("./data/", working_directory))
-    if not (working_directory_path == base or working_directory_path.startswith(base + os.sep)):
+    try:
+        validate_file_name(working_directory, "working directory")
+        working_directory_path = str((DATA_ROOT / working_directory).resolve())
+    except ValueError as exc:
+        gr.Warning(str(exc))
+        return None, None, None, None, None
+    if DATA_ROOT not in Path(working_directory_path).parents:
         gr.Warning("Invalid working directory: path must stay inside ./data/")
         return None, None, None, None, None
 
@@ -46,15 +61,23 @@ def on_open_working_directory(working_directory):
 
     return gr.update(choices=get_working_directories(), value=working_directory), working_directory_path, files, gr.update(interactive=True), gr.update(interactive=True)
 
-def on_file_list_change(working_directory_path,
-                        protein_structure_file_name, topology_output_file_name, box_output_file_name, topology_output_topology_file_name,
-                        solvation_output_file_name, solvation_output_topology_file_name,
-                        generate_ions_parameter_file_name, generate_ions_run_input_file_name, generate_ions_output_file_name, generate_ions_output_topology_file_name,
-                        energy_minimization_parameter_file_name, energy_minimization_run_input_file_name,
-                        nvt_equilibration_parameter_file_name, nvt_equilibration_run_input_file_name,
-                        npt_equilibration_parameter_file_name, npt_equilibration_run_input_file_name,
-                        prod_md_parameter_file_name, prod_md_run_input_file_name,
-                        make_mol_whole_output_traj_file_name, center_protein_output_traj_file_name, fit_backbone_output_traj_file_name):
+def on_file_list_change(working_directory_path: str, protein_structure_file_name: str,
+                        topology_output_file_name: str, box_output_file_name: str,
+                        topology_output_topology_file_name: str, solvation_output_file_name: str,
+                        solvation_output_topology_file_name: str, generate_ions_parameter_file_name: str,
+                        generate_ions_run_input_file_name: str, generate_ions_output_file_name: str,
+                        generate_ions_output_topology_file_name: str, energy_minimization_parameter_file_name:
+                        str, energy_minimization_run_input_file_name: str,
+                        nvt_equilibration_parameter_file_name: str, nvt_equilibration_run_input_file_name: str,
+                        npt_equilibration_parameter_file_name: str, npt_equilibration_run_input_file_name: str,
+                        prod_md_parameter_file_name: str, prod_md_run_input_file_name: str,
+                        make_mol_whole_output_traj_file_name: str, center_protein_output_traj_file_name: str,
+                        fit_backbone_output_traj_file_name: str) -> tuple[Any, ...]:
+    """Refresh the file table and re-point every file dropdown.
+
+    Each argument is the current value of the matching output-name textbox, so a
+    dropdown keeps pointing at the file the previous step just produced.
+    """
     files = get_files_in_working_directory(working_directory_path)
     # Update the file dataframe
     file_info = []
@@ -316,7 +339,8 @@ def on_file_list_change(working_directory_path,
         gr.update(choices=structure_files, value=analysis_structure_file_name_value), \
         gr.update(choices=viewer_trajectory_files, value=analysis_input_traj_file_name_value)
 
-def on_select_file(evt: gr.SelectData):
+def on_select_file(evt: gr.SelectData) -> tuple[Any, ...]:
+    """Route the clicked file row to the structure or text viewer state."""
     selected_file_name = evt.row_value[0]
     if selected_file_name.endswith('.pdb') or selected_file_name.endswith('.gro'):
         return selected_file_name, selected_file_name, None, gr.update(interactive=True)
@@ -325,16 +349,19 @@ def on_select_file(evt: gr.SelectData):
     else:
         return selected_file_name, None, None, gr.update(interactive=True)
 
-def on_selected_structure_file_state_change(state):
+def on_selected_structure_file_state_change(state: str | None) -> tuple[GradioUpdate, GradioUpdate]:
+    """Enable the View Structure button and reveal the accordion holding it."""
     # Open the accordion the button lives in, so a selected file is one click away.
     # Only ever open it: closing would collapse a viewer the user is reading just
     # because they clicked a row of a different type.
     return gr.update(interactive=(state is not None)), gr.update(open=True) if state is not None else gr.update()
 
-def on_selected_text_file_state_change(state):
+def on_selected_text_file_state_change(state: str | None) -> tuple[GradioUpdate, GradioUpdate]:
+    """Enable the View Text File button and reveal the accordion holding it."""
     return gr.update(interactive=(state is not None)), gr.update(open=True) if state is not None else gr.update()
 
-def on_delete_file(working_directory_path, selected_file_name):
+def on_delete_file(working_directory_path: str, selected_file_name: str | None) -> list[str]:
+    """Delete the selected file and return the refreshed file list."""
     if selected_file_name is None:
         return get_files_in_working_directory(working_directory_path)
     
@@ -348,7 +375,8 @@ def on_delete_file(working_directory_path, selected_file_name):
     
     return get_files_in_working_directory(working_directory_path)
 
-def on_clean_working_directory(working_directory_path):
+def on_clean_working_directory(working_directory_path: str) -> list[str]:
+    """Remove GROMACS backup files and Zone.Identifier leftovers."""
     try:
         files_to_clean = [f for f in os.listdir(working_directory_path) if f.startswith('#') or f.endswith("Zone.Identifier")]
         for f in files_to_clean:
@@ -362,7 +390,8 @@ def on_clean_working_directory(working_directory_path):
     
     return get_files_in_working_directory(working_directory_path)
 
-def on_view_protein_structure(working_directory_path, protein_file_name):
+def on_view_protein_structure(working_directory_path: str, protein_file_name: str) -> tuple[str | None, str]:
+    """Render a single frame with nglview and report the species it contains."""
     try:
         # Representations follow whatever species the file actually contains, so
         # ions like CU2P are drawn instead of being silently skipped.
@@ -389,7 +418,10 @@ def on_view_protein_structure(working_directory_path, protein_file_name):
         gr.Warning("Error!\n" + str(exc))
         return None, "<span style='color:red;'>Error loading structure!</span>"
 
-def on_view_trajectory(working_directory_path, structure_file_name, trajectory_file_name, selection, max_frames):
+def on_view_trajectory(working_directory_path: str, structure_file_name: str | None,
+                       trajectory_file_name: str | None, selection: str,
+                       max_frames: int) -> tuple[str | None, str | None]:
+    """Reduce the trajectory, then return an iframe that animates it with NGL."""
     if structure_file_name is None or trajectory_file_name is None:
         gr.Warning("Please select both a structure file and a trajectory file.")
         return None, None
@@ -418,7 +450,9 @@ def on_view_trajectory(working_directory_path, structure_file_name, trajectory_f
         gr.Warning("Error!\n" + str(exc))
         return None, "<span style='color:red;'>Error loading trajectory!</span>"
 
-def on_view_text_file(working_directory_path, text_file_name):
+def on_view_text_file(working_directory_path: str,
+                      text_file_name: str) -> tuple[GradioUpdate | None, GradioUpdate | None]:
+    """Load a text file into the editor and enable saving it."""
     text_file_path = os.path.join(working_directory_path, text_file_name)
     try:
         with open(text_file_path, 'r') as file:
@@ -428,7 +462,9 @@ def on_view_text_file(working_directory_path, text_file_name):
         gr.Warning("Error!\n" + str(exc))
         return None, None
 
-def on_save_text_file(working_directory_path, text_file_name, text_content):
+def on_save_text_file(working_directory_path: str, text_file_name: str | None,
+                      text_content: str) -> list[str]:
+    """Write the editor contents back to the file."""
     if text_file_name is None:
         gr.Warning("Please select a text file to save.")
         return get_files_in_working_directory(working_directory_path)
@@ -444,7 +480,9 @@ def on_save_text_file(working_directory_path, text_file_name, text_content):
     
     return get_files_in_working_directory(working_directory_path)
 
-def on_upload_protein_structure_file(working_directory_path, protein_structure_file_name, protein_structure_file_path):
+def on_upload_protein_structure_file(working_directory_path: str, protein_structure_file_name: str,
+                                     protein_structure_file_path: str) -> tuple[list[str], str]:
+    """Copy an uploaded protein structure into the job directory."""
     # Upload and rename the file
     save_file_path = os.path.join(working_directory_path, protein_structure_file_name)
     try:
@@ -459,7 +497,10 @@ def on_upload_protein_structure_file(working_directory_path, protein_structure_f
         status = "Error uploading file!\n" + str(exc)
         return get_files_in_working_directory(working_directory_path), "<span style='color:red;'>" + status + "</span>"
 
-def on_generate_protein_topology(working_directory_path, input_file_name, output_file_name, output_topology_file_name, force_field, water_model, n_terminus, c_terminus):
+def on_generate_protein_topology(working_directory_path: str, input_file_name: str, output_file_name: str,
+                                 output_topology_file_name: str, force_field: str, water_model: str,
+                                 n_terminus: str, c_terminus: str) -> tuple[list[str], str]:
+    """Run pdb2gmx, optionally choosing explicit N- and C-terminus patches."""
     try:
         # Run inside the working directory with plain file names: pdb2gmx writes the
         # -i path verbatim into the topology's "#ifdef POSRES" include, so passing a
@@ -483,6 +524,15 @@ def on_generate_protein_topology(working_directory_path, input_file_name, output
 
         if select_termini:
             answers, resolved_termini = resolve_terminus_selections(cmd, working_directory_path, n_terminus, c_terminus)
+
+        if select_termini and answers is None:
+            # The AMBER ports, for example, patch termini through renamed terminal
+            # residues and offer no menu, so run without -ter instead of failing.
+            cmd.remove("-ter")
+            run_checked_command(cmd, cwd=working_directory_path)
+            status = ("Topology generated successfully. This force field offers no terminus "
+                      "selection, so its own default termini were applied.")
+        elif select_termini:
             process = subprocess.Popen(cmd, cwd=working_directory_path, stdin=subprocess.PIPE,
                                        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
             _, stderr = process.communicate(input=answers)
@@ -500,7 +550,9 @@ def on_generate_protein_topology(working_directory_path, input_file_name, output
         
     return get_files_in_working_directory(working_directory_path), "<span style='color:green;'>" + status + "</span>"
 
-def on_generate_simulation_box(working_directory_path, input_file_name, output_file_name, box_type, distance):
+def on_generate_simulation_box(working_directory_path: str, input_file_name: str, output_file_name: str,
+                               box_type: str, distance: float) -> tuple[list[str], str]:
+    """Run editconf to centre the solute in a box of the requested shape."""
     try:
         cmd = [
             "gmx", "editconf",
@@ -521,7 +573,10 @@ def on_generate_simulation_box(working_directory_path, input_file_name, output_f
         
     return get_files_in_working_directory(working_directory_path), "<span style='color:green;'>" + status + "</span>"
 
-def on_solvate_protein(working_directory_path, input_file_name, output_file_name, input_topology_file_name, output_topology_file_name, solvent_configuration):
+def on_solvate_protein(working_directory_path: str, input_file_name: str, output_file_name: str,
+                       input_topology_file_name: str, output_topology_file_name: str,
+                       solvent_configuration: str) -> tuple[list[str], str]:
+    """Run solvate to fill the box with the chosen solvent configuration."""
     try:
         shutil.copy2(os.path.join(working_directory_path, input_topology_file_name), os.path.join(working_directory_path, output_topology_file_name))
 
@@ -543,7 +598,9 @@ def on_solvate_protein(working_directory_path, input_file_name, output_file_name
         
     return get_files_in_working_directory(working_directory_path), "<span style='color:green;'>" + status + "</span>"
 
-def on_generate_ions_mdp_file(working_directory_path, parameter_file_name, force_field):
+def on_generate_ions_mdp_file(working_directory_path: str, parameter_file_name: str,
+                              force_field: str) -> tuple[list[str], str]:
+    """Write the MDP used for the minimisation that precedes ion placement."""
     file_content = get_default_ion_addition_mdp_file_content(force_field=force_field)
     try:
         file_path = os.path.join(working_directory_path, parameter_file_name)
@@ -556,7 +613,9 @@ def on_generate_ions_mdp_file(working_directory_path, parameter_file_name, force
     
     return get_files_in_working_directory(working_directory_path), "<span style='color:green;'>" + status + "</span>"
 
-def on_generate_ions_tpr_file(working_directory_path, input_file_name, input_topology_file_name, parameter_file_name, run_input_file_name, max_warnings):
+def on_generate_ions_tpr_file(working_directory_path: str, input_file_name: str, input_topology_file_name: str,
+                              parameter_file_name: str, run_input_file_name: str, max_warnings: int) -> tuple[list[str], str]:
+    """Run grompp to build the run input file that genion needs."""
     try:
         cmd = [
             "gmx", "grompp",
@@ -564,7 +623,10 @@ def on_generate_ions_tpr_file(working_directory_path, input_file_name, input_top
             "-c", os.path.join(working_directory_path, input_file_name),
             "-p", os.path.join(working_directory_path, input_topology_file_name),
             "-o", os.path.join(working_directory_path, run_input_file_name),
-            "-maxwarn", str(max_warnings)
+            "-maxwarn", str(max_warnings),
+            # Without -po this byproduct lands in the process working directory,
+            # which is the repository root rather than the job directory.
+            "-po", os.path.join(working_directory_path, "mdout.mdp")
         ]
 
         print(f"Running command: {' '.join(cmd)}")
@@ -577,13 +639,18 @@ def on_generate_ions_tpr_file(working_directory_path, input_file_name, input_top
         
     return get_files_in_working_directory(working_directory_path), "<span style='color:green;'>" + status + "</span>"
 
-def on_add_ions_method_change(add_ions_method):
+def on_add_ions_method_change(add_ions_method: str) -> tuple[GradioUpdate, ...]:
+    """Show either the concentration slider or the explicit ion count sliders."""
     if add_ions_method == "Concentration":
         return gr.update(visible=True), gr.update(visible=False), gr.update(visible=False), gr.update(visible=False), gr.update(visible=False)
     else:  # add_ions_method == "Number"
         return gr.update(visible=False), gr.update(visible=True), gr.update(visible=True), gr.update(visible=True), gr.update(visible=True)
 
-def _find_sol_group(genion_cmd, working_directory_path):
+def _find_sol_group(genion_cmd: Sequence[str], working_directory_path: str) -> str:
+    """Detect the SOL group number genion offers, which depends on the topology.
+
+    Group numbering is not fixed across force fields, so a probe run is parsed
+    instead of assuming a well-known index."""
     tmp_gro = os.path.join(working_directory_path, ".probe_genion.gro")
     tmp_top = os.path.join(working_directory_path, ".probe_genion.top")
 
@@ -610,7 +677,12 @@ def _find_sol_group(genion_cmd, working_directory_path):
 
     raise Exception(f"Could not find SOL group in genion output:\n{stderr_probe}")
 
-def on_add_ions(working_directory_path, run_input_file_name, output_file_name, input_topology_file_name, output_topology_file_name, cation_name, anion_name, add_ion_method, concentration, cation_charge, anion_charge, number_of_cations, number_of_anions, neutralize):
+def on_add_ions(working_directory_path: str, run_input_file_name: str, output_file_name: str,
+                input_topology_file_name: str, output_topology_file_name: str, cation_name: str,
+                anion_name: str, add_ion_method: str, concentration: float, cation_charge: int,
+                anion_charge: int, number_of_cations: int, number_of_anions: int,
+                neutralize: bool) -> tuple[list[str], str]:
+    """Run genion to neutralise the system and reach the requested ion content."""
     try:
         shutil.copy2(os.path.join(working_directory_path, input_topology_file_name), os.path.join(working_directory_path, output_topology_file_name))
 
@@ -647,7 +719,9 @@ def on_add_ions(working_directory_path, run_input_file_name, output_file_name, i
         
     return get_files_in_working_directory(working_directory_path), "<span style='color:green;'>" + status + "</span>"
 
-def on_generate_energy_minimization_mdp_file(working_directory_path, parameter_file_name, force_field):
+def on_generate_energy_minimization_mdp_file(working_directory_path: str, parameter_file_name: str,
+                                             force_field: str) -> tuple[list[str], str]:
+    """Write the steepest-descent energy minimisation MDP."""
     file_content = get_default_energy_minimization_mdp_file_content(force_field=force_field)
     try:
         file_path = os.path.join(working_directory_path, parameter_file_name)
@@ -660,7 +734,9 @@ def on_generate_energy_minimization_mdp_file(working_directory_path, parameter_f
     
     return get_files_in_working_directory(working_directory_path), "<span style='color:green;'>" + status + "</span>"
 
-def on_generate_energy_minimization_tpr_file(working_directory_path, input_file_name, input_topology_file_name, parameter_file_name, run_input_file_name, max_warnings):
+def on_generate_energy_minimization_tpr_file(working_directory_path: str, input_file_name: str, input_topology_file_name: str,
+                                             parameter_file_name: str, run_input_file_name: str, max_warnings: int) -> tuple[list[str], str]:
+    """Run grompp to build the energy minimisation run input file."""
     try:
         cmd = [
             "gmx", "grompp",
@@ -668,7 +744,10 @@ def on_generate_energy_minimization_tpr_file(working_directory_path, input_file_
             "-c", os.path.join(working_directory_path, input_file_name),
             "-p", os.path.join(working_directory_path, input_topology_file_name),
             "-o", os.path.join(working_directory_path, run_input_file_name),
-            "-maxwarn", str(max_warnings)
+            "-maxwarn", str(max_warnings),
+            # Without -po this byproduct lands in the process working directory,
+            # which is the repository root rather than the job directory.
+            "-po", os.path.join(working_directory_path, "mdout.mdp")
         ]
 
         print(f"Running command: {' '.join(cmd)}")
@@ -681,7 +760,9 @@ def on_generate_energy_minimization_tpr_file(working_directory_path, input_file_
         
     return get_files_in_working_directory(working_directory_path), "<span style='color:green;'>" + status + "</span>"
 
-def on_run_energy_minimization(working_directory_path, run_input_file_name, mpi_rank, omp_threads, use_gpu):
+def on_run_energy_minimization(working_directory_path: str, run_input_file_name: str, mpi_rank: int,
+                               omp_threads: int, use_gpu: bool) -> tuple[list[str], str]:
+    """Run mdrun for energy minimisation and wait for it to finish."""
     try:
         base_name = os.path.splitext(run_input_file_name)[0]
 
@@ -701,7 +782,10 @@ def on_run_energy_minimization(working_directory_path, run_input_file_name, mpi_
         
     return get_files_in_working_directory(working_directory_path), "<span style='color:green;'>" + status + "</span>"
 
-def on_generate_nvt_equilibration_mdp_file(working_directory_path, time_scale, time_step, temperature, parameter_file_name, force_field):
+def on_generate_nvt_equilibration_mdp_file(working_directory_path: str, time_scale: float, time_step: float,
+                                           temperature: float, parameter_file_name: str,
+                                           force_field: str) -> tuple[list[str], str]:
+    """Write the restrained NVT equilibration MDP."""
     file_content = get_default_nvt_equilibration_mdp_file_content(time_scale_ps=time_scale, time_step_ps=time_step, temperature=temperature, force_field=force_field)
     try:
         file_path = os.path.join(working_directory_path, parameter_file_name)
@@ -714,7 +798,9 @@ def on_generate_nvt_equilibration_mdp_file(working_directory_path, time_scale, t
     
     return get_files_in_working_directory(working_directory_path), "<span style='color:green;'>" + status + "</span>"
 
-def on_generate_nvt_equilibration_tpr_file(working_directory_path, input_file_name, input_topology_file_name, parameter_file_name, run_input_file_name, max_warnings):
+def on_generate_nvt_equilibration_tpr_file(working_directory_path: str, input_file_name: str, input_topology_file_name: str,
+                                           parameter_file_name: str, run_input_file_name: str, max_warnings: int) -> tuple[list[str], str]:
+    """Run grompp to build the NVT run input file, with restraint references."""
     try:
         cmd = [
             "gmx", "grompp",
@@ -723,7 +809,10 @@ def on_generate_nvt_equilibration_tpr_file(working_directory_path, input_file_na
             "-r", os.path.join(working_directory_path, input_file_name),
             "-p", os.path.join(working_directory_path, input_topology_file_name),
             "-o", os.path.join(working_directory_path, run_input_file_name),
-            "-maxwarn", str(max_warnings)
+            "-maxwarn", str(max_warnings),
+            # Without -po this byproduct lands in the process working directory,
+            # which is the repository root rather than the job directory.
+            "-po", os.path.join(working_directory_path, "mdout.mdp")
         ]
 
         print(f"Running command: {' '.join(cmd)}")
@@ -736,7 +825,8 @@ def on_generate_nvt_equilibration_tpr_file(working_directory_path, input_file_na
         
     return get_files_in_working_directory(working_directory_path), "<span style='color:green;'>" + status + "</span>"
 
-def watch_process(proc, process_state):
+def watch_process(proc: subprocess.Popen[str], process_state: ProcessStateDict) -> None:
+    """Clear the shared process state once the watched run exits."""
     proc.wait()
 
     with process_state["lock"]:
@@ -745,7 +835,8 @@ def watch_process(proc, process_state):
         process_state["proc"] = None
         process_state["running"] = False
 
-def sync_button_state(process_state):
+def sync_button_state(process_state: ProcessStateDict) -> GradioUpdate:
+    """Keep a Run/Stop button label in step with the process state."""
     with process_state["lock"]:
         running = process_state["running"]
     if running:
@@ -753,7 +844,10 @@ def sync_button_state(process_state):
     else:
         return gr.update(value="Start", variant="primary")
     
-def on_run_nvt_equilibration(working_directory_path, run_input_file_name, mpi_rank, omp_threads, use_gpu, process_state):
+def on_run_nvt_equilibration(working_directory_path: str, run_input_file_name: str, mpi_rank: int,
+                             omp_threads: int, use_gpu: bool,
+                             process_state: ProcessStateDict) -> tuple[Any, ...]:
+    """Start NVT equilibration, or stop the run that is already in progress."""
     # ---------- STOP ----------
     with process_state["lock"]:
         was_running = process_state["running"]
@@ -809,7 +903,10 @@ def on_run_nvt_equilibration(working_directory_path, run_input_file_name, mpi_ra
 
         return get_files_in_working_directory(working_directory_path), f"<span style='color:red;'>{status}</span>", process_state, gr.update(value="Start", variant="primary")
 
-def on_generate_npt_equilibration_mdp_file(working_directory_path, time_scale, time_step, temperature, pressure, parameter_file_name, force_field):
+def on_generate_npt_equilibration_mdp_file(working_directory_path: str, time_scale: float, time_step: float,
+                                           temperature: float, pressure: float, parameter_file_name: str,
+                                           force_field: str) -> tuple[list[str], str]:
+    """Write the restrained NPT equilibration MDP."""
     file_content = get_default_npt_equilibration_mdp_file_content(time_scale_ps=time_scale, time_step_ps=time_step, temperature=temperature, pressure=pressure, force_field=force_field)
     try:
         file_path = os.path.join(working_directory_path, parameter_file_name)
@@ -822,7 +919,9 @@ def on_generate_npt_equilibration_mdp_file(working_directory_path, time_scale, t
     
     return get_files_in_working_directory(working_directory_path), "<span style='color:green;'>" + status + "</span>"
 
-def on_generate_npt_equilibration_tpr_file(working_directory_path, input_file_name, input_topology_file_name, parameter_file_name, run_input_file_name, max_warnings):
+def on_generate_npt_equilibration_tpr_file(working_directory_path: str, input_file_name: str, input_topology_file_name: str,
+                                           parameter_file_name: str, run_input_file_name: str, max_warnings: int) -> tuple[list[str], str]:
+    """Run grompp to build the NPT run input file, with restraint references."""
     try:
         cmd = [
             "gmx", "grompp",
@@ -831,7 +930,10 @@ def on_generate_npt_equilibration_tpr_file(working_directory_path, input_file_na
             "-r", os.path.join(working_directory_path, input_file_name),
             "-p", os.path.join(working_directory_path, input_topology_file_name),
             "-o", os.path.join(working_directory_path, run_input_file_name),
-            "-maxwarn", str(max_warnings)
+            "-maxwarn", str(max_warnings),
+            # Without -po this byproduct lands in the process working directory,
+            # which is the repository root rather than the job directory.
+            "-po", os.path.join(working_directory_path, "mdout.mdp")
         ]
         
         print(f"Running command: {' '.join(cmd)}")
@@ -844,7 +946,10 @@ def on_generate_npt_equilibration_tpr_file(working_directory_path, input_file_na
         
     return get_files_in_working_directory(working_directory_path), "<span style='color:green;'>" + status + "</span>"
 
-def on_run_npt_equilibration(working_directory_path, run_input_file_name, mpi_rank, omp_threads, use_gpu, process_state):
+def on_run_npt_equilibration(working_directory_path: str, run_input_file_name: str, mpi_rank: int,
+                             omp_threads: int, use_gpu: bool,
+                             process_state: ProcessStateDict) -> tuple[Any, ...]:
+    """Start NPT equilibration, or stop the run that is already in progress."""
     # ---------- STOP ----------
     with process_state["lock"]:
         was_running = process_state["running"]
@@ -900,7 +1005,8 @@ def on_run_npt_equilibration(working_directory_path, run_input_file_name, mpi_ra
 
         return get_files_in_working_directory(working_directory_path), f"<span style='color:red;'>{status}</span>", process_state, gr.update(value="Start", variant="primary")
 
-def on_toggle_nnpot(nnpot_active):
+def on_toggle_nnpot(nnpot_active: bool) -> str:
+    """Acknowledge the neural-network potential choice in the status line."""
     # The actual model is built by wrap_gmx_model.py when the production MD
     # parameter file is generated (it may need the input structure for atom
     # typing), so here we just acknowledge the choice.
@@ -909,13 +1015,18 @@ def on_toggle_nnpot(nnpot_active):
     return ("<span style='color:green;'>Machine learning potential enabled. "
             "The selected model will be built when you generate the production MD parameter file.</span>")
 
-def on_change_mdp_type(prod_md_mdp_type_radio):
+def on_change_mdp_type(prod_md_mdp_type_radio: str) -> tuple[GradioUpdate, str]:
+    """Switch the production MDP between an initial run and a continuation."""
     if prod_md_mdp_type_radio=="Initial":
         return gr.update(visible=True), "md_initial.mdp"
     else:
         return gr.update(visible=False), "md_continue.mdp"
 
-def on_generate_prod_md_mdp_file(working_directory_path, time_scale, time_step, temperature, pressure, mdp_type, random_seed, parameter_file_name, nnpot_active, nnpot_model_name, nnpot_input_group, force_field):
+def on_generate_prod_md_mdp_file(working_directory_path: str, time_scale: float, time_step: float,
+                                 temperature: float, pressure: float, mdp_type: str, random_seed: int,
+                                 parameter_file_name: str, nnpot_active: bool, nnpot_model_name: str,
+                                 nnpot_input_group: str, force_field: str) -> tuple[list[str], str]:
+    """Write the production MD MDP, building the neural potential if requested."""
     if parameter_file_name is None or str(parameter_file_name).strip() == "":
         parameter_file_name = "md_initial.mdp" if mdp_type == "Initial" else "md_continue.mdp"
 
@@ -941,7 +1052,9 @@ def on_generate_prod_md_mdp_file(working_directory_path, time_scale, time_step, 
     
     return get_files_in_working_directory(working_directory_path), "<span style='color:green;'>" + status + "</span>"
 
-def on_generate_prod_md_tpr_file(working_directory_path, input_file_name, input_topology_file_name, parameter_file_name, run_input_file_name, max_warnings):
+def on_generate_prod_md_tpr_file(working_directory_path: str, input_file_name: str, input_topology_file_name: str,
+                                 parameter_file_name: str, run_input_file_name: str, max_warnings: int) -> tuple[list[str], str]:
+    """Run grompp to build the production MD run input file."""
     try:
         cmd = [
             "gmx", "grompp",
@@ -949,7 +1062,10 @@ def on_generate_prod_md_tpr_file(working_directory_path, input_file_name, input_
             "-c", os.path.join(working_directory_path, input_file_name),
             "-p", os.path.join(working_directory_path, input_topology_file_name),
             "-o", os.path.join(working_directory_path, run_input_file_name),
-            "-maxwarn", str(max_warnings)
+            "-maxwarn", str(max_warnings),
+            # Without -po this byproduct lands in the process working directory,
+            # which is the repository root rather than the job directory.
+            "-po", os.path.join(working_directory_path, "mdout.mdp")
         ]
 
         print(f"Running command: {' '.join(cmd)}")
@@ -962,7 +1078,10 @@ def on_generate_prod_md_tpr_file(working_directory_path, input_file_name, input_
         
     return get_files_in_working_directory(working_directory_path), "<span style='color:green;'>" + status + "</span>"
 
-def on_run_prod_md(working_directory_path, run_input_file_name, mpi_rank, omp_threads, prod_md_nnpot_active, use_gpu, process_state):
+def on_run_prod_md(working_directory_path: str, run_input_file_name: str, mpi_rank: int, omp_threads: int,
+                   prod_md_nnpot_active: bool, use_gpu: bool,
+                   process_state: ProcessStateDict) -> tuple[Any, ...]:
+    """Start production MD, or stop the run that is already in progress."""
     # ---------- STOP ----------
     with process_state["lock"]:
         was_running = process_state["running"]
@@ -1029,7 +1148,10 @@ def on_run_prod_md(working_directory_path, run_input_file_name, mpi_rank, omp_th
 
         return get_files_in_working_directory(working_directory_path), f"<span style='color:red;'>{status}</span>", process_state, gr.update(value="Start", variant="primary")
 
-def on_continue_prod_md(working_directory_path, run_input_file_name, checkpoint_file_name, mpi_rank, omp_threads, prod_md_nnpot_active, use_gpu, process_state):
+def on_continue_prod_md(working_directory_path: str, run_input_file_name: str, checkpoint_file_name: str,
+                        mpi_rank: int, omp_threads: int, prod_md_nnpot_active: bool, use_gpu: bool,
+                        process_state: ProcessStateDict) -> tuple[Any, ...]:
+    """Extend production MD from a checkpoint, or stop the running extension."""
     # ---------- STOP ----------
     with process_state["lock"]:
         was_running = process_state["running"]
@@ -1098,7 +1220,9 @@ def on_continue_prod_md(working_directory_path, run_input_file_name, checkpoint_
 
         return get_files_in_working_directory(working_directory_path), f"<span style='color:red;'>{status}</span>", process_state, gr.update(value="Start", variant="primary")
     
-def on_make_molecule_whole(working_directory_path, run_input_file_name, input_traj_file_name, output_traj_file_name):
+def on_make_molecule_whole(working_directory_path: str, run_input_file_name: str, input_traj_file_name: str,
+                           output_traj_file_name: str) -> tuple[list[str], str]:
+    """Run trjconv -pbc whole to repair molecules broken across the box edge."""
     try:
         cmd = [
             "gmx", "trjconv",
@@ -1120,7 +1244,9 @@ def on_make_molecule_whole(working_directory_path, run_input_file_name, input_tr
         
     return get_files_in_working_directory(working_directory_path), "<span style='color:green;'>" + status + "</span>"
 
-def on_center_protein(working_directory_path, run_input_file_name, input_traj_file_name, output_traj_file_name):
+def on_center_protein(working_directory_path: str, run_input_file_name: str, input_traj_file_name: str,
+                      output_traj_file_name: str) -> tuple[list[str], str]:
+    """Run trjconv -pbc mol -center to keep the solute in the middle of the box."""
     try:
         cmd = [
             "gmx", "trjconv",
@@ -1143,7 +1269,9 @@ def on_center_protein(working_directory_path, run_input_file_name, input_traj_fi
         
     return get_files_in_working_directory(working_directory_path), "<span style='color:green;'>" + status + "</span>"
 
-def on_fit_backbone(working_directory_path, run_input_file_name, input_traj_file_name, output_traj_file_name):
+def on_fit_backbone(working_directory_path: str, run_input_file_name: str, input_traj_file_name: str,
+                    output_traj_file_name: str) -> tuple[list[str], str]:
+    """Run trjconv -fit rot+trans to remove overall rotation and translation."""
     try:
         cmd = [
             "gmx", "trjconv",
@@ -1165,7 +1293,10 @@ def on_fit_backbone(working_directory_path, run_input_file_name, input_traj_file
         
     return get_files_in_working_directory(working_directory_path), "<span style='color:green;'>" + status + "</span>"
 
-def on_analyze_md_traj(working_directory_path, structure_file_name, input_traj_file_name):
+def on_analyze_md_traj(working_directory_path: str, structure_file_name: str,
+                       input_traj_file_name: str) -> tuple[pd.DataFrame, plt.Figure,
+                                                           pd.DataFrame, plt.Figure]:
+    """Compute backbone RMSD and per-residue C-alpha RMSF for the trajectory."""
     u = mda.Universe(os.path.join(working_directory_path, structure_file_name), os.path.join(working_directory_path, input_traj_file_name))
     
     # Calculate protein RMSD
@@ -1209,7 +1340,8 @@ def on_analyze_md_traj(working_directory_path, structure_file_name, input_traj_f
 
     return protein_rmsd_df, protein_rmsd_fig, cd_rmsf_df, ca_rmsf_fig
 
-def on_export_df(working_directory_path, df, file_name):
+def on_export_df(working_directory_path: str, df: pd.DataFrame, file_name: str) -> tuple[list[str], str]:
+    """Write an analysis table to CSV inside the job directory."""
     try:
         df.to_csv(os.path.join(working_directory_path, file_name), index=False)
         status = f"File exported: {file_name}"
@@ -1219,7 +1351,11 @@ def on_export_df(working_directory_path, df, file_name):
     
     return get_files_in_working_directory(working_directory_path), "<span style='color:green;'>" + status + "</span>"
 
-def protein_md_simulation_tab_content():
+secure_module_callbacks(globals())
+
+
+def protein_md_simulation_tab_content() -> None:
+    """Build the Protein MD Simulation tab and wire up its callbacks."""
     with gr.Tab(label="Protein MD Simulation") as protein_md_simulation_tab:
         with gr.Row():
             with gr.Column(scale=1):

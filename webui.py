@@ -1,3 +1,7 @@
+"""Entry point: mounts the Gradio UI on a FastAPI app and serves it."""
+
+from __future__ import annotations
+
 import os
 import glob
 import gradio as gr
@@ -32,7 +36,8 @@ static_dir.mkdir(parents=True, exist_ok=True)
 app.mount("/static", StaticFiles(directory=static_dir), name="static")
 
 # function to find an available port
-def find_available_port(start_port=7860):
+def find_available_port(start_port: int = 7860) -> int:
+    """Return the first free localhost port at or above start_port."""
     port = start_port
     while True:
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:

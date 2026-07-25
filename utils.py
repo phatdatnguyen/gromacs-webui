@@ -1,9 +1,18 @@
+"""Shared helpers for the GROMACS WebUI: MDP generation, GROMACS process
+handling, topology merging and structure/trajectory viewer support."""
+
+from __future__ import annotations
+
 import math
 import os
 import re
 import subprocess
 import threading
+from collections.abc import Sequence
+from typing import Any, TypedDict
+
 import MDAnalysis as mda
+import nglview
 import torch
 from nnpot_models import (
     GmxAIMNet2Model,
@@ -14,7 +23,56 @@ from nnpot_models import (
 )
 from e3nn.util.jit import script
 
-def get_torchani_install_error_message(exc):
+
+class IonSpecies(TypedDict):
+    """A monatomic species (NA, CL, CU2P) and how it should be drawn."""
+
+    resname: str
+    count: int
+    element: str | None
+    color: str
+    recognized: bool
+
+
+class HeteroSpecies(TypedDict):
+    """A polyatomic non-water, non-protein residue such as a ligand."""
+
+    resname: str
+    count: int
+    atoms_per_residue: int
+
+
+class StructureSpecies(TypedDict):
+    """Everything a viewer needs to know about what a structure contains."""
+
+    protein_residues: int
+    ions: list[IonSpecies]
+    hetero: list[HeteroSpecies]
+    water: list[str]
+
+
+class TerminusMenu(TypedDict):
+    """A single terminus menu printed by pdb2gmx -ter, with its options."""
+
+    kind: str
+    residue: str
+    options: list[tuple[str, str]]
+
+
+class TrajectoryViewerInfo(TypedDict):
+    """Result of reducing a trajectory for the browser-side viewer."""
+
+    frames: int
+    stride: int
+    total_frames: int
+    n_atoms: int
+    n_residues: int
+    species: StructureSpecies
+
+
+
+def get_torchani_install_error_message(exc: Exception) -> str | None:
+    """Explain a mixed TorchANI installation, or None if that is not the cause."""
     message = str(exc)
     if "PERIODIC_TABLE" not in message or "torchani.utils" not in message:
         return None
@@ -32,7 +90,8 @@ def get_torchani_install_error_message(exc):
         f"Original import error: {message}"
     )
 
-def get_emle_install_error_message(model_name, exc):
+def get_emle_install_error_message(model_name: str, exc: Exception) -> str | None:
+    """Explain a broken EMLE installation, or None if that is not the cause."""
     if model_name != "ani2x-emle":
         return None
 
@@ -57,7 +116,8 @@ def get_emle_install_error_message(model_name, exc):
 
     return None
 
-def get_nnpot_model_load_error_message(exc):
+def get_nnpot_model_load_error_message(exc: Exception) -> str | None:
+    """Explain a cached model needing a rebuild, or None if that is not the cause."""
     message = str(exc)
     if "torch.classes.cuaev.CuaevComputer" not in message:
         return None
@@ -70,7 +130,8 @@ def get_nnpot_model_load_error_message(exc):
         f"Original model load error: {message}"
     )
 
-def get_expected_nnpot_model_config(model_name):
+def get_expected_nnpot_model_config(model_name: str) -> str:
+    """Return the config fingerprint a cached model file must carry to be reusable."""
     if model_name in ["ani1x", "ani2x"]:
         return f"{model_name}|torchani|pyaev|adaptive|extensions-disabled"
     if model_name == "ani2x-emle":
@@ -81,7 +142,8 @@ def get_expected_nnpot_model_config(model_name):
         return f"{model_name}|aimnet|traced-positions-numbers-box-pbc-device-float64-v5"
     return model_name
 
-def is_cached_nnpot_model_usable(model_name, modelfile_path):
+def is_cached_nnpot_model_usable(model_name: str, modelfile_path: str) -> bool:
+    """Report whether the cached model matches this build, moving it aside if not."""
     extra_files = {"nnpot_model_config": ""}
     try:
         torch.jit.load(modelfile_path, map_location="cpu", _extra_files=extra_files)
@@ -102,7 +164,8 @@ def is_cached_nnpot_model_usable(model_name, modelfile_path):
             return False
         raise
 
-def checkExtensions():
+def checkExtensions() -> dict[str, str]:
+    """Collect loaded Torch extension libraries to embed alongside a saved model."""
     ext_lib = []
     for lib in torch.ops.loaded_libraries:
         if lib:
@@ -114,7 +177,8 @@ def checkExtensions():
         extra_files['extension_libs'] = ext_lib
     return extra_files
 
-def trace_aimnet2_model(model):
+def trace_aimnet2_model(model: torch.nn.Module) -> torch.jit.ScriptModule:
+    """Trace AIMNet2 with representative inputs, since it cannot be scripted."""
     model.eval()
     try:
         device = next(model.parameters()).device
@@ -135,7 +199,8 @@ def trace_aimnet2_model(model):
         check_trace=False,
     )
 
-def download_nnpot_model(model_name):
+def download_nnpot_model(model_name: str) -> str:
+    """Build or reuse the wrapped neural-network potential and return its file path."""
     os.makedirs("./models", exist_ok=True)
     os.environ.setdefault("WARP_CACHE_PATH", os.path.abspath("./models/warp-cache"))
     os.environ.setdefault("AIMNET_CACHE_DIR", os.path.abspath("./models/aimnet-cache"))
@@ -195,7 +260,8 @@ def download_nnpot_model(model_name):
     
     return modelfile_path
 
-def run_checked_command(cmd, cwd=None, stdin_input=None, error_lines=25):
+def run_checked_command(cmd: Sequence[str], cwd: str | None = None, stdin_input: str | None = None,
+                        error_lines: int = 25) -> subprocess.CompletedProcess[str]:
     """Run a command to completion, raising an Exception that carries its stderr.
 
     GROMACS writes its diagnostics ("Fatal error", missing atoms, mismatched
@@ -228,7 +294,7 @@ def run_checked_command(cmd, cwd=None, stdin_input=None, error_lines=25):
 
     return process
 
-def stop_process_gracefully(proc, timeout=15):
+def stop_process_gracefully(proc: subprocess.Popen[str] | None, timeout: float = 15) -> None:
     """Ask a run to stop, only killing it if it ignores the request.
 
     mdrun handles SIGTERM by finishing the current step, writing a checkpoint and
@@ -242,8 +308,11 @@ def stop_process_gracefully(proc, timeout=15):
         proc.wait(timeout=timeout)
     except subprocess.TimeoutExpired:
         proc.kill()
+        # Reap it, otherwise the caller still sees a live process for a moment
+        # and the child lingers as a zombie.
+        proc.wait()
 
-def get_gpu_mdrun_options(use_gpu, mpi_rank):
+def get_gpu_mdrun_options(use_gpu: bool, mpi_rank: int) -> list[str]:
     """mdrun GPU offload flags that are safe for minimisation and restrained
     equilibration: nonbonded and PME carry almost all of the cost, while
     -bonded gpu and -update gpu are refused outright when position restraints
@@ -259,24 +328,25 @@ def get_gpu_mdrun_options(use_gpu, mpi_rank):
 
 class ProcessStateDict(dict):
     """dict subclass for gr.State that creates a fresh lock on deep copy."""
-    def __init__(self):
+    def __init__(self) -> None:
         super().__init__({"proc": None, "running": False, "lock": threading.Lock()})
 
-    def __deepcopy__(self, memo):
+    def __deepcopy__(self, memo: dict[int, Any]) -> ProcessStateDict:
         return ProcessStateDict()
 
-DEFAULT_TERMINUS_CHOICE = "Default (charged)"
+DEFAULT_TERMINUS_CHOICE: str = "Default (charged)"
 
 # Terminus patch names offered in the UI. The list a given force field actually
 # accepts comes from its aminoacids.[nc].tdb, and pdb2gmx filters it per residue,
 # so the dropdowns allow custom values and the real menu is resolved at run time
 # by resolve_terminus_selections().
-N_TERMINUS_CHOICES = [DEFAULT_TERMINUS_CHOICE, "NH3+", "NH2", "None", "GLY-NH3+", "PRO-NH2+"]
-C_TERMINUS_CHOICES = [DEFAULT_TERMINUS_CHOICE, "COO-", "COOH", "CT1", "CT2", "None"]
+N_TERMINUS_CHOICES: list[str] = [DEFAULT_TERMINUS_CHOICE, "NH3+", "NH2", "None", "GLY-NH3+", "PRO-NH2+"]
+C_TERMINUS_CHOICES: list[str] = [DEFAULT_TERMINUS_CHOICE, "COO-", "COOH", "CT1", "CT2", "None"]
 
-PROBE_PDB2GMX_PREFIX = ".probe_pdb2gmx"
+PROBE_PDB2GMX_PREFIX: str = ".probe_pdb2gmx"
 
-def _parse_terminus_menus(pdb2gmx_output):
+def _parse_terminus_menus(pdb2gmx_output: str) -> list[TerminusMenu]:
+    """Extract each terminus menu, in the order pdb2gmx asked about them."""
     # choose_ter() prints the title with printf(), then one "%2d: name" line per
     # option, so the options are the lines directly following a title line.
     menus = []
@@ -302,7 +372,8 @@ def _parse_terminus_menus(pdb2gmx_output):
 
     return menus
 
-def _remove_pdb2gmx_probe_files(working_directory_path):
+def _remove_pdb2gmx_probe_files(working_directory_path: str) -> None:
+    """Delete the throwaway outputs, and GROMACS backups, left by a probe run."""
     try:
         names = os.listdir(working_directory_path)
     except OSError:
@@ -317,13 +388,16 @@ def _remove_pdb2gmx_probe_files(working_directory_path):
             except OSError:
                 pass
 
-def resolve_terminus_selections(pdb2gmx_cmd, working_directory_path, n_terminus, c_terminus):
+def resolve_terminus_selections(pdb2gmx_cmd: Sequence[str], working_directory_path: str,
+                                n_terminus: str | None,
+                                c_terminus: str | None) -> tuple[str | None, list[str]]:
     """Probe 'gmx pdb2gmx -ter' to read the terminus menu it prints for each chain,
     then map the requested terminus names onto the stdin answers for the real run.
 
-    Returns (stdin_input, descriptions). Matching is done per prompt rather than
-    with a fixed index because filter_ter() builds a different list per residue
-    (a PRO N-terminus offers PRO-NH2+ first, so NH3+ is not index 0 there)."""
+    Returns (stdin_input, descriptions), or (None, []) when the force field offers
+    no terminus choice. Matching is done per prompt rather than with a fixed index
+    because filter_ter() builds a different list per residue (a PRO N-terminus
+    offers PRO-NH2+ first, so NH3+ is not index 0 there)."""
     # The real command runs with cwd set to the working directory and plain file
     # names, so the probe uses plain names too.
     probe_cmd = list(pdb2gmx_cmd)
@@ -349,7 +423,10 @@ def resolve_terminus_selections(pdb2gmx_cmd, working_directory_path, n_terminus,
 
     menus = _parse_terminus_menus(stdout_probe)
     if not menus:
-        raise Exception("pdb2gmx did not offer any terminus selection.\n" + stdout_probe + stderr_probe)
+        # Some force fields (the AMBER ports, for instance) apply terminus patches
+        # through renamed terminal residues and offer no choice at all. Report that
+        # rather than failing, so the caller can fall back to the default run.
+        return None, []
 
     answers = []
     descriptions = []
@@ -369,10 +446,12 @@ def resolve_terminus_selections(pdb2gmx_cmd, working_directory_path, n_terminus,
 
     return "\n".join(answers) + "\n", descriptions
 
-def is_charmm_force_field(force_field):
+def is_charmm_force_field(force_field: str | None) -> bool:
+    """Report whether a force field name belongs to the CHARMM family."""
     return str(force_field or "").strip().lower().startswith("charmm")
 
-def get_cutoff_mdp_section(force_field):
+def get_cutoff_mdp_section(force_field: str | None) -> str:
+    """Return the neighbour-searching and cutoff block suited to the force field."""
     if is_charmm_force_field(force_field):
         # CHARMM is parameterised with a force-switched LJ potential; plain
         # cutoffs at 1.0 nm give wrong energetics.
@@ -394,7 +473,8 @@ rvdw            = 1.0
 rcoulomb        = 1.0
 coulombtype     = PME"""
 
-def get_default_ion_addition_mdp_file_content(force_field=None):
+def get_default_ion_addition_mdp_file_content(force_field: str | None = None) -> str:
+    """MDP for the short minimisation that precedes ion placement."""
     return f"""
 integrator = steep
 nsteps     = 500
@@ -403,7 +483,8 @@ emtol      = 1000.0
 {get_cutoff_mdp_section(force_field)}
 """
 
-def get_default_energy_minimization_mdp_file_content(force_field=None):
+def get_default_energy_minimization_mdp_file_content(force_field: str | None = None) -> str:
+    """MDP for steepest-descent energy minimisation."""
     return f"""
 integrator  = steep
 nsteps      = 50000
@@ -412,7 +493,10 @@ emtol       = 1000.0
 {get_cutoff_mdp_section(force_field)}
 """
 
-def get_default_nvt_equilibration_mdp_file_content(time_scale_ps=500, time_step_ps=0.002, temperature=300, with_ligand=False, force_field=None):
+def get_default_nvt_equilibration_mdp_file_content(time_scale_ps: float = 500, time_step_ps: float = 0.002,
+                                                   temperature: float = 300, with_ligand: bool = False,
+                                                   force_field: str | None = None) -> str:
+    """MDP for restrained NVT equilibration with freshly generated velocities."""
     return f"""
 ; Restrain the solute while the solvent relaxes around it
 define      = -DPOSRES
@@ -436,7 +520,11 @@ gen_seed    = -1
 {get_cutoff_mdp_section(force_field)}
 """
 
-def get_default_npt_equilibration_mdp_file_content(time_scale_ps=1000, time_step_ps=0.002, temperature=300, pressure=1.0, with_ligand=False, force_field=None):
+def get_default_npt_equilibration_mdp_file_content(time_scale_ps: float = 1000, time_step_ps: float = 0.002,
+                                                   temperature: float = 300, pressure: float = 1.0,
+                                                   with_ligand: bool = False,
+                                                   force_field: str | None = None) -> str:
+    """MDP for restrained NPT equilibration under the C-rescale barostat."""
     return f"""
 ; Keep the solute restrained through the density equilibration as well
 define          = -DPOSRES
@@ -472,7 +560,15 @@ constraint_algorithm = lincs
 {get_cutoff_mdp_section(force_field)}
 """
 
-def get_default_prod_md_mdp_file_content(time_scale_ps=1000, time_step_ps=0.002, temperature=300, pressure=1.0, mdp_type="Initial", random_seed=0, with_ligand=False, nnpot_active=False, nnpot_modelfile_path="models/ani2x.pt", nnpot_input_group="Protein", nnpot_model_name="ani2x", force_field=None):
+def get_default_prod_md_mdp_file_content(time_scale_ps: float = 1000, time_step_ps: float = 0.002,
+                                         temperature: float = 300, pressure: float = 1.0,
+                                         mdp_type: str = "Initial", random_seed: int = 0,
+                                         with_ligand: bool = False, nnpot_active: bool = False,
+                                         nnpot_modelfile_path: str | None = "models/ani2x.pt",
+                                         nnpot_input_group: str = "Protein",
+                                         nnpot_model_name: str = "ani2x",
+                                         force_field: str | None = None) -> str:
+    """MDP for unrestrained production MD, optionally driven by a neural potential."""
     content = f"""
 integrator      = md
 dt              = {time_step_ps}
@@ -539,7 +635,8 @@ nnpot-model-input4    = pbc"""
 
     return content
 
-def read_gromacs_structure_file(filename):
+def read_gromacs_structure_file(filename: str) -> tuple[str, int, list[str], str]:
+    """Split a GRO file into its title, atom count, atom lines and box line."""
     with open(filename) as f:
         lines = f.readlines()
 
@@ -550,7 +647,9 @@ def read_gromacs_structure_file(filename):
 
     return title, natoms, atoms, box
 
-def merge_protein_ligand_structures(protein_structure_file_path, ligand_structure_file_path, output_structure_file_path):
+def merge_protein_ligand_structures(protein_structure_file_path: str, ligand_structure_file_path: str,
+                                    output_structure_file_path: str) -> None:
+    """Concatenate protein and ligand coordinates, keeping the protein box."""
     # Read input files
     _, p_n, p_atoms, p_box = read_gromacs_structure_file(protein_structure_file_path)
     _, l_n, l_atoms, _ = read_gromacs_structure_file(ligand_structure_file_path)
@@ -571,7 +670,9 @@ def merge_protein_ligand_structures(protein_structure_file_path, ligand_structur
         # keep protein box (ligand box is meaningless alone)
         out.write(p_box + "\n")
 
-def merge_protein_ligand_topologies(protein_topology_file_path, ligand_topology_file_path, output_topology_file_path):
+def merge_protein_ligand_topologies(protein_topology_file_path: str, ligand_topology_file_path: str,
+                                    output_topology_file_path: str) -> None:
+    """Include the ligand topology in the protein topology and list it under molecules."""
     ligand_topology_file_name = os.path.basename(ligand_topology_file_path)
 
     with open(protein_topology_file_path, "r") as f:
@@ -617,16 +718,16 @@ def merge_protein_ligand_topologies(protein_topology_file_path, ligand_topology_
     with open(output_topology_file_path, "w") as f:
         f.writelines(new_lines)
 
-WATER_RESNAMES = ["SOL", "WAT", "HOH", "H2O", "W", "DOD", "D3O", "TIP3", "TIP3P", "TIP4", "TIP4P", "SPC", "SPCE"]
+WATER_RESNAMES: list[str] = ["SOL", "WAT", "HOH", "H2O", "W", "DOD", "D3O", "TIP3", "TIP3P", "TIP4", "TIP4P", "SPC", "SPCE"]
 
 # Ion resname aliases used by the force fields in play (CHARMM ports, AMBER, GROMACS).
-ION_RESNAME_ALIASES = {
+ION_RESNAME_ALIASES: dict[str, str] = {
     "SOD": "NA", "CLA": "CL", "POT": "K", "CAL": "CA", "CES": "CS",
     "LIT": "LI", "IOD": "I", "BAR": "BA", "CAD": "CD",
 }
 
 # Jmol/CPK colours, the same palette NGL uses for its element colour scheme.
-ELEMENT_COLORS = {
+ELEMENT_COLORS: dict[str, str] = {
     "NA": "#AB5CF2", "CL": "#1FF01F", "K": "#8F40D4", "CA": "#3DFF00", "MG": "#8AFF00",
     "ZN": "#7D80B0", "FE": "#E06633", "CU": "#C88033", "MN": "#9C7AC7", "CO": "#F090A0",
     "NI": "#50D050", "CD": "#FFD98F", "HG": "#B8B8D0", "AG": "#C0C0C0", "AU": "#FFD123",
@@ -638,9 +739,9 @@ ELEMENT_COLORS = {
 }
 # Magenta means "this species was not recognised", so it stands out instead of
 # silently blending in with a default colour.
-UNKNOWN_SPECIES_COLOR = "#FF00FF"
+UNKNOWN_SPECIES_COLOR: str = "#FF00FF"
 
-def get_ion_element(resname):
+def get_ion_element(resname: str | None) -> str | None:
     """Derive the element symbol from an ion residue name, or None if unrecognised.
 
     Ion resnames vary by force field: plain (NA, CL, ZN), aliased (SOD, CLA, POT)
@@ -665,7 +766,7 @@ def get_ion_element(resname):
 
     return None
 
-def get_structure_species(atoms):
+def get_structure_species(atoms: mda.Universe | mda.AtomGroup) -> StructureSpecies:
     """Group the atoms into protein / ions / other hetero / water for rendering.
 
     A resname counts as an ion when its residues hold exactly one atom, which is
@@ -708,7 +809,8 @@ def get_structure_species(atoms):
 
     return {"protein_residues": protein_residues, "ions": ions, "hetero": hetero, "water": water_resnames}
 
-def get_species_legend(species):
+def get_species_legend(species: StructureSpecies) -> str:
+    """One-line summary of the species on show, flagging unrecognised ones."""
     parts = []
     if species["protein_residues"]:
         parts.append(f"protein {species['protein_residues']} res")
@@ -721,7 +823,7 @@ def get_species_legend(species):
 
     return "Species: " + ", ".join(parts) + "." if parts else ""
 
-def get_species_representations_js(species):
+def get_species_representations_js(species: StructureSpecies) -> str:
     """NGL.js representation calls for every species present in the structure."""
     lines = []
     n_protein_residues = species["protein_residues"]
@@ -751,7 +853,7 @@ def get_species_representations_js(species):
 
     return "\n  ".join(lines)
 
-def add_species_representations_to_nglview(view, species):
+def add_species_representations_to_nglview(view: nglview.NGLWidget, species: StructureSpecies) -> None:
     """Same species handling as the trajectory viewer, applied to an nglview widget."""
     view.clear()
 
@@ -776,7 +878,8 @@ def add_species_representations_to_nglview(view, species):
     if species["water"]:
         view.add_representation("line", selection="water", opacity=0.3)
 
-def prepare_structure_viewer_file(structure_file_path, static_output_path):
+def prepare_structure_viewer_file(structure_file_path: str,
+                                  static_output_path: str) -> tuple[str, StructureSpecies]:
     """Return (path NGL should load, species present) for the structure viewer.
 
     Non-PDB inputs are converted with MDAnalysis rather than ParmEd: ParmEd clips
@@ -798,13 +901,14 @@ def prepare_structure_viewer_file(structure_file_path, static_output_path):
 
     return display_path, get_structure_species(universe)
 
-TRAJECTORY_VIEWER_SELECTIONS = {
+TRAJECTORY_VIEWER_SELECTIONS: dict[str, str] = {
     "Protein": "protein",
     "Protein + Ligand + Ions": "not resname " + " ".join(WATER_RESNAMES),
     "All Atoms": "all",
 }
 
-def write_trajectory_viewer_files(structure_file_path, trajectory_file_path, selection, max_frames, static_basename):
+def write_trajectory_viewer_files(structure_file_path: str, trajectory_file_path: str, selection: str,
+                                  max_frames: int, static_basename: str) -> TrajectoryViewerInfo:
     """Write a reduced structure/trajectory pair into ./static for the NGL viewer.
 
     Production trajectories here run to several GB of solvated system, which no
@@ -857,6 +961,9 @@ def write_trajectory_viewer_files(structure_file_path, trajectory_file_path, sel
             written_frames += 1
 
     species = get_structure_species(atoms)
+    # Release the reader's file handle now rather than at the next collection: a
+    # multi-GB trajectory would otherwise stay open for the life of the server.
+    universe.trajectory.close()
 
     return {
         "frames": written_frames,
@@ -867,7 +974,7 @@ def write_trajectory_viewer_files(structure_file_path, trajectory_file_path, sel
         "species": species,
     }
 
-TRAJECTORY_VIEWER_HTML_TEMPLATE = """<!DOCTYPE html>
+TRAJECTORY_VIEWER_HTML_TEMPLATE: str = """<!DOCTYPE html>
 <html>
 <head>
 <meta charset="utf-8">
@@ -945,7 +1052,9 @@ stage.loadFile("/static/" + BASE + ".pdb?ts=" + TS).then(function (comp) {
 </html>
 """
 
-def get_trajectory_viewer_html(static_basename, timestamp, n_frames, species):
+def get_trajectory_viewer_html(static_basename: str, timestamp: int, n_frames: int,
+                               species: StructureSpecies) -> str:
+    """Build the self-contained NGL page that animates the reduced trajectory."""
     representations = get_species_representations_js(species)
 
     return (TRAJECTORY_VIEWER_HTML_TEMPLATE

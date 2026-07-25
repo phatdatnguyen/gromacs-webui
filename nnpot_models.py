@@ -1,9 +1,17 @@
+"""GROMACS-facing wrappers around neural-network potentials.
+
+Each wrapper converts between GROMACS units (nm, kJ/mol) and the model's own
+convention, and exposes a forward signature that the GROMACS neural-network
+potential interface can call.
+"""
+
 import os
 import torch
 from torch import nn
 from typing import Optional
 
-def load_emle_model_classes():
+def load_emle_model_classes() -> tuple[type, float, float]:
+    """Import EMLE behind a TorchANI 2.8 shim and return its class and unit factors."""
     # EMLE currently imports SpeciesEnergies from the TorchANI 2.7 location.
     # TorchANI 2.8 moved it to torchani.tuples, so provide the old attribute
     # before importing EMLE.
@@ -19,7 +27,8 @@ def load_emle_model_classes():
     from emle.models import ANI2xEMLE
     from emle._units import _HARTREE_TO_KJ_MOL, _NANOMETER_TO_ANGSTROM
 
-    def _add_torchani28_hook(self):
+    def _add_torchani28_hook(self) -> None:
+        """Capture AEV output via a forward hook, as TorchANI 2.8 no longer stores it."""
         from torch import Tensor
         from typing import Optional, Tuple
 
@@ -39,7 +48,8 @@ def load_emle_model_classes():
     return ANI2xEMLE, _NANOMETER_TO_ANGSTROM, _HARTREE_TO_KJ_MOL
 
 class GmxANI1xModel(nn.Module):
-    def __init__(self, device:str):
+    """ANI-1x wrapped for GROMACS, using pure PyTorch AEV."""
+    def __init__(self, device: str) -> None:
         super().__init__()
         from torchani.models import ANI1x
 
@@ -56,8 +66,10 @@ class GmxANI1xModel(nn.Module):
         self.length_conversion = 10.0   # nm --> Å
         self.energy_conversion = 2625.5 # Hartree --> kJ/mol
 
-    def forward(self, positions, atomic_numbers,
-                box: Optional[torch.Tensor]=None, pbc: Optional[torch.Tensor]=None):
+    def forward(self, positions: torch.Tensor, atomic_numbers: torch.Tensor,
+                box: Optional[torch.Tensor] = None,
+                pbc: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """Return the potential energy in kJ/mol for GROMACS coordinates given in nm."""
 
         # Prepare the inputs for the model
         atomic_numbers = atomic_numbers.unsqueeze(0)
@@ -73,6 +85,7 @@ class GmxANI1xModel(nn.Module):
         return energy
 
 class GmxANI2xModel(nn.Module):
+    """ANI-2x wrapped for GROMACS, using pure PyTorch AEV."""
     def __init__(self, device:str):
         super().__init__()
         from torchani.models import ANI2x
@@ -89,8 +102,10 @@ class GmxANI2xModel(nn.Module):
         self.length_conversion = 10.0   # nm --> Å
         self.energy_conversion = 2625.5 # Hartree --> kJ/mol
 
-    def forward(self, positions, atomic_numbers,
-                box: Optional[torch.Tensor]=None, pbc: Optional[torch.Tensor]=None):
+    def forward(self, positions: torch.Tensor, atomic_numbers: torch.Tensor,
+                box: Optional[torch.Tensor] = None,
+                pbc: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """Return the potential energy in kJ/mol for GROMACS coordinates given in nm."""
 
         # Prepare the inputs for the model
         atomic_numbers = atomic_numbers.unsqueeze(0)
@@ -106,7 +121,8 @@ class GmxANI2xModel(nn.Module):
         return energy
 
 class GmxMACEModel(torch.nn.Module):
-    def __init__(self, size: str, device:str, **kwargs):
+    """A MACE foundation model wrapped for GROMACS."""
+    def __init__(self, size: str, device: str, **kwargs: object) -> None:
         super().__init__()
         from mace.calculators import mace_off
 
@@ -129,8 +145,10 @@ class GmxMACEModel(torch.nn.Module):
         self.length_conversion = 10.0       # nm (gmx) --> Å (mace)
         self.energy_conversion = 96.4853    # eV (mace) --> kJ/mol (gmx)
     
-    def forward(self, positions, atomic_numbers,
-                cell: Optional[torch.Tensor]=None, pbc: Optional[torch.Tensor]=None):
+    def forward(self, positions: torch.Tensor, atomic_numbers: torch.Tensor,
+                cell: Optional[torch.Tensor] = None,
+                pbc: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """Return the potential energy in kJ/mol for GROMACS coordinates given in nm."""
         
         # Prepare the model input
         positions = positions * self.length_conversion
@@ -211,7 +229,8 @@ class GmxMACEModel(torch.nn.Module):
         return total_energy * self.energy_conversion
 
 class GmxAIMNet2Model(torch.nn.Module):
-    def __init__(self, device: str, charge=0, mult=1, **kwargs):
+    """AIMNet2 wrapped for GROMACS; traced rather than scripted."""
+    def __init__(self, device: str, charge: int = 0, mult: int = 1, **kwargs: object) -> None:
         super().__init__()
         os.environ.setdefault("WARP_CACHE_PATH", os.path.abspath("./models/warp-cache"))
         os.environ.setdefault("AIMNET_CACHE_DIR", os.path.abspath("./models/aimnet-cache"))
@@ -226,8 +245,10 @@ class GmxAIMNet2Model(torch.nn.Module):
         self.length_conversion = 10.0       # nm (gmx) --> Å (aimnet)
         self.energy_conversion = 96.4853    # eV (aimnet) --> kJ/mol (gmx)
 
-    def forward(self, positions, atomic_numbers,
-                cell: Optional[torch.Tensor]=None, pbc: Optional[torch.Tensor]=None):
+    def forward(self, positions: torch.Tensor, atomic_numbers: torch.Tensor,
+                cell: Optional[torch.Tensor] = None,
+                pbc: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """Return the potential energy in kJ/mol for GROMACS coordinates given in nm."""
         # Prepare the model input
         positions = positions.to(torch.float64) * self.length_conversion
         atomic_numbers = atomic_numbers.to(dtype=torch.int64, device=positions.device)
@@ -258,7 +279,8 @@ class GmxAIMNet2Model(torch.nn.Module):
         return energy
 
 class GmxANI2xEMLEModel(torch.nn.Module):
-    def __init__(self, device: str, qm_charge: int=0, **kwargs):
+    """ANI-2x with EMLE embedding, wrapped for GROMACS."""
+    def __init__(self, device: str, qm_charge: int = 0, **kwargs: object) -> None:
         super().__init__()
         ANI2xEMLE, length_conversion, energy_conversion = load_emle_model_classes()
         kwargs.setdefault("device", torch.device(device))
@@ -269,8 +291,10 @@ class GmxANI2xEMLEModel(torch.nn.Module):
         self.length_conversion = length_conversion
         self.energy_conversion = energy_conversion
 
-    def forward(self, positions_nn, atomic_numbers,
-                cell: Optional[torch.Tensor]=None, pbc: Optional[torch.Tensor]=None):
+    def forward(self, positions_nn: torch.Tensor, atomic_numbers: torch.Tensor,
+                cell: Optional[torch.Tensor] = None,
+                pbc: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """Return the potential energy in kJ/mol for GROMACS coordinates given in nm."""
         device = positions_nn.device
         # convert units
         positions_nn = positions_nn * self.length_conversion

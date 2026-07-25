@@ -1,0 +1,249 @@
+"""Tests for the Gradio callbacks that do not need GROMACS.
+
+The callbacks are wrapped by path_security at import time, so these also exercise
+that wrapper on the real signatures.
+"""
+
+from __future__ import annotations
+
+import os
+import unittest
+
+import MDAnalysis as mda
+import pandas as pd
+
+import protein_ligand_complex_md_simulation as complex_workflow
+import protein_md_simulation as workflow
+import utils
+from .testing_support import WorkingDirectoryTestCase, write_structure_pdb, write_trajectory
+
+
+class WorkingDirectoryCallbackTests(WorkingDirectoryTestCase):
+    def test_opening_a_directory_creates_it_and_enables_the_actions(self):
+        result = workflow.on_open_working_directory("_unittest_new_job")
+        self.addCleanup(lambda: os.rmdir(os.path.join("data", "_unittest_new_job")))
+
+        self.assertEqual(len(result), 5)
+        dropdown, path, files, clean_button, upload = result
+        self.assertTrue(os.path.isdir(path))
+        self.assertEqual(files, [])
+        self.assertTrue(path.endswith("_unittest_new_job"))
+
+    def test_directory_names_with_path_components_are_refused(self):
+        """The callback warns and opens nothing rather than escaping ./data."""
+        for value in ("../escape", "nested/job", "/absolute", "..\\escape"):
+            with self.subTest(value=value):
+                self.assertEqual(workflow.on_open_working_directory(value),
+                                 (None, None, None, None, None))
+        self.assertFalse(os.path.exists(os.path.join("data", "..", "escape")))
+
+    def test_blank_directory_name_returns_nothing(self):
+        self.assertEqual(workflow.on_open_working_directory("   "), (None, None, None, None, None))
+
+    def test_file_listing_hides_backups_and_zone_identifiers(self):
+        for name in ("keep.gro", "#backup.gro.1#", "note.txt:Zone.Identifier"):
+            with open(self.path(name), "w") as handle:
+                handle.write("x")
+        os.mkdir(self.path("subdir"))
+
+        files = workflow.get_files_in_working_directory(self.working_directory_path)
+        self.assertIn("keep.gro", files)
+        self.assertNotIn("#backup.gro.1#", files)
+        self.assertNotIn("subdir", files)
+        self.assertFalse([name for name in files if name.endswith("Zone.Identifier")])
+
+    def test_missing_directory_lists_nothing(self):
+        self.assertEqual(workflow.get_files_in_working_directory("data/_unittest_absent"), [])
+        self.assertEqual(workflow.get_files_in_working_directory(None), [])
+
+
+class FileActionTests(WorkingDirectoryTestCase):
+    def test_deleting_a_file_refreshes_the_listing(self):
+        with open(self.path("doomed.gro"), "w") as handle:
+            handle.write("x")
+        files = workflow.on_delete_file(self.working_directory_path, "doomed.gro")
+        self.assertNotIn("doomed.gro", files)
+
+    def test_cleaning_removes_backups_only(self):
+        with open(self.path("#topol.top.1#"), "w") as handle:
+            handle.write("x")
+        with open(self.path("topol.top"), "w") as handle:
+            handle.write("x")
+
+        workflow.on_clean_working_directory(self.working_directory_path)
+        remaining = os.listdir(self.working_directory_path)
+        self.assertIn("topol.top", remaining)
+        self.assertNotIn("#topol.top.1#", remaining)
+
+    def test_text_file_round_trip(self):
+        with open(self.path("notes.mdp"), "w") as handle:
+            handle.write("integrator = steep\n")
+
+        viewer, save_button = workflow.on_view_text_file(self.working_directory_path, "notes.mdp")
+        self.assertIn("integrator = steep", viewer["value"])
+
+        workflow.on_save_text_file(self.working_directory_path, "notes.mdp", "integrator = md\n")
+        with open(self.path("notes.mdp")) as handle:
+            self.assertEqual(handle.read(), "integrator = md\n")
+
+    def test_export_writes_a_csv_into_the_job_directory(self):
+        frame = pd.DataFrame({"Time (ns)": [0.0, 0.1], "RMSD": [0.0, 1.5]})
+        files, status = workflow.on_export_df(self.working_directory_path, frame, "rmsd.csv")
+        self.assertIn("rmsd.csv", files)
+        self.assertIn("File exported", self.plain_text(status))
+        self.assertTrue(os.path.exists(self.path("rmsd.csv")))
+
+
+class AccordionAndSelectionTests(unittest.TestCase):
+    def test_selecting_a_structure_opens_its_accordion(self):
+        button, accordion = workflow.on_selected_structure_file_state_change("protein.gro")
+        self.assertTrue(button["interactive"])
+        self.assertTrue(accordion["open"])
+
+    def test_deselecting_disables_the_button_without_closing_the_accordion(self):
+        """Closing it would collapse a viewer the user is reading."""
+        button, accordion = workflow.on_selected_structure_file_state_change(None)
+        self.assertFalse(button["interactive"])
+        self.assertNotIn("open", accordion)
+
+    def test_text_selection_behaves_the_same_way(self):
+        button, accordion = workflow.on_selected_text_file_state_change("topol.top")
+        self.assertTrue(button["interactive"])
+        self.assertTrue(accordion["open"])
+        button, accordion = workflow.on_selected_text_file_state_change(None)
+        self.assertFalse(button["interactive"])
+        self.assertNotIn("open", accordion)
+
+    def test_ion_method_switch_shows_the_matching_inputs(self):
+        concentration, *counts = workflow.on_add_ions_method_change("Concentration")
+        self.assertTrue(concentration["visible"])
+        self.assertTrue(all(not update["visible"] for update in counts))
+
+        concentration, *counts = workflow.on_add_ions_method_change("Number")
+        self.assertFalse(concentration["visible"])
+        self.assertTrue(all(update["visible"] for update in counts))
+
+    def test_mdp_type_switch_renames_the_parameter_file(self):
+        seed_box, file_name = workflow.on_change_mdp_type("Initial")
+        self.assertTrue(seed_box["visible"])
+        self.assertEqual(file_name, "md_initial.mdp")
+
+        seed_box, file_name = workflow.on_change_mdp_type("Continuation")
+        self.assertFalse(seed_box["visible"])
+        self.assertEqual(file_name, "md_continue.mdp")
+
+    def test_button_state_follows_the_process_state(self):
+        state = utils.ProcessStateDict()
+        self.assertEqual(workflow.sync_button_state(state)["value"], "Start")
+        state["running"] = True
+        self.assertEqual(workflow.sync_button_state(state)["value"], "Stop")
+
+
+class MdpCallbackTests(WorkingDirectoryTestCase):
+    def test_each_generator_writes_its_file_and_lists_it(self):
+        cases = (
+            (workflow.on_generate_ions_mdp_file, ("ions.mdp", "CHARMM36"), "ions.mdp"),
+            (workflow.on_generate_energy_minimization_mdp_file, ("em.mdp", "CHARMM36"), "em.mdp"),
+        )
+        for callback, extra, expected in cases:
+            with self.subTest(callback=callback.__name__):
+                files, status = callback(self.working_directory_path, *extra)
+                self.assertIn(expected, files)
+                self.assertIn("successfully", self.plain_text(status))
+                with open(self.path(expected)) as handle:
+                    self.assertIn("force-switch", handle.read())
+
+    def test_nvt_mdp_callback_passes_the_temperature_through(self):
+        files, _ = workflow.on_generate_nvt_equilibration_mdp_file(
+            self.working_directory_path, 100, 0.002, 305, "nvt.mdp", "AMBER99SB-ILDN")
+        self.assertIn("nvt.mdp", files)
+        with open(self.path("nvt.mdp")) as handle:
+            content = handle.read()
+        self.assertIn("ref_t       = 305", content)
+        self.assertIn("gen_temp    = 305", content)
+        self.assertIn("-DPOSRES", content)
+
+
+class TrajectoryViewerCallbackTests(WorkingDirectoryTestCase):
+    def test_viewing_a_trajectory_returns_an_iframe_and_a_species_legend(self):
+        structure = write_structure_pdb(self.path("system.pdb"), n_residues=3, ions={"NA": 2})
+        write_trajectory(structure, self.path("traj.xtc"), n_frames=6)
+
+        html, status = workflow.on_view_trajectory(self.working_directory_path, "system.pdb",
+                                                   "traj.xtc", "Protein + Ligand + Ions", 200)
+        self.assertIn("<iframe", html)
+        self.assertIn("protein_md_trajectory_view.html", html)
+        text = self.plain_text(status)
+        self.assertIn("Showing 6 of 6 frames", text)
+        self.assertIn("NA 2", text)
+        self.assertTrue(os.path.exists("static/protein_md_trajectory_view.html"))
+
+    def test_missing_selection_warns_instead_of_raising(self):
+        self.assertEqual(workflow.on_view_trajectory(self.working_directory_path, None, None,
+                                                     "Protein", 200), (None, None))
+
+    def test_unreadable_pair_reports_an_error_status(self):
+        write_structure_pdb(self.path("system.pdb"), n_residues=2)
+        with open(self.path("broken.xtc"), "wb") as handle:
+            handle.write(b"not really an xtc")
+
+        html, status = workflow.on_view_trajectory(self.working_directory_path, "system.pdb",
+                                                   "broken.xtc", "Protein", 200)
+        self.assertIsNone(html)
+        self.assertIn("Error", self.plain_text(status))
+
+    def test_the_two_tabs_write_to_different_static_files(self):
+        structure = write_structure_pdb(self.path("system.pdb"), n_residues=3)
+        write_trajectory(structure, self.path("traj.xtc"), n_frames=3)
+
+        workflow.on_view_trajectory(self.working_directory_path, "system.pdb", "traj.xtc", "Protein", 200)
+        complex_workflow.on_view_trajectory(self.working_directory_path, "system.pdb", "traj.xtc",
+                                            "Protein", 200)
+        self.assertTrue(os.path.exists("static/protein_md_trajectory.xtc"))
+        self.assertTrue(os.path.exists("static/complex_md_trajectory.xtc"))
+
+
+class FileListChangeTests(WorkingDirectoryTestCase):
+    def arguments(self, count):
+        # path_security rejects an empty file name, so use a harmless placeholder
+        return ["unused.txt"] * count
+
+    def test_dropdowns_point_at_the_files_each_step_produces(self):
+        for name in ("protein.pdb", "protein.gro", "topology.top", "em.mdp", "em.tpr", "md.xtc"):
+            with open(self.path(name), "w") as handle:
+                handle.write("x")
+
+        import inspect
+        parameters = inspect.signature(workflow.on_file_list_change).parameters
+        values = {name: "unused.txt" for name in parameters}
+        values["working_directory_path"] = self.working_directory_path
+        values["protein_structure_file_name"] = "protein.pdb"
+        values["topology_output_file_name"] = "protein.gro"
+        values["topology_output_topology_file_name"] = "topology.top"
+
+        result = workflow.on_file_list_change(**values)
+
+        table = result[0]
+        self.assertEqual(sorted(table["File"]), sorted(os.listdir(self.working_directory_path)))
+        # first dropdown is the topology input, which should follow the uploaded pdb
+        self.assertEqual(result[1]["value"], "protein.pdb")
+        # the box input follows pdb2gmx's output structure
+        self.assertEqual(result[2]["value"], "protein.gro")
+
+    def test_return_count_matches_the_wired_outputs(self):
+        """A mismatch here breaks every file refresh at runtime."""
+        import webui
+        handlers = (webui.blocks.fns.values() if hasattr(webui.blocks.fns, "values")
+                    else webui.blocks.fns)
+        for handler in handlers:
+            if getattr(handler.fn, "__name__", "") != "on_file_list_change":
+                continue
+            import inspect
+            required = len(inspect.signature(handler.fn).parameters)
+            returned = handler.fn(self.working_directory_path, *self.arguments(required - 1))
+            self.assertIsInstance(returned, tuple)
+            self.assertEqual(len(returned), len(handler.outputs))
+
+
+if __name__ == "__main__":
+    unittest.main()
