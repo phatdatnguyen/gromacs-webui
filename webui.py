@@ -18,6 +18,8 @@ for filepath in glob.iglob('./static/*.html'):
     os.remove(filepath)
 for filepath in glob.iglob('./static/*.pdb'):
     os.remove(filepath)
+for filepath in glob.iglob('./static/*.xtc'):
+    os.remove(filepath)
 
 # create a FastAPI app
 app = FastAPI()

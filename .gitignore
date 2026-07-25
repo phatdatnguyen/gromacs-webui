@@ -24,5 +24,6 @@ __pycache__/
 *.trr
 *.xtc
 *.npz
+*.txt
 
 CLAUDE.md

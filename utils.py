@@ -1,5 +1,9 @@
+import math
 import os
+import re
+import subprocess
 import threading
+import MDAnalysis as mda
 import torch
 from nnpot_models import (
     GmxAIMNet2Model,
@@ -191,6 +195,68 @@ def download_nnpot_model(model_name):
     
     return modelfile_path
 
+def run_checked_command(cmd, cwd=None, stdin_input=None, error_lines=25):
+    """Run a command to completion, raising an Exception that carries its stderr.
+
+    GROMACS writes its diagnostics ("Fatal error", missing atoms, mismatched
+    coordinate counts) to stderr. Without capturing it, a failure surfaces in the
+    UI as nothing more than 'returned non-zero exit status 1'."""
+    process = subprocess.run(cmd, cwd=cwd, input=stdin_input, text=True, capture_output=True)
+
+    if process.returncode != 0:
+        output = (process.stderr or "") + "\n" + (process.stdout or "")
+        lines = [line for line in output.splitlines() if line.strip()]
+
+        # GROMACS prints a version banner before the diagnostic, so start the
+        # message at the error block itself and fall back to the tail otherwise.
+        marker_index = None
+        for index, line in enumerate(lines):
+            if line.lstrip().startswith(("Fatal error", "Error in user input", "Inconsistency in user input")):
+                marker_index = index
+
+        if marker_index is None:
+            detail_lines = lines[-error_lines:]
+        else:
+            detail_lines = [line for line in lines[marker_index:]
+                            if not line.startswith("---")
+                            and "troubleshooting" not in line
+                            and "manual.gromacs.org" not in line][:error_lines]
+
+        detail = "\n".join(detail_lines) if detail_lines else "no output captured"
+        raise Exception(f"{os.path.basename(cmd[0])} {cmd[1] if len(cmd) > 1 else ''} failed "
+                        f"(exit status {process.returncode}):\n{detail}")
+
+    return process
+
+def stop_process_gracefully(proc, timeout=15):
+    """Ask a run to stop, only killing it if it ignores the request.
+
+    mdrun handles SIGTERM by finishing the current step, writing a checkpoint and
+    a confout structure; SIGKILL would discard everything since the last
+    checkpoint was written."""
+    if proc is None or proc.poll() is not None:
+        return
+
+    proc.terminate()
+    try:
+        proc.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+
+def get_gpu_mdrun_options(use_gpu, mpi_rank):
+    """mdrun GPU offload flags that are safe for minimisation and restrained
+    equilibration: nonbonded and PME carry almost all of the cost, while
+    -bonded gpu and -update gpu are refused outright when position restraints
+    are present, and GPU PME needs a single rank."""
+    if not use_gpu:
+        return []
+
+    options = ["-nb", "gpu"]
+    if int(mpi_rank) == 1:
+        options.extend(["-pme", "gpu"])
+
+    return options
+
 class ProcessStateDict(dict):
     """dict subclass for gr.State that creates a fresh lock on deep copy."""
     def __init__(self):
@@ -199,27 +265,158 @@ class ProcessStateDict(dict):
     def __deepcopy__(self, memo):
         return ProcessStateDict()
 
-def get_default_ion_addition_mdp_file_content():
-    return """
+DEFAULT_TERMINUS_CHOICE = "Default (charged)"
+
+# Terminus patch names offered in the UI. The list a given force field actually
+# accepts comes from its aminoacids.[nc].tdb, and pdb2gmx filters it per residue,
+# so the dropdowns allow custom values and the real menu is resolved at run time
+# by resolve_terminus_selections().
+N_TERMINUS_CHOICES = [DEFAULT_TERMINUS_CHOICE, "NH3+", "NH2", "None", "GLY-NH3+", "PRO-NH2+"]
+C_TERMINUS_CHOICES = [DEFAULT_TERMINUS_CHOICE, "COO-", "COOH", "CT1", "CT2", "None"]
+
+PROBE_PDB2GMX_PREFIX = ".probe_pdb2gmx"
+
+def _parse_terminus_menus(pdb2gmx_output):
+    # choose_ter() prints the title with printf(), then one "%2d: name" line per
+    # option, so the options are the lines directly following a title line.
+    menus = []
+    current_menu = None
+
+    for line in pdb2gmx_output.splitlines():
+        title = re.match(r'\s*Select (start|end) terminus type for (\S+)', line)
+        if title:
+            current_menu = {"kind": title.group(1), "residue": title.group(2), "options": []}
+            menus.append(current_menu)
+            continue
+
+        if current_menu is None:
+            continue
+
+        option = re.match(r'\s*(\d+):\s*(.+?)\s*$', line)
+        if option:
+            # choose_ter() appends a note to zwitterion entries; keep the name only.
+            label = re.sub(r'\s*\(only use with zwitterions.*\)\s*$', '', option.group(2)).strip()
+            current_menu["options"].append((option.group(1), label))
+        else:
+            current_menu = None
+
+    return menus
+
+def _remove_pdb2gmx_probe_files(working_directory_path):
+    try:
+        names = os.listdir(working_directory_path)
+    except OSError:
+        return
+
+    for name in names:
+        # pdb2gmx also writes per-chain include files and #backup# copies derived
+        # from the probe output names.
+        if name.startswith(PROBE_PDB2GMX_PREFIX) or name.startswith("#" + PROBE_PDB2GMX_PREFIX):
+            try:
+                os.remove(os.path.join(working_directory_path, name))
+            except OSError:
+                pass
+
+def resolve_terminus_selections(pdb2gmx_cmd, working_directory_path, n_terminus, c_terminus):
+    """Probe 'gmx pdb2gmx -ter' to read the terminus menu it prints for each chain,
+    then map the requested terminus names onto the stdin answers for the real run.
+
+    Returns (stdin_input, descriptions). Matching is done per prompt rather than
+    with a fixed index because filter_ter() builds a different list per residue
+    (a PRO N-terminus offers PRO-NH2+ first, so NH3+ is not index 0 there)."""
+    # The real command runs with cwd set to the working directory and plain file
+    # names, so the probe uses plain names too.
+    probe_cmd = list(pdb2gmx_cmd)
+    probe_cmd[probe_cmd.index("-o") + 1] = PROBE_PDB2GMX_PREFIX + ".gro"
+    probe_cmd[probe_cmd.index("-p") + 1] = PROBE_PDB2GMX_PREFIX + ".top"
+    probe_itp = PROBE_PDB2GMX_PREFIX + ".itp"
+    if "-i" in probe_cmd:
+        probe_cmd[probe_cmd.index("-i") + 1] = probe_itp
+    else:
+        probe_cmd.extend(["-i", probe_itp])
+
+    try:
+        probe = subprocess.Popen(probe_cmd, cwd=working_directory_path, stdin=subprocess.PIPE,
+                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        # Answer every prompt up front: pdb2gmx's menu goes to a block-buffered
+        # stdout pipe, so reading it before replying would deadlock.
+        stdout_probe, stderr_probe = probe.communicate(input="0\n" * 512)
+    finally:
+        _remove_pdb2gmx_probe_files(working_directory_path)
+
+    if probe.returncode != 0:
+        raise Exception(stderr_probe)
+
+    menus = _parse_terminus_menus(stdout_probe)
+    if not menus:
+        raise Exception("pdb2gmx did not offer any terminus selection.\n" + stdout_probe + stderr_probe)
+
+    answers = []
+    descriptions = []
+    for menu in menus:
+        requested = n_terminus if menu["kind"] == "start" else c_terminus
+        if requested is None or requested.strip() == "" or requested == DEFAULT_TERMINUS_CHOICE:
+            index, label = menu["options"][0]
+        else:
+            match = next((option for option in menu["options"] if option[1].lower() == requested.strip().lower()), None)
+            if match is None:
+                available = ", ".join(label for _, label in menu["options"])
+                raise Exception(f"Terminus type '{requested}' is not available for the {menu['kind']} terminus of {menu['residue']}.\nAvailable types: {available}")
+            index, label = match
+
+        answers.append(index)
+        descriptions.append(f"{menu['residue']} {label}")
+
+    return "\n".join(answers) + "\n", descriptions
+
+def is_charmm_force_field(force_field):
+    return str(force_field or "").strip().lower().startswith("charmm")
+
+def get_cutoff_mdp_section(force_field):
+    if is_charmm_force_field(force_field):
+        # CHARMM is parameterised with a force-switched LJ potential; plain
+        # cutoffs at 1.0 nm give wrong energetics.
+        return """; Neighbor searching and cutoffs (CHARMM force-switch)
+cutoff-scheme   = Verlet
+vdwtype         = cutoff
+vdw-modifier    = force-switch
+rlist           = 1.2
+rvdw            = 1.2
+rvdw-switch     = 1.0
+coulombtype     = PME
+rcoulomb        = 1.2
+DispCorr        = no"""
+
+    return """; Neighbor searching and cutoffs
+cutoff-scheme   = Verlet
+rlist           = 1.0
+rvdw            = 1.0
+rcoulomb        = 1.0
+coulombtype     = PME"""
+
+def get_default_ion_addition_mdp_file_content(force_field=None):
+    return f"""
 integrator = steep
 nsteps     = 500
 emtol      = 1000.0
 
-cutoff-scheme = Verlet
-coulombtype   = PME
-rcoulomb      = 1.0
-rvdw          = 1.0
+{get_cutoff_mdp_section(force_field)}
 """
 
-def get_default_energy_minimization_mdp_file_content():
-    return """
+def get_default_energy_minimization_mdp_file_content(force_field=None):
+    return f"""
 integrator  = steep
 nsteps      = 50000
 emtol       = 1000.0
+
+{get_cutoff_mdp_section(force_field)}
 """
 
-def get_default_nvt_equilibration_mdp_file_content(time_scale_ps=500, time_step_ps=0.002, temperature=300, with_ligand=False):
+def get_default_nvt_equilibration_mdp_file_content(time_scale_ps=500, time_step_ps=0.002, temperature=300, with_ligand=False, force_field=None):
     return f"""
+; Restrain the solute while the solvent relaxes around it
+define      = -DPOSRES
+
 integrator  = md
 dt          = {time_step_ps}
 nsteps      = {int(time_scale_ps / time_step_ps)}
@@ -228,10 +425,22 @@ tc-grps     = System
 tau_t       = 0.1
 ref_t       = {temperature}
 constraints = h-bonds
+
+; Energy minimisation leaves no velocities behind, so draw them from a
+; Maxwell distribution instead of starting the thermostat from 0 K
+continuation = no
+gen_vel     = yes
+gen_temp    = {temperature}
+gen_seed    = -1
+
+{get_cutoff_mdp_section(force_field)}
 """
 
-def get_default_npt_equilibration_mdp_file_content(time_scale_ps=1000, time_step_ps=0.002, temperature=300, pressure=1.0, with_ligand=False):
+def get_default_npt_equilibration_mdp_file_content(time_scale_ps=1000, time_step_ps=0.002, temperature=300, pressure=1.0, with_ligand=False, force_field=None):
     return f"""
+; Keep the solute restrained through the density equilibration as well
+define          = -DPOSRES
+
 integrator      = md
 dt              = {time_step_ps}
 nsteps          = {int(time_scale_ps / time_step_ps)}
@@ -248,8 +457,9 @@ tc-grps         = System
 tau_t           = 0.1
 ref_t           = {temperature}
 
-; Pressure coupling
-pcoupl          = Parrinello-Rahman
+; Pressure coupling. C-rescale rather than Parrinello-Rahman: the box starts far
+; from equilibrium here, where Parrinello-Rahman can oscillate.
+pcoupl          = C-rescale
 pcoupltype      = isotropic
 tau_p           = 2.0
 ref_p           = {pressure}
@@ -259,15 +469,10 @@ compressibility = 4.5e-5
 constraints     = h-bonds
 constraint_algorithm = lincs
 
-; Cutoffs
-cutoff-scheme   = Verlet
-rlist           = 1.0
-rvdw            = 1.0
-rcoulomb        = 1.0
-coulombtype     = PME
+{get_cutoff_mdp_section(force_field)}
 """
 
-def get_default_prod_md_mdp_file_content(time_scale_ps=1000, time_step_ps=0.002, temperature=300, pressure=1.0, mdp_type="Initial", random_seed=0, with_ligand=False, nnpot_active=False, nnpot_modelfile_path="models/ani2x.pt", nnpot_input_group="Protein", nnpot_model_name="ani2x"):
+def get_default_prod_md_mdp_file_content(time_scale_ps=1000, time_step_ps=0.002, temperature=300, pressure=1.0, mdp_type="Initial", random_seed=0, with_ligand=False, nnpot_active=False, nnpot_modelfile_path="models/ani2x.pt", nnpot_input_group="Protein", nnpot_model_name="ani2x", force_field=None):
     content = f"""
 integrator      = md
 dt              = {time_step_ps}
@@ -280,12 +485,7 @@ nstenergy       = 5000
 nstlog          = 5000
 nstxout-compressed = 5000
 
-; Neighbor searching
-cutoff-scheme   = Verlet
-rlist           = 1.0
-rvdw            = 1.0
-rcoulomb        = 1.0
-coulombtype     = PME
+{get_cutoff_mdp_section(force_field)}
 
 ; Temperature coupling
 tcoupl          = V-rescale
@@ -415,4 +615,341 @@ def merge_protein_ligand_topologies(protein_topology_file_path, ligand_topology_
 
     # Write merged topology
     with open(output_topology_file_path, "w") as f:
-        f.writelines(new_lines)       
+        f.writelines(new_lines)
+
+WATER_RESNAMES = ["SOL", "WAT", "HOH", "H2O", "W", "DOD", "D3O", "TIP3", "TIP3P", "TIP4", "TIP4P", "SPC", "SPCE"]
+
+# Ion resname aliases used by the force fields in play (CHARMM ports, AMBER, GROMACS).
+ION_RESNAME_ALIASES = {
+    "SOD": "NA", "CLA": "CL", "POT": "K", "CAL": "CA", "CES": "CS",
+    "LIT": "LI", "IOD": "I", "BAR": "BA", "CAD": "CD",
+}
+
+# Jmol/CPK colours, the same palette NGL uses for its element colour scheme.
+ELEMENT_COLORS = {
+    "NA": "#AB5CF2", "CL": "#1FF01F", "K": "#8F40D4", "CA": "#3DFF00", "MG": "#8AFF00",
+    "ZN": "#7D80B0", "FE": "#E06633", "CU": "#C88033", "MN": "#9C7AC7", "CO": "#F090A0",
+    "NI": "#50D050", "CD": "#FFD98F", "HG": "#B8B8D0", "AG": "#C0C0C0", "AU": "#FFD123",
+    "AL": "#BFA6A6", "LI": "#CC80FF", "RB": "#702EB0", "CS": "#57178F", "SR": "#00FF00",
+    "BA": "#00C900", "BR": "#A62929", "I": "#940094", "F": "#90E050", "PB": "#575961",
+    "CR": "#8A99C7", "BE": "#C2FF00", "GA": "#C28F8F", "IN": "#A67573", "LA": "#70D4FF",
+    "CE": "#FFFFC7", "EU": "#61FFC7", "GD": "#45FFC7", "DY": "#1FFFC7", "ER": "#00E675",
+    "HO": "#00FF9C", "LU": "#00AB24", "BI": "#9E4FB5", "AS": "#BD80E3", "SE": "#FFA100",
+}
+# Magenta means "this species was not recognised", so it stands out instead of
+# silently blending in with a default colour.
+UNKNOWN_SPECIES_COLOR = "#FF00FF"
+
+def get_ion_element(resname):
+    """Derive the element symbol from an ion residue name, or None if unrecognised.
+
+    Ion resnames vary by force field: plain (NA, CL, ZN), aliased (SOD, CLA, POT)
+    or carrying a charge suffix as in the CHARMM ports (CU2P, FE3P, ZN2P, AG1P).
+    Elements are derived from the name rather than guessed from coordinates
+    because atom names like 'CU2P' guess badly (carbon, not copper)."""
+    name = str(resname or "").strip().upper()
+    if not name:
+        return None
+
+    if name in ION_RESNAME_ALIASES:
+        name = ION_RESNAME_ALIASES[name]
+    if name in ELEMENT_COLORS:
+        return name
+
+    # Strip a trailing charge marker: CU2P / FE3M / NA+ / CL- / ZN2
+    candidate = re.sub(r'(\d+[PM]|[+-]+|\d+)$', '', name)
+    if candidate in ION_RESNAME_ALIASES:
+        candidate = ION_RESNAME_ALIASES[candidate]
+    if candidate in ELEMENT_COLORS:
+        return candidate
+
+    return None
+
+def get_structure_species(atoms):
+    """Group the atoms into protein / ions / other hetero / water for rendering.
+
+    A resname counts as an ion when its residues hold exactly one atom, which is
+    how NA, CL and CU2P are distinguished from a 33-atom LIG without keeping a
+    list of ion names (NGL's own 'ion' keyword knows CU but not CU2P)."""
+    water_resnames = []
+    ions = []
+    hetero = []
+
+    protein_atoms = atoms.select_atoms("protein")
+    protein_residues = protein_atoms.n_residues
+    protein_indices = set(protein_atoms.indices)
+
+    seen = {}
+    for residue in atoms.residues:
+        resname = str(residue.resname).strip().upper()
+        n_atoms_in_residue = len(residue.atoms)
+        if resname in WATER_RESNAMES:
+            if resname not in water_resnames:
+                water_resnames.append(resname)
+            continue
+        if protein_indices and set(residue.atoms.indices) <= protein_indices:
+            continue
+
+        entry = seen.setdefault(resname, {"resname": resname, "count": 0, "atoms_per_residue": n_atoms_in_residue})
+        entry["count"] += 1
+
+    for entry in sorted(seen.values(), key=lambda e: (-e["count"], e["resname"])):
+        if entry["atoms_per_residue"] == 1:
+            element = get_ion_element(entry["resname"])
+            ions.append({
+                "resname": entry["resname"],
+                "count": entry["count"],
+                "element": element,
+                "color": ELEMENT_COLORS.get(element, UNKNOWN_SPECIES_COLOR),
+                "recognized": element is not None,
+            })
+        else:
+            hetero.append(entry)
+
+    return {"protein_residues": protein_residues, "ions": ions, "hetero": hetero, "water": water_resnames}
+
+def get_species_legend(species):
+    parts = []
+    if species["protein_residues"]:
+        parts.append(f"protein {species['protein_residues']} res")
+    for entry in species["hetero"]:
+        parts.append(f"{entry['resname']} {entry['count']} ({entry['atoms_per_residue']} atoms)")
+    for ion in species["ions"]:
+        parts.append(f"{ion['resname']} {ion['count']}" if ion["recognized"] else f"{ion['resname']} {ion['count']} (unrecognised, magenta)")
+    for resname in species["water"]:
+        parts.append(f"{resname} (water)")
+
+    return "Species: " + ", ".join(parts) + "." if parts else ""
+
+def get_species_representations_js(species):
+    """NGL.js representation calls for every species present in the structure."""
+    lines = []
+    n_protein_residues = species["protein_residues"]
+
+    if n_protein_residues:
+        # Cartoon needs a backbone long enough to trace; on a short peptide it
+        # draws nothing and the viewport looks empty, so use licorice there.
+        if n_protein_residues < 20:
+            lines.append('comp.addRepresentation("licorice", { sele: "protein", colorScheme: "element" });')
+        else:
+            lines.append('comp.addRepresentation("cartoon", { sele: "protein", colorScheme: "sstruc" });')
+
+    for entry in species["hetero"]:
+        lines.append(f'comp.addRepresentation("ball+stick", {{ sele: "[{entry["resname"]}]" }});')
+
+    for ion in species["ions"]:
+        # Explicit colour and a fixed radius: a mis-guessed element must not be
+        # able to shrink or grey out an ion sphere.
+        lines.append(f'comp.addRepresentation("spacefill", {{ sele: "[{ion["resname"]}]", color: "{ion["color"]}", radiusType: "size", radiusSize: 1.0 }});')
+
+    if species["ions"]:
+        ion_selection = " or ".join(f'[{ion["resname"]}]' for ion in species["ions"])
+        lines.append(f'comp.addRepresentation("label", {{ sele: "{ion_selection}", labelType: "resname", color: "#222222", scale: 1.5, showBackground: true, backgroundColor: "white", backgroundOpacity: 0.5 }});')
+
+    if species["water"]:
+        lines.append('comp.addRepresentation("line", { sele: "water", opacity: 0.3 });')
+
+    return "\n  ".join(lines)
+
+def add_species_representations_to_nglview(view, species):
+    """Same species handling as the trajectory viewer, applied to an nglview widget."""
+    view.clear()
+
+    n_protein_residues = species["protein_residues"]
+    if n_protein_residues:
+        if n_protein_residues < 20:
+            view.add_representation("licorice", selection="protein")
+        else:
+            view.add_cartoon("protein", color="sstruc")
+
+    for entry in species["hetero"]:
+        view.add_ball_and_stick(f'[{entry["resname"]}]')
+
+    for ion in species["ions"]:
+        view.add_representation("spacefill", selection=f'[{ion["resname"]}]', color=ion["color"], radiusType="size", radiusSize=1.0)
+
+    if species["ions"]:
+        ion_selection = " or ".join(f'[{ion["resname"]}]' for ion in species["ions"])
+        view.add_representation("label", selection=ion_selection, labelType="resname", color="#222222", scale=1.5,
+                                showBackground=True, backgroundColor="white", backgroundOpacity=0.5)
+
+    if species["water"]:
+        view.add_representation("line", selection="water", opacity=0.3)
+
+def prepare_structure_viewer_file(structure_file_path, static_output_path):
+    """Return (path NGL should load, species present) for the structure viewer.
+
+    Non-PDB inputs are converted with MDAnalysis rather than ParmEd: ParmEd clips
+    residue names to the 3-column PDB field (CU2P -> CU2), which would stop the
+    per-species selections from matching. MDAnalysis writes 4 characters into
+    columns 18-21, exactly what NGL's PDB parser reads."""
+    universe = mda.Universe(structure_file_path)
+
+    try:
+        universe.guess_TopologyAttrs(context="default", to_guess=["elements"])
+    except Exception:
+        pass
+
+    if structure_file_path.endswith(".pdb"):
+        display_path = structure_file_path
+    else:
+        universe.atoms.write(static_output_path)
+        display_path = static_output_path
+
+    return display_path, get_structure_species(universe)
+
+TRAJECTORY_VIEWER_SELECTIONS = {
+    "Protein": "protein",
+    "Protein + Ligand + Ions": "not resname " + " ".join(WATER_RESNAMES),
+    "All Atoms": "all",
+}
+
+def write_trajectory_viewer_files(structure_file_path, trajectory_file_path, selection, max_frames, static_basename):
+    """Write a reduced structure/trajectory pair into ./static for the NGL viewer.
+
+    Production trajectories here run to several GB of solvated system, which no
+    browser can hold in memory (NGL keeps every frame as float32), so the frames
+    are subsetted and strided before they are handed over."""
+    selection_string = TRAJECTORY_VIEWER_SELECTIONS.get(selection, selection)
+
+    structure_name = os.path.basename(structure_file_path)
+    trajectory_name = os.path.basename(trajectory_file_path)
+
+    try:
+        universe = mda.Universe(structure_file_path, trajectory_file_path)
+    except Exception as exc:
+        # Mismatched atom counts are the usual cause, but an empty or truncated
+        # trajectory lands here too, so do not assert one over the other.
+        raise Exception(
+            f"Could not read '{structure_name}' together with '{trajectory_name}'. Check that both "
+            f"come from the same run (so the atom counts match) and that the trajectory is complete.\n{exc}"
+        ) from exc
+
+    if len(universe.trajectory) == 0:
+        raise Exception(f"'{trajectory_name}' contains no frames.")
+
+    atoms = universe.select_atoms(selection_string)
+    if atoms.n_atoms == 0:
+        raise Exception(f"Selection '{selection}' matched no atoms in {structure_name}.")
+
+    # GRO files carry no element column, so fill it in before writing the PDB;
+    # NGL uses elements for bond detection, colours and radii.
+    try:
+        universe.guess_TopologyAttrs(context="default", to_guess=["elements"])
+    except Exception:
+        pass
+
+    total_frames = len(universe.trajectory)
+    stride = max(1, math.ceil(total_frames / max(1, int(max_frames))))
+
+    structure_output_path = os.path.join("./static", static_basename + ".pdb")
+    trajectory_output_path = os.path.join("./static", static_basename + ".xtc")
+
+    # Structure and trajectory are written from the same selection so their atom
+    # counts always agree, which NGL requires to apply frames to the structure.
+    universe.trajectory[0]
+    atoms.write(structure_output_path)
+
+    written_frames = 0
+    with mda.Writer(trajectory_output_path, atoms.n_atoms) as writer:
+        for _ in universe.trajectory[::stride]:
+            writer.write(atoms)
+            written_frames += 1
+
+    species = get_structure_species(atoms)
+
+    return {
+        "frames": written_frames,
+        "stride": stride,
+        "total_frames": total_frames,
+        "n_atoms": atoms.n_atoms,
+        "n_residues": atoms.n_residues,
+        "species": species,
+    }
+
+TRAJECTORY_VIEWER_HTML_TEMPLATE = """<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>MD Trajectory Viewer</title>
+<script src="https://unpkg.com/ngl@2.4.0/dist/ngl.js"></script>
+<style>
+  html, body { margin: 0; padding: 0; font-family: sans-serif; background: #ffffff; }
+  #viewport { width: 100%; height: 700px; }
+  #controls { display: flex; align-items: center; gap: 8px; padding: 6px; }
+  #frame { flex: 1; }
+  #counter { font-size: 12px; color: #333; min-width: 80px; text-align: right; }
+  #status { font-size: 12px; color: #555; padding: 0 6px 6px 6px; }
+</style>
+</head>
+<body>
+<div id="viewport"></div>
+<div id="controls">
+  <button id="toggle" type="button">Pause</button>
+  <input id="frame" type="range" min="0" max="__MAX_FRAME__" value="0" step="1">
+  <span id="counter">-</span>
+</div>
+<div id="status">Loading trajectory...</div>
+<script>
+var TS = "__TIMESTAMP__";
+var BASE = "__BASENAME__";
+
+var statusEl = document.getElementById("status");
+var toggleEl = document.getElementById("toggle");
+var frameEl = document.getElementById("frame");
+var counterEl = document.getElementById("counter");
+
+var stage = new NGL.Stage("viewport", { backgroundColor: "white" });
+window.addEventListener("resize", function () { stage.handleResize(); });
+
+stage.loadFile("/static/" + BASE + ".pdb?ts=" + TS).then(function (comp) {
+  __SPECIES_REPRESENTATIONS__
+  comp.autoView();
+
+  return NGL.autoLoad("/static/" + BASE + ".xtc?ts=" + TS).then(function (frames) {
+    var traj = comp.addTrajectory(frames, {}).trajectory;
+    var count = traj.frameCount;
+    frameEl.max = Math.max(0, count - 1);
+
+    var player = new NGL.TrajectoryPlayer(traj, {
+      step: 1, timeout: 80, mode: "loop", direction: "forward", interpolateType: ""
+    });
+    var playing = true;
+    player.play();
+
+    toggleEl.addEventListener("click", function () {
+      if (playing) { player.pause(); toggleEl.textContent = "Play"; }
+      else { player.play(); toggleEl.textContent = "Pause"; }
+      playing = !playing;
+    });
+
+    frameEl.addEventListener("input", function () {
+      if (playing) { player.pause(); playing = false; toggleEl.textContent = "Play"; }
+      traj.setFrame(parseInt(frameEl.value, 10));
+    });
+
+    setInterval(function () {
+      var current = traj.currentFrame;
+      if (current < 0) { return; }
+      if (playing) { frameEl.value = current; }
+      counterEl.textContent = (current + 1) + " / " + count;
+    }, 100);
+
+    statusEl.textContent = count + " frames animating.";
+  });
+}).catch(function (err) {
+  statusEl.textContent = "Error: " + err;
+});
+</script>
+</body>
+</html>
+"""
+
+def get_trajectory_viewer_html(static_basename, timestamp, n_frames, species):
+    representations = get_species_representations_js(species)
+
+    return (TRAJECTORY_VIEWER_HTML_TEMPLATE
+            .replace("__BASENAME__", static_basename)
+            .replace("__TIMESTAMP__", str(timestamp))
+            .replace("__MAX_FRAME__", str(max(0, n_frames - 1)))
+            .replace("__SPECIES_REPRESENTATIONS__", representations))

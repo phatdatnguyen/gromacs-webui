@@ -9,7 +9,6 @@ import shutil
 import subprocess
 import pandas as pd
 import gradio as gr
-import parmed as pmd
 import nglview
 import MDAnalysis as mda
 from MDAnalysis.analysis import rms
@@ -93,6 +92,8 @@ def on_file_list_change(working_directory_path,
     run_input_files = [f for f in files if f.endswith('.tpr')]
     checkpoint_files = [f for f in files if f.endswith('.cpt')]
     trajectory_files = [f for f in files if f.endswith('.xtc')]
+    # NGL and MDAnalysis both read .trr, so the viewer accepts it as well.
+    viewer_trajectory_files = [f for f in files if f.endswith('.xtc') or f.endswith('.trr')]
 
     # Update topology input file name dropdown
     if protein_structure_file_name in structure_files:
@@ -311,7 +312,9 @@ def on_file_list_change(working_directory_path,
         gr.update(choices=trajectory_files, value=center_protein_input_traj_file_name_value), \
         gr.update(choices=trajectory_files, value=fit_backbone_input_traj_file_name_value), \
         gr.update(choices=structure_files, value=analysis_structure_file_name_value), \
-        gr.update(choices=trajectory_files, value=analysis_input_traj_file_name_value)
+        gr.update(choices=trajectory_files, value=analysis_input_traj_file_name_value), \
+        gr.update(choices=structure_files, value=analysis_structure_file_name_value), \
+        gr.update(choices=viewer_trajectory_files, value=analysis_input_traj_file_name_value)
 
 def on_select_file(evt: gr.SelectData):
     selected_file_name = evt.row_value[0]
@@ -323,10 +326,13 @@ def on_select_file(evt: gr.SelectData):
         return selected_file_name, None, None, gr.update(interactive=True)
 
 def on_selected_structure_file_state_change(state):
-    return gr.update(interactive=(state is not None))
+    # Open the accordion the button lives in, so a selected file is one click away.
+    # Only ever open it: closing would collapse a viewer the user is reading just
+    # because they clicked a row of a different type.
+    return gr.update(interactive=(state is not None)), gr.update(open=True) if state is not None else gr.update()
 
 def on_selected_text_file_state_change(state):
-    return gr.update(interactive=(state is not None))
+    return gr.update(interactive=(state is not None)), gr.update(open=True) if state is not None else gr.update()
 
 def on_delete_file(working_directory_path, selected_file_name):
     if selected_file_name is None:
@@ -358,19 +364,16 @@ def on_clean_working_directory(working_directory_path):
 
 def on_view_protein_structure(working_directory_path, protein_file_name):
     try:
-        protein_file_path = os.path.join(working_directory_path, protein_file_name)
-        if protein_file_name.endswith('.gro'):
-            protein_structure = pmd.load_file(protein_file_path)
-            protein_structure.save("./static/protein_md_structure.pdb", overwrite=True)
-            protein_file_path = "./static/protein_md_structure.pdb"
+        # Representations follow whatever species the file actually contains, so
+        # ions like CU2P are drawn instead of being silently skipped.
+        protein_file_path, species = prepare_structure_viewer_file(
+            os.path.join(working_directory_path, protein_file_name),
+            "./static/protein_md_structure.pdb",
+        )
 
         # Create the NGL view widget
         view = nglview.show_structure_file(protein_file_path)
-        view.clear()
-        view.add_cartoon("protein", color="sstruc")
-        view.add_ball_and_stick("NA")
-        view.add_ball_and_stick("CL")
-        view.add_ball_and_stick("SOL", opacity=0.3)
+        add_species_representations_to_nglview(view, species)
 
         # Write the widget to HTML
         if os.path.exists('./static/protein_md_structure.html'):
@@ -381,10 +384,39 @@ def on_view_protein_structure(working_directory_path, protein_file_name):
         timestamp = int(time.time())
         html = f'<iframe src="/static/protein_md_structure.html?ts={timestamp}" height="800" width="600" title="NGL View"></iframe>'
 
-        return html
+        return html, "<span style='color:green;'>" + get_species_legend(species) + "</span>"
     except Exception as exc:
         gr.Warning("Error!\n" + str(exc))
-        return None
+        return None, "<span style='color:red;'>Error loading structure!</span>"
+
+def on_view_trajectory(working_directory_path, structure_file_name, trajectory_file_name, selection, max_frames):
+    if structure_file_name is None or trajectory_file_name is None:
+        gr.Warning("Please select both a structure file and a trajectory file.")
+        return None, None
+
+    try:
+        static_basename = "protein_md_trajectory"
+        info = write_trajectory_viewer_files(
+            os.path.join(working_directory_path, structure_file_name),
+            os.path.join(working_directory_path, trajectory_file_name),
+            selection,
+            max_frames,
+            static_basename,
+        )
+
+        viewer_file_path = f"./static/{static_basename}_view.html"
+        timestamp = int(time.time())
+        with open(viewer_file_path, 'w') as file:
+            file.write(get_trajectory_viewer_html(static_basename, timestamp, info["frames"], info["species"]))
+
+        html = f'<iframe src="/static/{static_basename}_view.html?ts={timestamp}" height="800" width="600" title="NGL Trajectory View"></iframe>'
+        status = (f"Showing {info['frames']} of {info['total_frames']} frames (every {info['stride']}), "
+                  f"{info['n_atoms']} atoms. {get_species_legend(info['species'])}")
+
+        return html, "<span style='color:green;'>" + status + "</span>"
+    except Exception as exc:
+        gr.Warning("Error!\n" + str(exc))
+        return None, "<span style='color:red;'>Error loading trajectory!</span>"
 
 def on_view_text_file(working_directory_path, text_file_name):
     text_file_path = os.path.join(working_directory_path, text_file_name)
@@ -427,22 +459,41 @@ def on_upload_protein_structure_file(working_directory_path, protein_structure_f
         status = "Error uploading file!\n" + str(exc)
         return get_files_in_working_directory(working_directory_path), "<span style='color:red;'>" + status + "</span>"
 
-def on_generate_protein_topology(working_directory_path, input_file_name, output_file_name, output_topology_file_name, force_field, water_model):
+def on_generate_protein_topology(working_directory_path, input_file_name, output_file_name, output_topology_file_name, force_field, water_model, n_terminus, c_terminus):
     try:
+        # Run inside the working directory with plain file names: pdb2gmx writes the
+        # -i path verbatim into the topology's "#ifdef POSRES" include, so passing a
+        # path here would leave the topology only usable from this app's directory.
         cmd = [
             "gmx", "pdb2gmx",
-            "-f", os.path.join(working_directory_path, input_file_name),
-            "-o", os.path.join(working_directory_path, output_file_name),
-            "-p", os.path.join(working_directory_path, output_topology_file_name),
+            "-f", input_file_name,
+            "-o", output_file_name,
+            "-p", output_topology_file_name,
+            "-i", "posre.itp",
             "-ff", force_field.lower(),
             "-water", water_model.lower(),
             "-ignh"
         ]
 
-        print(f"Running command: {' '.join(cmd)}")
+        select_termini = n_terminus != DEFAULT_TERMINUS_CHOICE or c_terminus != DEFAULT_TERMINUS_CHOICE
+        if select_termini:
+            cmd.append("-ter")
 
-        subprocess.run(cmd, check=True)
-        status = "Topology generated successfully."
+        print(f"Running command (in {working_directory_path}): {' '.join(cmd)}")
+
+        if select_termini:
+            answers, resolved_termini = resolve_terminus_selections(cmd, working_directory_path, n_terminus, c_terminus)
+            process = subprocess.Popen(cmd, cwd=working_directory_path, stdin=subprocess.PIPE,
+                                       stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            _, stderr = process.communicate(input=answers)
+
+            if process.returncode != 0:
+                raise Exception(stderr)
+
+            status = "Topology generated successfully. Termini: " + ", ".join(resolved_termini) + "."
+        else:
+            run_checked_command(cmd, cwd=working_directory_path)
+            status = "Topology generated successfully."
     except Exception as exc:
         status = "Error generating topology!\n" + str(exc)
         return get_files_in_working_directory(working_directory_path), "<span style='color:red;'>" + status + "</span>"
@@ -462,7 +513,7 @@ def on_generate_simulation_box(working_directory_path, input_file_name, output_f
 
         print(f"Running command: {' '.join(cmd)}")
 
-        subprocess.run(cmd, check=True)
+        run_checked_command(cmd)
         status = "Simulation box generated successfully."
     except Exception as exc:
         status = "Error generating simulation box!\n" + str(exc)
@@ -484,7 +535,7 @@ def on_solvate_protein(working_directory_path, input_file_name, output_file_name
 
         print(f"Running command: {' '.join(cmd)}")
 
-        subprocess.run(cmd, check=True)
+        run_checked_command(cmd)
         status = "Protein solvated successfully."
     except Exception as exc:
         status = "Error solvating protein!\n" + str(exc)
@@ -492,8 +543,8 @@ def on_solvate_protein(working_directory_path, input_file_name, output_file_name
         
     return get_files_in_working_directory(working_directory_path), "<span style='color:green;'>" + status + "</span>"
 
-def on_generate_ions_mdp_file(working_directory_path, parameter_file_name):
-    file_content = get_default_ion_addition_mdp_file_content()
+def on_generate_ions_mdp_file(working_directory_path, parameter_file_name, force_field):
+    file_content = get_default_ion_addition_mdp_file_content(force_field=force_field)
     try:
         file_path = os.path.join(working_directory_path, parameter_file_name)
         with open(file_path, 'w') as file:
@@ -518,7 +569,7 @@ def on_generate_ions_tpr_file(working_directory_path, input_file_name, input_top
 
         print(f"Running command: {' '.join(cmd)}")
 
-        subprocess.run(cmd, check=True)
+        run_checked_command(cmd)
         status = "Ion addition run input file generated successfully."
     except Exception as exc:
         status = "Error generating ion addition run input file!\n" + str(exc)
@@ -596,8 +647,8 @@ def on_add_ions(working_directory_path, run_input_file_name, output_file_name, i
         
     return get_files_in_working_directory(working_directory_path), "<span style='color:green;'>" + status + "</span>"
 
-def on_generate_energy_minimization_mdp_file(working_directory_path, parameter_file_name):
-    file_content = get_default_energy_minimization_mdp_file_content()
+def on_generate_energy_minimization_mdp_file(working_directory_path, parameter_file_name, force_field):
+    file_content = get_default_energy_minimization_mdp_file_content(force_field=force_field)
     try:
         file_path = os.path.join(working_directory_path, parameter_file_name)
         with open(file_path, 'w') as file:
@@ -622,7 +673,7 @@ def on_generate_energy_minimization_tpr_file(working_directory_path, input_file_
 
         print(f"Running command: {' '.join(cmd)}")
 
-        subprocess.run(cmd, check=True)
+        run_checked_command(cmd)
         status = "Energy minimization run input file generated successfully."
     except Exception as exc:
         status = "Error generating energy minimization run input file!\n" + str(exc)
@@ -630,7 +681,7 @@ def on_generate_energy_minimization_tpr_file(working_directory_path, input_file_
         
     return get_files_in_working_directory(working_directory_path), "<span style='color:green;'>" + status + "</span>"
 
-def on_run_energy_minimization(working_directory_path, run_input_file_name, mpi_rank, omp_threads):
+def on_run_energy_minimization(working_directory_path, run_input_file_name, mpi_rank, omp_threads, use_gpu):
     try:
         base_name = os.path.splitext(run_input_file_name)[0]
 
@@ -640,9 +691,9 @@ def on_run_energy_minimization(working_directory_path, run_input_file_name, mpi_
             "-ntmpi", str(mpi_rank),
             "-ntomp", str(omp_threads),
             "-v"
-        ]
+        ] + get_gpu_mdrun_options(use_gpu, mpi_rank)
 
-        subprocess.run(cmd, check=True)
+        run_checked_command(cmd)
         status = "Energy minimization completed successfully."
     except Exception as exc:
         status = "Error during energy minimization!\n" + str(exc)
@@ -650,8 +701,8 @@ def on_run_energy_minimization(working_directory_path, run_input_file_name, mpi_
         
     return get_files_in_working_directory(working_directory_path), "<span style='color:green;'>" + status + "</span>"
 
-def on_generate_nvt_equilibration_mdp_file(working_directory_path, time_scale, time_step, temperature, parameter_file_name):
-    file_content = get_default_nvt_equilibration_mdp_file_content(time_scale_ps=time_scale, time_step_ps=time_step, temperature=temperature)
+def on_generate_nvt_equilibration_mdp_file(working_directory_path, time_scale, time_step, temperature, parameter_file_name, force_field):
+    file_content = get_default_nvt_equilibration_mdp_file_content(time_scale_ps=time_scale, time_step_ps=time_step, temperature=temperature, force_field=force_field)
     try:
         file_path = os.path.join(working_directory_path, parameter_file_name)
         with open(file_path, 'w') as file:
@@ -677,7 +728,7 @@ def on_generate_nvt_equilibration_tpr_file(working_directory_path, input_file_na
 
         print(f"Running command: {' '.join(cmd)}")
 
-        subprocess.run(cmd, check=True)
+        run_checked_command(cmd)
         status = "NVT equilibration run input file generated successfully."
     except Exception as exc:
         status = "Error generating NVT equilibration run input file!\n" + str(exc)
@@ -702,15 +753,18 @@ def sync_button_state(process_state):
     else:
         return gr.update(value="Start", variant="primary")
     
-def on_run_nvt_equilibration(working_directory_path, run_input_file_name, mpi_rank, omp_threads, process_state):
+def on_run_nvt_equilibration(working_directory_path, run_input_file_name, mpi_rank, omp_threads, use_gpu, process_state):
     # ---------- STOP ----------
-    if process_state["running"]:
-        with process_state["lock"]:
-            proc = process_state["proc"]
-            process_state["proc"] = None
-            process_state["running"] = False
-        if proc and proc.poll() is None:
-            proc.kill()
+    with process_state["lock"]:
+        was_running = process_state["running"]
+        proc = process_state["proc"] if was_running else None
+        process_state["proc"] = None
+        process_state["running"] = False
+
+    if was_running:
+        # Shutting the run down happens outside the lock: waiting for mdrun to
+        # write its checkpoint must not block the timer that polls this state.
+        stop_process_gracefully(proc)
 
         status = "NVT equilibration stopped by user."
 
@@ -726,7 +780,7 @@ def on_run_nvt_equilibration(working_directory_path, run_input_file_name, mpi_ra
             "-ntmpi", str(mpi_rank),
             "-ntomp", str(omp_threads),
             "-v"
-        ]
+        ] + get_gpu_mdrun_options(use_gpu, mpi_rank)
 
         print(f"Running command: {' '.join(cmd)}")
 
@@ -755,8 +809,8 @@ def on_run_nvt_equilibration(working_directory_path, run_input_file_name, mpi_ra
 
         return get_files_in_working_directory(working_directory_path), f"<span style='color:red;'>{status}</span>", process_state, gr.update(value="Start", variant="primary")
 
-def on_generate_npt_equilibration_mdp_file(working_directory_path, time_scale, time_step, temperature, pressure, parameter_file_name):
-    file_content = get_default_npt_equilibration_mdp_file_content(time_scale_ps=time_scale, time_step_ps=time_step, temperature=temperature, pressure=pressure)
+def on_generate_npt_equilibration_mdp_file(working_directory_path, time_scale, time_step, temperature, pressure, parameter_file_name, force_field):
+    file_content = get_default_npt_equilibration_mdp_file_content(time_scale_ps=time_scale, time_step_ps=time_step, temperature=temperature, pressure=pressure, force_field=force_field)
     try:
         file_path = os.path.join(working_directory_path, parameter_file_name)
         with open(file_path, 'w') as file:
@@ -782,7 +836,7 @@ def on_generate_npt_equilibration_tpr_file(working_directory_path, input_file_na
         
         print(f"Running command: {' '.join(cmd)}")
 
-        subprocess.run(cmd, check=True)
+        run_checked_command(cmd)
         status = "NPT equilibration run input file generated successfully."
     except Exception as exc:
         status = "Error generating NPT equilibration run input file!\n" + str(exc)
@@ -790,15 +844,18 @@ def on_generate_npt_equilibration_tpr_file(working_directory_path, input_file_na
         
     return get_files_in_working_directory(working_directory_path), "<span style='color:green;'>" + status + "</span>"
 
-def on_run_npt_equilibration(working_directory_path, run_input_file_name, mpi_rank, omp_threads, process_state):
+def on_run_npt_equilibration(working_directory_path, run_input_file_name, mpi_rank, omp_threads, use_gpu, process_state):
     # ---------- STOP ----------
-    if process_state["running"]:
-        with process_state["lock"]:
-            proc = process_state["proc"]
-            process_state["proc"] = None
-            process_state["running"] = False
-        if proc and proc.poll() is None:
-            proc.kill()
+    with process_state["lock"]:
+        was_running = process_state["running"]
+        proc = process_state["proc"] if was_running else None
+        process_state["proc"] = None
+        process_state["running"] = False
+
+    if was_running:
+        # Shutting the run down happens outside the lock: waiting for mdrun to
+        # write its checkpoint must not block the timer that polls this state.
+        stop_process_gracefully(proc)
 
         status = "NPT equilibration stopped by user."
 
@@ -814,7 +871,7 @@ def on_run_npt_equilibration(working_directory_path, run_input_file_name, mpi_ra
             "-ntmpi", str(mpi_rank),
             "-ntomp", str(omp_threads),
             "-v"
-        ]
+        ] + get_gpu_mdrun_options(use_gpu, mpi_rank)
 
         print(f"Running command: {' '.join(cmd)}")
 
@@ -858,7 +915,7 @@ def on_change_mdp_type(prod_md_mdp_type_radio):
     else:
         return gr.update(visible=False), "md_continue.mdp"
 
-def on_generate_prod_md_mdp_file(working_directory_path, time_scale, time_step, temperature, pressure, mdp_type, random_seed, parameter_file_name, nnpot_active, nnpot_model_name, nnpot_input_group):
+def on_generate_prod_md_mdp_file(working_directory_path, time_scale, time_step, temperature, pressure, mdp_type, random_seed, parameter_file_name, nnpot_active, nnpot_model_name, nnpot_input_group, force_field):
     if parameter_file_name is None or str(parameter_file_name).strip() == "":
         parameter_file_name = "md_initial.mdp" if mdp_type == "Initial" else "md_continue.mdp"
 
@@ -872,7 +929,7 @@ def on_generate_prod_md_mdp_file(working_directory_path, time_scale, time_step, 
             status = "Error downloading NNPot model!\n" + str(exc)
             return get_files_in_working_directory(working_directory_path), "<span style='color:red;'>" + status + "</span>"
 
-    file_content = get_default_prod_md_mdp_file_content(time_scale_ps=time_scale*1000, time_step_ps=time_step, temperature=temperature, pressure=pressure, mdp_type=mdp_type, random_seed=random_seed, nnpot_active=nnpot_active, nnpot_modelfile_path=nnpot_modelfile_path, nnpot_input_group=nnpot_input_group, nnpot_model_name=nnpot_model_name)
+    file_content = get_default_prod_md_mdp_file_content(time_scale_ps=time_scale*1000, time_step_ps=time_step, temperature=temperature, pressure=pressure, mdp_type=mdp_type, random_seed=random_seed, nnpot_active=nnpot_active, nnpot_modelfile_path=nnpot_modelfile_path, nnpot_input_group=nnpot_input_group, nnpot_model_name=nnpot_model_name, force_field=force_field)
     try:
         file_path = os.path.join(working_directory_path, parameter_file_name)
         with open(file_path, 'w') as file:
@@ -897,7 +954,7 @@ def on_generate_prod_md_tpr_file(working_directory_path, input_file_name, input_
 
         print(f"Running command: {' '.join(cmd)}")
 
-        subprocess.run(cmd, check=True)
+        run_checked_command(cmd)
         status = "Production MD run input file generated successfully."
     except Exception as exc:
         status = "Error generating production MD run input file!\n" + str(exc)
@@ -907,13 +964,16 @@ def on_generate_prod_md_tpr_file(working_directory_path, input_file_name, input_
 
 def on_run_prod_md(working_directory_path, run_input_file_name, mpi_rank, omp_threads, prod_md_nnpot_active, use_gpu, process_state):
     # ---------- STOP ----------
-    if process_state["running"]:
-        with process_state["lock"]:
-            proc = process_state["proc"]
-            process_state["proc"] = None
-            process_state["running"] = False
-        if proc and proc.poll() is None:
-            proc.kill()
+    with process_state["lock"]:
+        was_running = process_state["running"]
+        proc = process_state["proc"] if was_running else None
+        process_state["proc"] = None
+        process_state["running"] = False
+
+    if was_running:
+        # Shutting the run down happens outside the lock: waiting for mdrun to
+        # write its checkpoint must not block the timer that polls this state.
+        stop_process_gracefully(proc)
 
         status = "Production MD stopped by user."
 
@@ -971,13 +1031,16 @@ def on_run_prod_md(working_directory_path, run_input_file_name, mpi_rank, omp_th
 
 def on_continue_prod_md(working_directory_path, run_input_file_name, checkpoint_file_name, mpi_rank, omp_threads, prod_md_nnpot_active, use_gpu, process_state):
     # ---------- STOP ----------
-    if process_state["running"]:
-        with process_state["lock"]:
-            proc = process_state["proc"]
-            process_state["proc"] = None
-            process_state["running"] = False
-        if proc and proc.poll() is None:
-            proc.kill()
+    with process_state["lock"]:
+        was_running = process_state["running"]
+        proc = process_state["proc"] if was_running else None
+        process_state["proc"] = None
+        process_state["running"] = False
+
+    if was_running:
+        # Shutting the run down happens outside the lock: waiting for mdrun to
+        # write its checkpoint must not block the timer that polls this state.
+        stop_process_gracefully(proc)
 
         status = "Production MD stopped by user."
 
@@ -1048,7 +1111,7 @@ def on_make_molecule_whole(working_directory_path, run_input_file_name, input_tr
         print(f"Running command: {' '.join(cmd)}")
 
         # trjconv requires user input to select a group; we will provide "0" for "System"
-        subprocess.run(cmd, input="0\n", text=True, check=True)
+        run_checked_command(cmd, stdin_input="0\n")
         
         status = "Operation executed successfully."
     except Exception as exc:
@@ -1071,7 +1134,7 @@ def on_center_protein(working_directory_path, run_input_file_name, input_traj_fi
         print(f"Running command: {' '.join(cmd)}")
 
         # trjconv requires user input to select a group; we will provide "1" for "Protein", then "0" for "System"
-        subprocess.run(cmd, input="1\n0\n", text=True, check=True)
+        run_checked_command(cmd, stdin_input="1\n0\n")
         
         status = "Operation executed successfully."
     except Exception as exc:
@@ -1093,7 +1156,7 @@ def on_fit_backbone(working_directory_path, run_input_file_name, input_traj_file
         print(f"Running command: {' '.join(cmd)}")
 
         # trjconv requires user input to select a group; we will provide "4" for "Backbone", then "0" for "System"
-        subprocess.run(cmd, input="4\n0\n", text=True, check=True)
+        run_checked_command(cmd, stdin_input="4\n0\n")
         
         status = "Operation executed successfully."
     except Exception as exc:
@@ -1171,11 +1234,22 @@ def protein_md_simulation_tab_content():
                 with gr.Row():
                     delete_file_button = gr.Button(value="Delete Selected File", interactive=False)
                     clean_working_directory_button = gr.Button(value="Clean Working Directory", interactive=False)
-                view_structure_button = gr.Button(value="View Structure", interactive=False)
-                structure_viewer_html = gr.HTML()
-                view_text_file_button = gr.Button(value="View Text File", interactive=False)
-                text_file_viewer_textarea = gr.TextArea(label="Text File Viewer", lines=20, elem_id="textfile_viewer", interactive=False)
-                save_text_file_button = gr.Button(value="Save Text File", interactive=False)
+                with gr.Accordion(label="Structure Viewer", open=False) as structure_viewer_accordion:
+                    view_structure_button = gr.Button(value="View Structure", interactive=False)
+                    structure_viewer_status_markdown = gr.Markdown()
+                    structure_viewer_html = gr.HTML()
+                with gr.Accordion(label="Trajectory Viewer", open=False):
+                    trajectory_viewer_structure_file_dropdown = gr.Dropdown(label="Structure File", choices=[], value=None)
+                    trajectory_viewer_trajectory_file_dropdown = gr.Dropdown(label="Trajectory File", choices=[], value=None)
+                    trajectory_viewer_selection_dropdown = gr.Dropdown(label="Selection", choices=list(TRAJECTORY_VIEWER_SELECTIONS), value="Protein + Ligand + Ions")
+                    trajectory_viewer_max_frames_slider = gr.Slider(label="Max Frames", minimum=10, maximum=1000, value=200, step=10)
+                    view_trajectory_button = gr.Button(value="View Trajectory")
+                    trajectory_viewer_status_markdown = gr.Markdown()
+                    trajectory_viewer_html = gr.HTML()
+                with gr.Accordion(label="Text File Viewer", open=False) as text_file_viewer_accordion:
+                    view_text_file_button = gr.Button(value="View Text File", interactive=False)
+                    text_file_viewer_textarea = gr.TextArea(label="Text File Viewer", lines=20, elem_id="textfile_viewer", interactive=False)
+                    save_text_file_button = gr.Button(value="Save Text File", interactive=False)
             with gr.Column(scale=2):
                 with gr.Row():
                     status_markdown = gr.Markdown()
@@ -1197,8 +1271,10 @@ def protein_md_simulation_tab_content():
                             topology_output_topology_file_name_textbox = gr.Textbox(label="Output Topology File Name", value="topology.top")
                         with gr.Column():
                             force_field_dropdown = gr.Dropdown(label="Force Field", choices=["AMBER94", "AMBER96", "AMBER99", "AMBER99SB", "AMBER99SB-ILDN", "AMBER03", "AMBERGS", "AMBER14SB", "AMBER19SB",
-                                                                                            "CHARMM27", "GROMOS43A1", "GROMOS43A2", "GROMOS45A3", "GROMOS53A5", "GROMOS53A6", "GROMOS54A7", ("OPLS-AA", "OPLSAA")], value="AMBER99SB-ILDN", allow_custom_value=True)
+                                                                                            "CHARMM27", "CHARMM36", "GROMOS43A1", "GROMOS43A2", "GROMOS45A3", "GROMOS53A5", "GROMOS53A6", "GROMOS54A7", ("OPLS-AA", "OPLSAA")], value="AMBER99SB-ILDN", allow_custom_value=True)
                             water_model_dropdown = gr.Dropdown(label="Water Model", choices=["SELECT", "NONE", "OPC", "OPC3", "SPC", "SPCE", "TIP3P", "TIP4P", ("TIP4P-Ew", "TIP4PEW"), "TIP5P", "TIPS3P"], value="TIP3P")
+                            n_terminus_dropdown = gr.Dropdown(label="N-Terminus", choices=N_TERMINUS_CHOICES, value=DEFAULT_TERMINUS_CHOICE, allow_custom_value=True)
+                            c_terminus_dropdown = gr.Dropdown(label="C-Terminus", choices=C_TERMINUS_CHOICES, value=DEFAULT_TERMINUS_CHOICE, allow_custom_value=True)
                             generate_topology_button = gr.Button(value="Generate Topology")
                 with gr.Accordion(label="Generate Simulation Box", open=False):
                     with gr.Row():
@@ -1478,13 +1554,15 @@ def protein_md_simulation_tab_content():
                                               npt_equilibration_input_file_name_dropdown, npt_equilibration_input_topology_file_name_dropdown, npt_equilibration_parameter_file_dropdown, npt_equilibration_run_input_file_dropdown,
                                               prod_md_input_file_name_dropdown, prod_md_input_topology_file_name_dropdown, prod_md_parameter_file_dropdown, prod_md_run_input_file_dropdown, checkpoint_file_dropdown,
                                               fix_traj_run_input_file_name_dropdown, make_mol_whole_input_traj_file_name_dropdown, center_protein_input_traj_file_name_dropdown, fit_backbone_input_traj_file_name_dropdown,
-                                              analysis_structure_file_name_dropdown, analysis_input_traj_file_name_dropdown])
+                                              analysis_structure_file_name_dropdown, analysis_input_traj_file_name_dropdown,
+                                              trajectory_viewer_structure_file_dropdown, trajectory_viewer_trajectory_file_dropdown])
     working_directory_file_dataframe.select(on_select_file, [], [selected_file_state, selected_structure_file_state, selected_text_file_state, delete_file_button])
-    selected_structure_file_state.change(on_selected_structure_file_state_change, selected_structure_file_state, view_structure_button)
-    selected_text_file_state.change(on_selected_text_file_state_change, selected_text_file_state, view_text_file_button)
+    selected_structure_file_state.change(on_selected_structure_file_state_change, selected_structure_file_state, [view_structure_button, structure_viewer_accordion])
+    selected_text_file_state.change(on_selected_text_file_state_change, selected_text_file_state, [view_text_file_button, text_file_viewer_accordion])
     delete_file_button.click(on_delete_file, [working_directory_path_state, selected_file_state], working_directory_file_list_state)
     clean_working_directory_button.click(on_clean_working_directory, working_directory_path_state, working_directory_file_list_state)
-    view_structure_button.click(on_view_protein_structure, [working_directory_path_state, selected_structure_file_state], structure_viewer_html)
+    view_structure_button.click(on_view_protein_structure, [working_directory_path_state, selected_structure_file_state], [structure_viewer_html, structure_viewer_status_markdown])
+    view_trajectory_button.click(on_view_trajectory, [working_directory_path_state, trajectory_viewer_structure_file_dropdown, trajectory_viewer_trajectory_file_dropdown, trajectory_viewer_selection_dropdown, trajectory_viewer_max_frames_slider], [trajectory_viewer_html, trajectory_viewer_status_markdown])
     view_text_file_button.click(on_view_text_file, [working_directory_path_state, selected_text_file_state], [text_file_viewer_textarea, save_text_file_button])
     save_text_file_button.click(on_save_text_file, [working_directory_path_state, selected_text_file_state, text_file_viewer_textarea], working_directory_file_list_state)
 
@@ -1492,7 +1570,7 @@ def protein_md_simulation_tab_content():
     protein_structure_file.upload(on_upload_protein_structure_file, [working_directory_path_state, protein_structure_file_name_textbox, protein_structure_file], [working_directory_file_list_state, status_markdown])
 
     # Generate protein topology interaction
-    generate_topology_button.click(on_generate_protein_topology, [working_directory_path_state, topology_input_file_name_dropdown, topology_output_file_name_textbox, topology_output_topology_file_name_textbox, force_field_dropdown, water_model_dropdown], [working_directory_file_list_state, status_markdown])
+    generate_topology_button.click(on_generate_protein_topology, [working_directory_path_state, topology_input_file_name_dropdown, topology_output_file_name_textbox, topology_output_topology_file_name_textbox, force_field_dropdown, water_model_dropdown, n_terminus_dropdown, c_terminus_dropdown], [working_directory_file_list_state, status_markdown])
     
     # Generate simulation box interaction
     generate_box_button.click(on_generate_simulation_box, [working_directory_path_state, box_input_file_name_dropdown, box_output_file_name_textbox, box_type_dropdown, distance_slider], [working_directory_file_list_state, status_markdown])
@@ -1501,32 +1579,32 @@ def protein_md_simulation_tab_content():
     solvate_button.click(on_solvate_protein, [working_directory_path_state, solvation_input_file_name_dropdown, solvation_output_file_name_textbox, solvation_input_topology_file_name_dropdown, solvation_output_topology_file_name_textbox, solvent_configuration_dropdown], [working_directory_file_list_state, status_markdown])
 
     # Generate ions interaction
-    generate_ions_parameter_file_button.click(on_generate_ions_mdp_file, [working_directory_path_state, generate_ions_parameter_file_name_textbox], [working_directory_file_list_state, status_markdown])
+    generate_ions_parameter_file_button.click(on_generate_ions_mdp_file, [working_directory_path_state, generate_ions_parameter_file_name_textbox, force_field_dropdown], [working_directory_file_list_state, status_markdown])
     generate_ions_run_input_file_button.click(on_generate_ions_tpr_file, [working_directory_path_state, generate_ions_input_file_name_dropdown, generate_ions_input_topology_file_name_dropdown, generate_ions_parameter_file_dropdown, generate_ions_run_input_file_name_textbox, max_warns_slider], [working_directory_file_list_state, status_markdown])
     add_ion_method_radio.change(on_add_ions_method_change, add_ion_method_radio, [concentration_slider, cation_charge_slider, anion_charge_slider, number_of_cations_slider, number_of_anions_slider])
     add_ions_button.click(on_add_ions, [working_directory_path_state, generate_ions_run_input_file_dropdown, generate_ions_output_file_name_textbox, generate_ions_input_topology_file_name_dropdown, generate_ions_output_topology_file_name_textbox, cation_name_textbox, anion_name_textbox, add_ion_method_radio, concentration_slider, cation_charge_slider, anion_charge_slider, number_of_cations_slider, number_of_anions_slider, netralize_checkbox], [working_directory_file_list_state, status_markdown])
     
     # Energy minimization interaction
-    energy_minimization_parameter_file_button.click(on_generate_energy_minimization_mdp_file, [working_directory_path_state, energy_minimization_parameter_file_name_textbox], [working_directory_file_list_state, status_markdown])
+    energy_minimization_parameter_file_button.click(on_generate_energy_minimization_mdp_file, [working_directory_path_state, energy_minimization_parameter_file_name_textbox, force_field_dropdown], [working_directory_file_list_state, status_markdown])
     energy_minimization_run_input_file_button.click(on_generate_energy_minimization_tpr_file, [working_directory_path_state, energy_minimization_input_file_name_dropdown, energy_minimization_input_topology_file_name_dropdown, energy_minimization_parameter_file_dropdown, energy_minimization_run_input_file_name_textbox, max_warns_slider], [working_directory_file_list_state, status_markdown])
-    run_energy_minimization_button.click(on_run_energy_minimization, [working_directory_path_state, energy_minimization_run_input_file_dropdown, mpi_rank_slider, omp_threads_slider], [working_directory_file_list_state, status_markdown])
+    run_energy_minimization_button.click(on_run_energy_minimization, [working_directory_path_state, energy_minimization_run_input_file_dropdown, mpi_rank_slider, omp_threads_slider, use_gpu], [working_directory_file_list_state, status_markdown])
 
     # NVT equilibration interaction
-    nvt_equilibration_parameter_file_button.click(on_generate_nvt_equilibration_mdp_file, [working_directory_path_state, nvt_time_scale_slider, nvt_time_step_slider, nvt_temperature_slider, nvt_equilibration_parameter_file_name_textbox], [working_directory_file_list_state, status_markdown])
+    nvt_equilibration_parameter_file_button.click(on_generate_nvt_equilibration_mdp_file, [working_directory_path_state, nvt_time_scale_slider, nvt_time_step_slider, nvt_temperature_slider, nvt_equilibration_parameter_file_name_textbox, force_field_dropdown], [working_directory_file_list_state, status_markdown])
     nvt_equilibration_run_input_file_button.click(on_generate_nvt_equilibration_tpr_file, [working_directory_path_state, nvt_equilibration_input_file_name_dropdown, nvt_equilibration_input_topology_file_name_dropdown, nvt_equilibration_parameter_file_dropdown, nvt_equilibration_run_input_file_name_textbox, max_warns_slider], [working_directory_file_list_state, status_markdown])
-    run_nvt_equilibration_button.click(on_run_nvt_equilibration, [working_directory_path_state, nvt_equilibration_run_input_file_dropdown, mpi_rank_slider, omp_threads_slider, nvt_process_state], [working_directory_file_list_state, status_markdown, nvt_process_state, run_nvt_equilibration_button])
+    run_nvt_equilibration_button.click(on_run_nvt_equilibration, [working_directory_path_state, nvt_equilibration_run_input_file_dropdown, mpi_rank_slider, omp_threads_slider, use_gpu, nvt_process_state], [working_directory_file_list_state, status_markdown, nvt_process_state, run_nvt_equilibration_button])
     nvt_equilibration_timer.tick(sync_button_state, nvt_process_state, run_nvt_equilibration_button)
 
     # NPT equilibration interaction
-    npt_equilibration_parameter_file_button.click(on_generate_npt_equilibration_mdp_file, [working_directory_path_state, npt_time_scale_slider, npt_time_step_slider, npt_temperature_slider, npt_pressure_slider, npt_equilibration_parameter_file_name_textbox], [working_directory_file_list_state, status_markdown])
+    npt_equilibration_parameter_file_button.click(on_generate_npt_equilibration_mdp_file, [working_directory_path_state, npt_time_scale_slider, npt_time_step_slider, npt_temperature_slider, npt_pressure_slider, npt_equilibration_parameter_file_name_textbox, force_field_dropdown], [working_directory_file_list_state, status_markdown])
     npt_equilibration_run_input_file_button.click(on_generate_npt_equilibration_tpr_file, [working_directory_path_state, npt_equilibration_input_file_name_dropdown, npt_equilibration_input_topology_file_name_dropdown, npt_equilibration_parameter_file_dropdown, npt_equilibration_run_input_file_name_textbox, max_warns_slider], [working_directory_file_list_state, status_markdown])
-    run_npt_equilibration_button.click(on_run_npt_equilibration, [working_directory_path_state, npt_equilibration_run_input_file_dropdown, mpi_rank_slider, omp_threads_slider, npt_process_state], [working_directory_file_list_state, status_markdown, npt_process_state, run_npt_equilibration_button])
+    run_npt_equilibration_button.click(on_run_npt_equilibration, [working_directory_path_state, npt_equilibration_run_input_file_dropdown, mpi_rank_slider, omp_threads_slider, use_gpu, npt_process_state], [working_directory_file_list_state, status_markdown, npt_process_state, run_npt_equilibration_button])
     npt_equilibration_timer.tick(sync_button_state, npt_process_state, run_npt_equilibration_button)
 
     # Production MD interaction
     prod_md_mdp_type_radio.change(on_change_mdp_type, prod_md_mdp_type_radio, [prod_md_random_seed_textbox, prod_md_parameter_file_name_textbox])
     prod_md_nnpot_active_checkbox.change(on_toggle_nnpot, prod_md_nnpot_active_checkbox, status_markdown)
-    prod_md_parameter_file_button.click(on_generate_prod_md_mdp_file, [working_directory_path_state, prod_md_time_scale_slider, prod_md_time_step_slider, prod_md_temperature_slider, prod_md_pressure_slider, prod_md_mdp_type_radio, prod_md_random_seed_textbox, prod_md_parameter_file_name_textbox, prod_md_nnpot_active_checkbox, prod_md_nnpot_model_dropdown, prod_md_nnpot_input_group_textbox], [working_directory_file_list_state, status_markdown])
+    prod_md_parameter_file_button.click(on_generate_prod_md_mdp_file, [working_directory_path_state, prod_md_time_scale_slider, prod_md_time_step_slider, prod_md_temperature_slider, prod_md_pressure_slider, prod_md_mdp_type_radio, prod_md_random_seed_textbox, prod_md_parameter_file_name_textbox, prod_md_nnpot_active_checkbox, prod_md_nnpot_model_dropdown, prod_md_nnpot_input_group_textbox, force_field_dropdown], [working_directory_file_list_state, status_markdown])
     prod_md_run_input_file_button.click(on_generate_prod_md_tpr_file, [working_directory_path_state, prod_md_input_file_name_dropdown, prod_md_input_topology_file_name_dropdown, prod_md_parameter_file_dropdown, prod_md_run_input_file_name_textbox, max_warns_slider], [working_directory_file_list_state, status_markdown])
     run_prod_md_button.click(on_run_prod_md, [working_directory_path_state, prod_md_run_input_file_dropdown, mpi_rank_slider, omp_threads_slider, prod_md_nnpot_active_checkbox, use_gpu, prod_md_initial_process_state], [working_directory_file_list_state, status_markdown, prod_md_initial_process_state, run_prod_md_button])
     prod_md_initial_timer.tick(sync_button_state, prod_md_initial_process_state, run_prod_md_button)
