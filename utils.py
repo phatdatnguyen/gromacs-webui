@@ -3,6 +3,7 @@ handling, topology merging and structure/trajectory viewer support."""
 
 from __future__ import annotations
 
+import importlib.util
 import math
 import os
 import re
@@ -13,15 +14,12 @@ from typing import Any, TypedDict
 
 import MDAnalysis as mda
 import nglview
-import torch
-from nnpot_models import (
-    GmxAIMNet2Model,
-    GmxANI1xModel,
-    GmxANI2xEMLEModel,
-    GmxANI2xModel,
-    GmxMACEModel,
-)
-from e3nn.util.jit import script
+
+# Machine learning potentials are optional. torch, e3nn and the model packages are
+# large, so they are neither imported nor required at start-up: availability is
+# checked by looking for the modules, and they are imported only when a model is
+# actually built. Everything else in the application works without them.
+NNPOT_REQUIRED_PACKAGES: tuple[str, ...] = ("torch", "e3nn")
 
 
 class IonSpecies(TypedDict):
@@ -69,6 +67,35 @@ class TrajectoryViewerInfo(TypedDict):
     n_residues: int
     species: StructureSpecies
 
+
+
+def get_missing_nnpot_packages() -> list[str]:
+    """Which machine learning potential packages are absent from this environment."""
+    missing = []
+    for name in NNPOT_REQUIRED_PACKAGES:
+        try:
+            if importlib.util.find_spec(name) is None:
+                missing.append(name)
+        except Exception:
+            # A broken or shadowed installation is as good as a missing one here.
+            missing.append(name)
+
+    return missing
+
+
+def get_nnpot_unavailable_reason() -> str | None:
+    """A message naming what to install, or None when potentials can be used."""
+    missing = get_missing_nnpot_packages()
+    if not missing:
+        return None
+
+    return (f"Machine learning potentials are disabled: {', '.join(missing)} "
+            f"not installed. See the Readme for the optional install steps.")
+
+
+def is_nnpot_available() -> bool:
+    """Whether the optional machine learning potential support can be used."""
+    return not get_missing_nnpot_packages()
 
 
 def get_torchani_install_error_message(exc: Exception) -> str | None:
@@ -144,6 +171,8 @@ def get_expected_nnpot_model_config(model_name: str) -> str:
 
 def is_cached_nnpot_model_usable(model_name: str, modelfile_path: str) -> bool:
     """Report whether the cached model matches this build, moving it aside if not."""
+    import torch
+
     extra_files = {"nnpot_model_config": ""}
     try:
         torch.jit.load(modelfile_path, map_location="cpu", _extra_files=extra_files)
@@ -166,6 +195,8 @@ def is_cached_nnpot_model_usable(model_name: str, modelfile_path: str) -> bool:
 
 def checkExtensions() -> dict[str, str]:
     """Collect loaded Torch extension libraries to embed alongside a saved model."""
+    import torch
+
     ext_lib = []
     for lib in torch.ops.loaded_libraries:
         if lib:
@@ -179,6 +210,8 @@ def checkExtensions() -> dict[str, str]:
 
 def trace_aimnet2_model(model: torch.nn.Module) -> torch.jit.ScriptModule:
     """Trace AIMNet2 with representative inputs, since it cannot be scripted."""
+    import torch
+
     model.eval()
     try:
         device = next(model.parameters()).device
@@ -201,6 +234,20 @@ def trace_aimnet2_model(model: torch.nn.Module) -> torch.jit.ScriptModule:
 
 def download_nnpot_model(model_name: str) -> str:
     """Build or reuse the wrapped neural-network potential and return its file path."""
+    reason = get_nnpot_unavailable_reason()
+    if reason is not None:
+        raise RuntimeError(reason)
+
+    import torch
+    from e3nn.util.jit import script
+    from nnpot_models import (
+        GmxAIMNet2Model,
+        GmxANI1xModel,
+        GmxANI2xEMLEModel,
+        GmxANI2xModel,
+        GmxMACEModel,
+    )
+
     os.makedirs("./models", exist_ok=True)
     os.environ.setdefault("WARP_CACHE_PATH", os.path.abspath("./models/warp-cache"))
     os.environ.setdefault("AIMNET_CACHE_DIR", os.path.abspath("./models/aimnet-cache"))
