@@ -360,8 +360,8 @@ def stop_process_gracefully(proc: subprocess.Popen[str] | None, timeout: float =
         proc.wait()
 
 def get_gpu_mdrun_options(use_gpu: bool, mpi_rank: int) -> list[str]:
-    """mdrun GPU offload flags that are safe for minimisation and restrained
-    equilibration: nonbonded and PME carry almost all of the cost, while
+    """mdrun GPU offload flags that are safe for restrained equilibration:
+    nonbonded and PME carry almost all of the cost, while
     -bonded gpu and -update gpu are refused outright when position restraints
     are present, and GPU PME needs a single rank."""
     if not use_gpu:

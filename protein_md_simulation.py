@@ -772,7 +772,7 @@ def on_run_energy_minimization(working_directory_path: str, run_input_file_name:
             "-ntmpi", str(mpi_rank),
             "-ntomp", str(omp_threads),
             "-v"
-        ] + get_gpu_mdrun_options(use_gpu, mpi_rank)
+        ]
 
         run_checked_command(cmd)
         status = "Energy minimization completed successfully."
