@@ -7,7 +7,11 @@ that wrapper on the real signatures.
 from __future__ import annotations
 
 import os
+import shutil
+import tempfile
+import textwrap
 import unittest
+import unittest.mock
 
 import MDAnalysis as mda
 import pandas as pd
@@ -16,6 +20,12 @@ import protein_ligand_complex_md_simulation as complex_workflow
 import protein_md_simulation as workflow
 import utils
 from .testing_support import WorkingDirectoryTestCase, write_structure_pdb, write_trajectory
+
+UNK_LIGAND_PDB = textwrap.dedent("""\
+    HETATM    1  C1  UNK A 901      12.345  23.456  34.567  1.00  0.00           C
+    HETATM    2  O1  UNK A 901      13.345  24.456  35.567  1.00  0.00           O
+    END
+    """)
 
 
 class WorkingDirectoryCallbackTests(WorkingDirectoryTestCase):
@@ -55,6 +65,24 @@ class WorkingDirectoryCallbackTests(WorkingDirectoryTestCase):
     def test_missing_directory_lists_nothing(self):
         self.assertEqual(workflow.get_files_in_working_directory("data/_unittest_absent"), [])
         self.assertEqual(workflow.get_files_in_working_directory(None), [])
+
+    def test_file_listing_is_sorted_by_name(self):
+        """Every file dropdown is filtered out of this list, so its order is the UI's."""
+        for name in ("zulu.gro", "alpha.top", "Bravo.mdp", "charlie.tpr"):
+            with open(self.path(name), "w") as handle:
+                handle.write("x")
+
+        for module in (workflow, complex_workflow):
+            with self.subTest(module=module.__name__):
+                files = module.get_files_in_working_directory(self.working_directory_path)
+                self.assertEqual(files, ["alpha.top", "Bravo.mdp", "charlie.tpr", "zulu.gro"])
+
+    def test_working_directories_are_sorted_by_name(self):
+        for module in (workflow, complex_workflow):
+            with self.subTest(module=module.__name__):
+                directories = module.get_working_directories()
+                self.assertEqual(directories, sorted(directories, key=str.lower))
+                self.assertIn(self.working_directory_name, directories)
 
 
 class FileActionTests(WorkingDirectoryTestCase):
@@ -243,6 +271,71 @@ class FileListChangeTests(WorkingDirectoryTestCase):
             returned = handler.fn(self.working_directory_path, *self.arguments(required - 1))
             self.assertIsInstance(returned, tuple)
             self.assertEqual(len(returned), len(handler.outputs))
+
+
+class LigandUploadTests(WorkingDirectoryTestCase):
+    """The analysis selects the ligand as "resname LIG", so the upload enforces it."""
+
+    def upload(self, content, name="ligand.pdb"):
+        source = os.path.join(tempfile.mkdtemp(), name)
+        self.addCleanup(shutil.rmtree, os.path.dirname(source), ignore_errors=True)
+        with open(source, "w") as handle:
+            handle.write(content)
+        return complex_workflow.on_upload_ligand_structure_file(
+            self.working_directory_path, name, source)
+
+    def test_an_unk_ligand_is_stored_as_lig(self):
+        files, status = self.upload(UNK_LIGAND_PDB)
+
+        self.assertIn("ligand.pdb", files)
+        with open(self.path("ligand.pdb")) as handle:
+            stored = handle.read()
+        self.assertNotIn("UNK", stored)
+        self.assertIn("LIG", stored)
+
+        plain = self.plain_text(status)
+        self.assertIn("uploaded successfully", plain)
+        self.assertIn("UNK", plain)                    # the rename is reported, not silent
+
+        universe = mda.Universe(self.path("ligand.pdb"))
+        self.assertEqual(universe.select_atoms("resname LIG").n_atoms, 2)
+
+    def test_a_ligand_already_named_lig_uploads_unchanged(self):
+        content = UNK_LIGAND_PDB.replace("UNK", "LIG")
+        files, status = self.upload(content)
+
+        self.assertIn("ligand.pdb", files)
+        with open(self.path("ligand.pdb")) as handle:
+            self.assertEqual(handle.read(), content)
+        self.assertNotIn("renamed", self.plain_text(status))
+
+    def test_a_protein_upload_keeps_its_own_residue_names(self):
+        source = write_structure_pdb(os.path.join(tempfile.mkdtemp(), "protein.pdb"))
+        self.addCleanup(shutil.rmtree, os.path.dirname(source), ignore_errors=True)
+
+        complex_workflow.on_upload_protein_structure_file(
+            self.working_directory_path, "protein.pdb", source)
+
+        with open(self.path("protein.pdb")) as handle:
+            self.assertIn("GLY", handle.read())
+
+
+class EnergyMinimizationHardwareTests(WorkingDirectoryTestCase):
+    """GROMACS has no GPU PME for the minimisers, so this step must stay on the CPU."""
+
+    def run_minimization(self, module, use_gpu):
+        with unittest.mock.patch.object(module, "run_checked_command") as run:
+            module.on_run_energy_minimization(self.working_directory_path, "em.tpr", 1, 4, use_gpu)
+        return run.call_args.args[0]
+
+    def test_the_command_never_asks_for_a_gpu(self):
+        for module in (workflow, complex_workflow):
+            for use_gpu in (True, False):
+                with self.subTest(module=module.__name__, use_gpu=use_gpu):
+                    cmd = self.run_minimization(module, use_gpu)
+                    self.assertNotIn("gpu", cmd)
+                    for task in ("-nb", "-pme", "-bonded"):
+                        self.assertEqual(cmd[cmd.index(task) + 1], "cpu")
 
 
 if __name__ == "__main__":

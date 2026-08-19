@@ -141,6 +141,13 @@ class GpuOptionTests(unittest.TestCase):
             self.assertNotIn("-bonded", options)
             self.assertNotIn("-update", options)
 
+    def test_cpu_only_options_pin_every_task_to_the_cpu(self):
+        """mdrun offloads to a detected GPU unless each task is asked for by name."""
+        options = utils.get_cpu_only_mdrun_options()
+        for task in ("-nb", "-pme", "-bonded"):
+            self.assertEqual(options[options.index(task) + 1], "cpu")
+        self.assertNotIn("gpu", options)
+
 
 class ProcessStateTests(unittest.TestCase):
     def test_starts_idle_with_a_lock(self):

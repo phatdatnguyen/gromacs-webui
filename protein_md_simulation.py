@@ -24,17 +24,20 @@ from path_security import DATA_ROOT, secure_module_callbacks, validate_file_name
 
 
 def get_working_directories() -> list[str]:
-    """Names of the job directories that already exist under ./data."""
+    """Names of the job directories that already exist under ./data, sorted by name."""
     base_path = "./data/"
     os.makedirs(base_path, exist_ok=True)
-    return [d for d in os.listdir(base_path) if os.path.isdir(os.path.join(base_path, d))]
+    return sorted((d for d in os.listdir(base_path) if os.path.isdir(os.path.join(base_path, d))), key=str.lower)
 
 def get_files_in_working_directory(working_directory_path: str | None) -> list[str]:
-    """Visible files in a job directory, hiding GROMACS backups and Zone.Identifier files."""
+    """Visible files in a job directory, hiding GROMACS backups and Zone.Identifier files.
+
+    Sorted by name: os.listdir() order is arbitrary, and every file dropdown in
+    the UI is filtered straight out of this list."""
     if working_directory_path is None or not os.path.isdir(working_directory_path):
         return []
     files = [f for f in os.listdir(working_directory_path) if not (f.startswith('#') or f.endswith("Zone.Identifier") or os.path.isdir(os.path.join(working_directory_path, f)))]
-    return files
+    return sorted(files, key=str.lower)
 
 def get_default_cpu_count() -> int:
     """Physical core count, used as the upper bound of the MPI rank slider."""
@@ -762,7 +765,10 @@ def on_generate_energy_minimization_tpr_file(working_directory_path: str, input_
 
 def on_run_energy_minimization(working_directory_path: str, run_input_file_name: str, mpi_rank: int,
                                omp_threads: int, use_gpu: bool) -> tuple[list[str], str]:
-    """Run mdrun for energy minimisation and wait for it to finish."""
+    """Run mdrun for energy minimisation and wait for it to finish.
+
+    use_gpu is deliberately ignored: GROMACS cannot run PME on the GPU during
+    energy minimisation, so this step always stays on the CPU."""
     try:
         base_name = os.path.splitext(run_input_file_name)[0]
 
@@ -772,7 +778,7 @@ def on_run_energy_minimization(working_directory_path: str, run_input_file_name:
             "-ntmpi", str(mpi_rank),
             "-ntomp", str(omp_threads),
             "-v"
-        ]
+        ] + get_cpu_only_mdrun_options()
 
         run_checked_command(cmd)
         status = "Energy minimization completed successfully."

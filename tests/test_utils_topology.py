@@ -127,6 +127,70 @@ class MergeTopologyTests(unittest.TestCase):
         self.assertEqual(len(re_findall_ligand(molecules)), 1)
 
 
+LIGAND_PDB = textwrap.dedent("""\
+    REMARK   1 an uploaded ligand
+    HETATM    1  C1  UNK A 901      12.345  23.456  34.567  1.00  0.00           C
+    HETATM    2  O1  UNK A 901      13.345  24.456  35.567  1.00  0.00           O
+    TER       3      UNK A 901
+    END
+    """)
+
+
+class RenamePdbResiduesTests(unittest.TestCase):
+    def setUp(self):
+        self.directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.directory.cleanup)
+
+    def write(self, name, content):
+        path = os.path.join(self.directory.name, name)
+        with open(path, "w") as handle:
+            handle.write(content)
+        return path
+
+    def read(self, path):
+        with open(path) as handle:
+            return handle.read()
+
+    def test_reports_and_replaces_the_old_residue_name(self):
+        path = self.write("ligand.pdb", LIGAND_PDB)
+
+        self.assertEqual(utils.rename_pdb_residues(path), ["UNK"])
+
+        rewritten = self.read(path)
+        self.assertNotIn("UNK", rewritten)
+        self.assertEqual(rewritten.count("LIG"), 3)   # both atoms and the TER record
+
+    def test_the_residue_name_stays_in_columns_18_to_20(self):
+        """MDAnalysis reads the name by column, so a shifted record would break it."""
+        path = self.write("ligand.pdb", LIGAND_PDB)
+        utils.rename_pdb_residues(path)
+
+        for line in self.read(path).splitlines():
+            if line.startswith("HETATM"):
+                self.assertEqual(line[17:20], "LIG")
+                self.assertEqual(len(line), len(LIGAND_PDB.splitlines()[1]))
+
+    def test_coordinates_and_other_records_are_untouched(self):
+        path = self.write("ligand.pdb", LIGAND_PDB)
+        utils.rename_pdb_residues(path)
+
+        rewritten = self.read(path)
+        self.assertIn("12.345  23.456  34.567", rewritten)
+        self.assertIn("REMARK   1 an uploaded ligand", rewritten)
+        self.assertTrue(rewritten.endswith("END\n"))
+
+    def test_a_file_already_named_lig_is_left_alone(self):
+        path = self.write("ligand.pdb", LIGAND_PDB.replace("UNK", "LIG"))
+        before = os.stat(path).st_mtime_ns
+
+        self.assertEqual(utils.rename_pdb_residues(path), [])
+        self.assertEqual(os.stat(path).st_mtime_ns, before)
+
+    def test_several_distinct_names_are_all_reported_once(self):
+        path = self.write("ligand.pdb", LIGAND_PDB.replace("O1  UNK", "O1  MOL"))
+        self.assertEqual(utils.rename_pdb_residues(path), ["UNK", "MOL"])
+
+
 def re_findall_ligand(text: str) -> list[str]:
     import re
     return re.findall(r"^ligand\s+\d+", text, flags=re.MULTILINE)

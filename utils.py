@@ -373,6 +373,14 @@ def get_gpu_mdrun_options(use_gpu: bool, mpi_rank: int) -> list[str]:
 
     return options
 
+def get_cpu_only_mdrun_options() -> list[str]:
+    """mdrun flags that pin a run to the CPU, whatever hardware is present.
+
+    Energy minimisation needs them: GROMACS has no GPU PME implementation for
+    the minimisers, and mdrun offloads to a detected GPU by default, so leaving
+    the choice on "auto" makes minimisation fail on a GPU machine."""
+    return ["-nb", "cpu", "-pme", "cpu", "-bonded", "cpu"]
+
 class ProcessStateDict(dict):
     """dict subclass for gr.State that creates a fresh lock on deep copy."""
     def __init__(self) -> None:
@@ -681,6 +689,52 @@ nnpot-model-input3    = box
 nnpot-model-input4    = pbc"""
 
     return content
+
+LIGAND_RESNAME: str = "LIG"
+
+# Columns 18-20 of a PDB ATOM/HETATM/TER record, 1-based and inclusive.
+_PDB_RESNAME_SLICE = slice(17, 20)
+
+def rename_pdb_residues(pdb_file_path: str, resname: str = LIGAND_RESNAME) -> list[str]:
+    """Rewrite every residue name in a PDB file in place, returning the old names.
+
+    An uploaded ligand often calls its molecule UNK, MOL or a PDB chemical
+    component id. Trajectory analysis selects the ligand as "resname LIG", so
+    anything else silently analyses an empty selection; normalising the name at
+    upload keeps the rest of the workflow able to find the ligand. Returns the
+    replaced names in the order met, empty when the file already used `resname`.
+    """
+    with open(pdb_file_path) as handle:
+        lines = handle.readlines()
+
+    replaced: list[str] = []
+    rewritten: list[str] = []
+    for line in lines:
+        if not line.startswith(("ATOM  ", "HETATM", "TER")):
+            rewritten.append(line)
+            continue
+
+        body = line.rstrip("\r\n")
+        newline = line[len(body):]
+        current = body[_PDB_RESNAME_SLICE].strip()
+        if not current:
+            # A bare "TER" carries no residue name; leave it that way.
+            rewritten.append(line)
+            continue
+
+        if current != resname and current not in replaced:
+            replaced.append(current)
+
+        rewritten.append(body[:_PDB_RESNAME_SLICE.start] + resname.rjust(3)
+                         + body[_PDB_RESNAME_SLICE.stop:] + newline)
+
+    if not replaced:
+        return []
+
+    with open(pdb_file_path, "w") as handle:
+        handle.writelines(rewritten)
+
+    return replaced
 
 def read_gromacs_structure_file(filename: str) -> tuple[str, int, list[str], str]:
     """Split a GRO file into its title, atom count, atom lines and box line."""
