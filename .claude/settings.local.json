@@ -25,7 +25,8 @@
       "WebFetch(domain:arxiv.org)",
       "WebFetch(domain:github.com)",
       "Bash(wsl.exe -d Ubuntu-24.04 -- bash -lc 'cd /tmp && rm -rf gmx-nnpot-tools && git clone --depth 1 https://github.com/lmuellender/gmx-nnpot-tools 2>&1 | tail -3 && echo \"=== FILES ===\" && find gmx-nnpot-tools -name \"*.py\" -o -name \"*.ipynb\" | head -40')",
-      "Bash(wsl.exe *)"
+      "Bash(wsl.exe *)",
+      "Bash(grep -rn \\\\\\\\\\\\\"cwd='\\\\\\\\.'\\\\\\\\\\\\\" *.py)"
     ]
   }
 }

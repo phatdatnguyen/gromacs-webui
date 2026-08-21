@@ -912,15 +912,19 @@ def on_run_energy_minimization(working_directory_path: str, run_input_file_name:
     try:
         base_name = os.path.splitext(run_input_file_name)[0]
 
+        # Every mdrun runs from the job directory with plain file names. -deffnm
+        # would place its own outputs correctly either way, but the PDBs mdrun
+        # dumps when constraints fail (step<n>b.pdb / step<n>c.pdb) have hardcoded
+        # names and no flag to redirect them, so they follow the working directory.
         cmd = [
             "gmx", "mdrun",
-            "-deffnm", os.path.join(working_directory_path, base_name),
+            "-deffnm", base_name,
             "-ntmpi", str(mpi_rank),
             "-ntomp", str(omp_threads),
             "-v"
         ] + get_cpu_only_mdrun_options()
 
-        run_checked_command(cmd)
+        run_checked_command(cmd, cwd=working_directory_path)
         status = "Energy minimization completed successfully."
     except Exception as exc:
         status = "Error during energy minimization!\n" + str(exc)
@@ -1018,15 +1022,15 @@ def on_run_nvt_equilibration(working_directory_path: str, run_input_file_name: s
 
         cmd = [
             "gmx", "mdrun",
-            "-deffnm", os.path.join(working_directory_path, base_name),
+            "-deffnm", base_name,
             "-ntmpi", str(mpi_rank),
             "-ntomp", str(omp_threads),
             "-v"
-        ] + get_gpu_mdrun_options(use_gpu, mpi_rank)
+        ] + get_mdrun_hardware_options(use_gpu, mpi_rank)
 
         print(f"Running command: {' '.join(cmd)}")
 
-        proc = subprocess.Popen(cmd, cwd='.', text=True)
+        proc = subprocess.Popen(cmd, cwd=working_directory_path, text=True)
 
         with process_state["lock"]:
             process_state["proc"] = proc
@@ -1120,15 +1124,15 @@ def on_run_npt_equilibration(working_directory_path: str, run_input_file_name: s
 
         cmd = [
             "gmx", "mdrun",
-            "-deffnm", os.path.join(working_directory_path, base_name),
+            "-deffnm", base_name,
             "-ntmpi", str(mpi_rank),
             "-ntomp", str(omp_threads),
             "-v"
-        ] + get_gpu_mdrun_options(use_gpu, mpi_rank)
+        ] + get_mdrun_hardware_options(use_gpu, mpi_rank)
 
         print(f"Running command: {' '.join(cmd)}")
 
-        proc = subprocess.Popen(cmd, cwd='.', text=True)
+        proc = subprocess.Popen(cmd, cwd=working_directory_path, text=True)
 
         with process_state["lock"]:
             process_state["proc"] = proc
@@ -1254,7 +1258,7 @@ def on_run_prod_md(working_directory_path: str, run_input_file_name: str, mpi_ra
 
         cmd = [
             "gmx", "mdrun",
-            "-deffnm", os.path.join(working_directory_path, base_name),
+            "-deffnm", base_name,
             "-ntmpi", str(mpi_rank),
             "-ntomp", str(omp_threads),
             "-v"
@@ -1268,10 +1272,14 @@ def on_run_prod_md(working_directory_path: str, run_input_file_name: str, mpi_ra
                 "-pin", "on",
                 "-dlb", "yes"
             ])
+        elif not use_gpu:
+            # Not merely "do not ask for the GPU": every task defaults to auto,
+            # which picks a detected GPU, so the CPU has to be named.
+            cmd.extend(get_cpu_only_mdrun_options())
 
         print(f"Running command: {' '.join(cmd)}")
 
-        proc = subprocess.Popen(cmd, cwd='.', text=True)
+        proc = subprocess.Popen(cmd, cwd=working_directory_path, text=True)
 
         with process_state["lock"]:
             process_state["proc"] = proc
@@ -1324,8 +1332,8 @@ def on_continue_prod_md(working_directory_path: str, run_input_file_name: str, c
 
         cmd = [
             "gmx", "mdrun",
-            "-deffnm", os.path.join(working_directory_path, base_name),
-            "-cpi", os.path.join(working_directory_path, checkpoint_file_name),
+            "-deffnm", base_name,
+            "-cpi", checkpoint_file_name,
             "-ntmpi", str(mpi_rank),
             "-ntomp", str(omp_threads),
             "-append",
@@ -1340,10 +1348,14 @@ def on_continue_prod_md(working_directory_path: str, run_input_file_name: str, c
                 "-pin", "on",
                 "-dlb", "yes"
             ])
+        elif not use_gpu:
+            # Not merely "do not ask for the GPU": every task defaults to auto,
+            # which picks a detected GPU, so the CPU has to be named.
+            cmd.extend(get_cpu_only_mdrun_options())
 
         print(f"Running command: {' '.join(cmd)}")
 
-        proc = subprocess.Popen(cmd, cwd='.', text=True)
+        proc = subprocess.Popen(cmd, cwd=working_directory_path, text=True)
 
         with process_state["lock"]:
             process_state["proc"] = proc

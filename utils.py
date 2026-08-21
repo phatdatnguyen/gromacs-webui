@@ -251,7 +251,9 @@ def download_nnpot_model(model_name: str) -> str:
     os.makedirs("./models", exist_ok=True)
     os.environ.setdefault("WARP_CACHE_PATH", os.path.abspath("./models/warp-cache"))
     os.environ.setdefault("AIMNET_CACHE_DIR", os.path.abspath("./models/aimnet-cache"))
-    modelfile_path = os.path.join("./models", f"{model_name}.pt")
+    # Absolute: this path is written into the MDP as nnpot-modelfile and resolved
+    # by mdrun, which runs from the job directory rather than the repository root.
+    modelfile_path = os.path.abspath(os.path.join("./models", f"{model_name}.pt"))
     is_ani_model = model_name in ["ani1x", "ani2x"]
     is_emle_model = model_name == "ani2x-emle"
     
@@ -359,13 +361,18 @@ def stop_process_gracefully(proc: subprocess.Popen[str] | None, timeout: float =
         # and the child lingers as a zombie.
         proc.wait()
 
-def get_gpu_mdrun_options(use_gpu: bool, mpi_rank: int) -> list[str]:
-    """mdrun GPU offload flags that are safe for restrained equilibration:
-    nonbonded and PME carry almost all of the cost, while
-    -bonded gpu and -update gpu are refused outright when position restraints
-    are present, and GPU PME needs a single rank."""
+def get_mdrun_hardware_options(use_gpu: bool, mpi_rank: int) -> list[str]:
+    """Task assignment for a restrained equilibration run.
+
+    With the GPU asked for, offload nonbonded and PME: they carry almost all of
+    the cost, while -bonded gpu and -update gpu are refused outright when
+    position restraints are present, and GPU PME needs a single rank.
+
+    Without it, name the CPU for every task rather than passing nothing. Each
+    -nb/-pme/-bonded option defaults to "auto", which resolves to a detected
+    GPU, so on a CUDA-enabled build silence still lands the run on the GPU."""
     if not use_gpu:
-        return []
+        return get_cpu_only_mdrun_options()
 
     options = ["-nb", "gpu"]
     if int(mpi_rank) == 1:

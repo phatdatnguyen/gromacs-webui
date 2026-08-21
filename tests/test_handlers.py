@@ -338,5 +338,128 @@ class EnergyMinimizationHardwareTests(WorkingDirectoryTestCase):
                         self.assertEqual(cmd[cmd.index(task) + 1], "cpu")
 
 
+class GpuCheckboxTests(WorkingDirectoryTestCase):
+    """Unticking "Use GPU" has to reach the CPU, not just stop asking for the GPU."""
+
+    RUN_HANDLERS = ("on_run_nvt_equilibration", "on_run_npt_equilibration",
+                    "on_run_prod_md", "on_continue_prod_md")
+
+    def launch(self, module, handler_name, use_gpu, nnpot=False):
+        import inspect
+        handler = getattr(module, handler_name)
+        arguments = {}
+        for name, parameter in inspect.signature(handler).parameters.items():
+            if name == "working_directory_path":
+                arguments[name] = self.working_directory_path
+            elif name.endswith("process_state"):
+                arguments[name] = utils.ProcessStateDict()
+            elif name == "run_input_file_name":
+                arguments[name] = "md.tpr"
+            elif name == "checkpoint_file_name":
+                arguments[name] = "md.cpt"
+            elif name == "use_gpu":
+                arguments[name] = use_gpu
+            elif name == "prod_md_nnpot_active":
+                arguments[name] = nnpot
+            elif parameter.annotation is bool:
+                arguments[name] = False
+            else:
+                arguments[name] = 1
+
+        with unittest.mock.patch.object(module, "subprocess") as fake_subprocess, \
+                unittest.mock.patch.object(module, "threading"):
+            handler(**arguments)
+            return fake_subprocess.Popen.call_args.args[0]
+
+    def assertTaskAssignment(self, cmd, task, hardware):
+        """Fail with the command rather than a ValueError when the option is absent."""
+        self.assertIn(task, cmd, f"{task} left on auto, which picks a detected GPU: {cmd}")
+        self.assertEqual(cmd[cmd.index(task) + 1], hardware, cmd)
+
+    def test_unticking_the_box_pins_every_run_to_the_cpu(self):
+        for module in (workflow, complex_workflow):
+            for handler_name in self.RUN_HANDLERS:
+                with self.subTest(module=module.__name__, handler=handler_name):
+                    cmd = self.launch(module, handler_name, use_gpu=False)
+                    self.assertNotIn("gpu", cmd)
+                    for task in ("-nb", "-pme", "-bonded"):
+                        self.assertTaskAssignment(cmd, task, "cpu")
+
+    def test_ticking_the_box_still_offloads(self):
+        for module in (workflow, complex_workflow):
+            for handler_name in self.RUN_HANDLERS:
+                with self.subTest(module=module.__name__, handler=handler_name):
+                    cmd = self.launch(module, handler_name, use_gpu=True)
+                    self.assertTaskAssignment(cmd, "-nb", "gpu")
+
+    def test_a_neural_network_run_is_left_on_auto_when_the_box_is_ticked(self):
+        """Its own offload set is unsafe here, but the model still wants the GPU."""
+        for module in (workflow, complex_workflow):
+            with self.subTest(module=module.__name__):
+                cmd = self.launch(module, "on_run_prod_md", use_gpu=True, nnpot=True)
+                self.assertNotIn("-nb", cmd)
+                self.assertNotIn("-pme", cmd)
+
+    def test_a_neural_network_run_still_honours_an_unticked_box(self):
+        for module in (workflow, complex_workflow):
+            with self.subTest(module=module.__name__):
+                cmd = self.launch(module, "on_run_prod_md", use_gpu=False, nnpot=True)
+                self.assertTaskAssignment(cmd, "-nb", "cpu")
+
+
+class MdrunWorkingDirectoryTests(WorkingDirectoryTestCase):
+    """mdrun dumps step<n>b.pdb / step<n>c.pdb into its own working directory.
+
+    Those names are hardcoded and no flag redirects them, so running from the
+    repository root scatters crash dumps beside the source files.
+    """
+
+    MDRUN_HANDLERS = ("on_run_energy_minimization", "on_run_nvt_equilibration",
+                      "on_run_npt_equilibration", "on_run_prod_md", "on_continue_prod_md")
+
+    def invoke(self, module, handler_name):
+        """Call one mdrun handler with placeholder arguments, capturing the launch."""
+        import inspect
+        handler = getattr(module, handler_name)
+        arguments = {}
+        for name, parameter in inspect.signature(handler).parameters.items():
+            if name == "working_directory_path":
+                arguments[name] = self.working_directory_path
+            elif name.endswith("process_state"):
+                arguments[name] = utils.ProcessStateDict()
+            elif name == "run_input_file_name":
+                arguments[name] = "md.tpr"
+            elif name == "checkpoint_file_name":
+                arguments[name] = "md.cpt"
+            elif parameter.annotation is bool:
+                arguments[name] = True
+            else:
+                arguments[name] = 1
+
+        with unittest.mock.patch.object(module, "subprocess") as fake_subprocess, \
+                unittest.mock.patch.object(module, "run_checked_command") as run, \
+                unittest.mock.patch.object(module, "threading"):
+            handler(**arguments)
+            if run.called:
+                return run.call_args.args[0], run.call_args.kwargs.get("cwd")
+            call = fake_subprocess.Popen.call_args
+            return call.args[0], call.kwargs.get("cwd")
+
+    def test_every_mdrun_launches_inside_the_job_directory(self):
+        for module in (workflow, complex_workflow):
+            for handler_name in self.MDRUN_HANDLERS:
+                with self.subTest(module=module.__name__, handler=handler_name):
+                    cmd, cwd = self.invoke(module, handler_name)
+
+                    self.assertEqual(cmd[:2], ["gmx", "mdrun"])
+                    # path_security resolves the callback's directory argument.
+                    self.assertEqual(cwd, os.path.abspath(self.working_directory_path))
+                    # Plain names only: a path here would be resolved against the
+                    # job directory a second time and miss.
+                    self.assertEqual(cmd[cmd.index("-deffnm") + 1], "md")
+                    if "-cpi" in cmd:
+                        self.assertEqual(cmd[cmd.index("-cpi") + 1], "md.cpt")
+
+
 if __name__ == "__main__":
     unittest.main()

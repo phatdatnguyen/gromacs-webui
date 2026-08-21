@@ -7,7 +7,9 @@ runs on a machine without GROMACS.
 from __future__ import annotations
 
 import os
+import time
 import unittest
+import unittest.mock
 
 import protein_md_simulation as workflow
 import utils
@@ -111,6 +113,215 @@ class RunInputTests(WorkingDirectoryTestCase):
         self.assertNotIn("returned non-zero exit status", text)
         self.assertIn("gmx grompp failed", text)
         self.assertIn(".top", text)
+
+
+@requires_gromacs
+class MinimisationRunTests(WorkingDirectoryTestCase):
+    """A real mdrun, checked for where it writes and what hardware it picks."""
+
+    def setUp(self):
+        super().setUp()
+        write_structure_pdb(self.path("protein.pdb"), n_residues=6)
+        _, status = workflow.on_generate_protein_topology(
+            self.working_directory_path, "protein.pdb", "protein.gro", "topology.top",
+            "AMBER99SB-ILDN", "TIP3P", utils.DEFAULT_TERMINUS_CHOICE, utils.DEFAULT_TERMINUS_CHOICE)
+        self.assertIn("successfully", self.plain_text(status), "topology setup failed")
+        _, status = workflow.on_generate_simulation_box(
+            self.working_directory_path, "protein.gro", "boxed.gro", "cubic", 1.0)
+        self.assertIn("successfully", self.plain_text(status), "box setup failed")
+        workflow.on_generate_energy_minimization_mdp_file(self.working_directory_path, "em.mdp",
+                                                          "AMBER99SB-ILDN")
+        _, status = workflow.on_generate_energy_minimization_tpr_file(
+            self.working_directory_path, "boxed.gro", "topology.top", "em.mdp", "em.tpr", 5)
+        self.assertIn("successfully", self.plain_text(status), "run input setup failed")
+
+    def minimise(self, use_gpu=True):
+        files, status = workflow.on_run_energy_minimization(
+            self.working_directory_path, "em.tpr", 1, 1, use_gpu)
+        self.assertIn("completed successfully", self.plain_text(status), self.plain_text(status))
+        return files
+
+    def test_minimisation_completes_and_writes_into_the_job_directory(self):
+        """-deffnm is a plain name, so mdrun resolves it against its own directory."""
+        files = self.minimise()
+        for name in ("em.gro", "em.log", "em.edr"):
+            self.assertIn(name, files)
+
+    def test_mdrun_leaves_nothing_in_the_repository_root(self):
+        """mdrun's constraint dumps use hardcoded names relative to its directory."""
+        before = set(os.listdir("."))
+        self.minimise()
+        self.assertEqual(set(os.listdir(".")) - before, set())
+
+    def test_minimisation_stays_off_the_gpu_even_when_the_box_is_ticked(self):
+        """GROMACS has no GPU PME for the minimisers.
+
+        Omitting the offload flags is not enough: mdrun defaults every task to
+        "auto" and picks a detected GPU, so the CPU has to be asked for by name.
+        Passes trivially on a machine with no GPU, which is the honest outcome.
+        """
+        self.minimise(use_gpu=True)
+
+        with open(self.path("em.log")) as handle:
+            log = handle.read()
+        if "compatible GPU" not in log:
+            self.skipTest("no GPU on this machine, so there is nothing to offload to")
+        for claim in ("GPU selected for this run", "aspects on the GPU",
+                      "GPU 8x4 nonbonded", "nonbonded interactions on the GPU"):
+            self.assertNotIn(claim, log, f"mdrun used the GPU for minimisation: {claim!r}")
+
+
+class AsyncRunMixin:
+    """Start one of the backgrounded mdrun handlers and wait it out safely."""
+
+    @staticmethod
+    def stop(state):
+        """Shut the run down, so a slow or wedged mdrun is never left behind."""
+        with state["lock"]:
+            proc = state["proc"]
+            state["proc"] = None
+            state["running"] = False
+        utils.stop_process_gracefully(proc)
+
+    def start_and_wait(self, handler, *arguments, timeout=60):
+        """Call handler(dir, *arguments, state) and block until the watcher clears it."""
+        state = utils.ProcessStateDict()
+        handler(self.working_directory_path, *arguments, state)
+        # Registered before the wait: an mdrun still running at the deadline has to
+        # be killed, or it outlives the suite burning a core on a deleted directory.
+        self.addCleanup(self.stop, state)
+
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            with state["lock"]:
+                if not state["running"]:
+                    return
+            time.sleep(0.2)
+        self.fail(f"mdrun did not exit within {timeout}s")
+
+
+@requires_gromacs
+class EquilibrationHardwareTests(AsyncRunMixin, WorkingDirectoryTestCase):
+    """What the "Use GPU" checkbox actually does to a real run.
+
+    Every mdrun task option defaults to "auto", which resolves to a detected
+    GPU, so a build with CUDA support ignores an unticked box unless the CPU is
+    named explicitly. Only the log says which way it went.
+    """
+
+    def setUp(self):
+        super().setUp()
+        write_structure_pdb(self.path("protein.pdb"), n_residues=6)
+        workflow.on_generate_protein_topology(
+            self.working_directory_path, "protein.pdb", "protein.gro", "topology.top",
+            "AMBER99SB-ILDN", "TIP3P", utils.DEFAULT_TERMINUS_CHOICE, utils.DEFAULT_TERMINUS_CHOICE)
+        workflow.on_generate_simulation_box(
+            self.working_directory_path, "protein.gro", "boxed.gro", "cubic", 1.0)
+        workflow.on_generate_nvt_equilibration_mdp_file(
+            self.working_directory_path, 0.02, 0.002, 300, "nvt.mdp", "AMBER99SB-ILDN")
+        _, status = workflow.on_generate_nvt_equilibration_tpr_file(
+            self.working_directory_path, "boxed.gro", "topology.top", "nvt.mdp", "nvt.tpr", 5)
+        self.assertIn("successfully", self.plain_text(status), "run input setup failed")
+
+    def equilibrate(self, use_gpu):
+        self.start_and_wait(workflow.on_run_nvt_equilibration, "nvt.tpr", 1, 1, use_gpu)
+        with open(self.path("nvt.log")) as handle:
+            log = handle.read()
+        if "compatible GPU" not in log:
+            self.skipTest("no GPU on this machine, so the checkbox cannot change anything")
+        return log
+
+    def test_unticking_the_box_keeps_the_run_off_the_gpu(self):
+        log = self.equilibrate(use_gpu=False)
+        for claim in ("GPU selected for this run", "aspects on the GPU",
+                      "GPU 8x4 nonbonded", "nonbonded interactions on the GPU"):
+            self.assertNotIn(claim, log, f"mdrun used the GPU with the box unticked: {claim!r}")
+
+    def test_ticking_the_box_does_reach_the_gpu(self):
+        """The other half: the pinning must not have disabled the GPU outright."""
+        log = self.equilibrate(use_gpu=True)
+        self.assertIn("GPU selected for this run", log)
+
+
+@requires_gromacs
+class ConstraintDumpTests(AsyncRunMixin, WorkingDirectoryTestCase):
+    """The crash dumps that used to pile up in the repository root.
+
+    When LINCS cannot satisfy a constraint, mdrun writes step<n>b.pdb and
+    step<n>c.pdb. Those names are hardcoded and no flag redirects them, so they
+    land wherever mdrun was started from. Generating velocities at an absurd
+    temperature makes constrained bonds rotate past lincs-warnangle immediately,
+    which is the cheapest way to reach that code path on purpose.
+    """
+
+    @staticmethod
+    def dumps_in(directory):
+        return sorted(name for name in os.listdir(directory)
+                      if name.startswith("step") and name.endswith(".pdb"))
+
+    @staticmethod
+    def clean_repository_root():
+        """Remove stray dumps, including the backups GROMACS makes before it
+        overwrites one of its own: those are named #step0b.pdb.1# and so escape
+        both the dumps_in() pattern and the *.pdb entry in .gitignore."""
+        for name in os.listdir("."):
+            if name.lstrip("#").startswith("step") and ".pdb" in name:
+                os.remove(name)
+
+    def setUp(self):
+        super().setUp()
+        # A regression here writes into the repository root, so clean up after the
+        # run whatever the outcome: a failing test must not litter the checkout.
+        self.addCleanup(self.clean_repository_root)
+        write_structure_pdb(self.path("protein.pdb"), n_residues=6)
+        workflow.on_generate_protein_topology(
+            self.working_directory_path, "protein.pdb", "protein.gro", "topology.top",
+            "AMBER99SB-ILDN", "TIP3P", utils.DEFAULT_TERMINUS_CHOICE, utils.DEFAULT_TERMINUS_CHOICE)
+        workflow.on_generate_simulation_box(
+            self.working_directory_path, "protein.gro", "boxed.gro", "cubic", 1.0)
+        # Ten steps only. The dumps appear in the first few, and an exploded system
+        # grows a huge pair list that makes every later step crawl.
+        workflow.on_generate_nvt_equilibration_mdp_file(
+            self.working_directory_path, 0.02, 0.002, 100000, "hot.mdp", "AMBER99SB-ILDN")
+        _, status = workflow.on_generate_nvt_equilibration_tpr_file(
+            self.working_directory_path, "boxed.gro", "topology.top", "hot.mdp", "hot.tpr", 50)
+        self.assertIn("successfully", self.plain_text(status), "run input setup failed")
+
+    def run_until_it_fails(self):
+        """Start the doomed run and wait for the watcher thread to clear the state."""
+        # On a GPU machine the explosion surfaces as a CUDA fault before LINCS
+        # ever reports, so keep this one run on the CPU.
+        with unittest.mock.patch.dict(os.environ, {"GMX_DISABLE_GPU_DETECTION": "1"}):
+            self.start_and_wait(workflow.on_run_nvt_equilibration, "hot.tpr", 1, 1, False)
+
+    def test_the_dumps_land_in_the_job_directory_not_the_repository_root(self):
+        root_before = set(os.listdir("."))
+        self.run_until_it_fails()
+
+        # Checked before the skip below: dumps in the root are the bug itself, and
+        # skipping on "no dumps in the job directory" would hide exactly that.
+        self.assertEqual(sorted(set(os.listdir(".")) - root_before), [],
+                         "mdrun scattered crash dumps into the repository root")
+
+        dumps = self.dumps_in(self.working_directory_path)
+        if not dumps:
+            self.skipTest("this GROMACS build did not dump coordinates for the failed constraint")
+        # b is the state going in, c the state after constraining; both are written.
+        self.assertTrue(any(name.endswith("b.pdb") for name in dumps), dumps)
+        self.assertTrue(any(name.endswith("c.pdb") for name in dumps), dumps)
+        with open(os.path.join(self.working_directory_path, dumps[0])) as handle:
+            self.assertIn("coordinates", handle.readline())
+
+    def test_the_dumps_are_listed_for_the_user(self):
+        """They are diagnostics for a failed run, so they belong in the file table."""
+        self.run_until_it_fails()
+        self.assertEqual(self.dumps_in("."), [], "dumps landed in the repository root")
+
+        files = workflow.get_files_in_working_directory(self.working_directory_path)
+        dumps = [name for name in files if name.startswith("step") and name.endswith(".pdb")]
+        if not dumps:
+            self.skipTest("this GROMACS build did not dump coordinates for the failed constraint")
+        self.assertEqual(dumps, sorted(dumps, key=str.lower))
 
 
 @requires_gromacs

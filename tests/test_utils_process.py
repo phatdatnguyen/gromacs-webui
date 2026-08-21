@@ -125,19 +125,24 @@ class StopProcessGracefullyTests(unittest.TestCase):
 
 
 class GpuOptionTests(unittest.TestCase):
-    def test_no_flags_when_gpu_is_off(self):
-        self.assertEqual(utils.get_gpu_mdrun_options(False, 1), [])
+    def test_gpu_off_names_the_cpu_rather_than_staying_silent(self):
+        """Passing nothing leaves every task on "auto", which picks a found GPU."""
+        for ranks in (1, 2, 8):
+            options = utils.get_mdrun_hardware_options(False, ranks)
+            self.assertNotIn("gpu", options)
+            for task in ("-nb", "-pme", "-bonded"):
+                self.assertEqual(options[options.index(task) + 1], "cpu")
 
     def test_single_rank_offloads_nonbonded_and_pme(self):
-        self.assertEqual(utils.get_gpu_mdrun_options(True, 1), ["-nb", "gpu", "-pme", "gpu"])
+        self.assertEqual(utils.get_mdrun_hardware_options(True, 1), ["-nb", "gpu", "-pme", "gpu"])
 
     def test_multiple_ranks_keep_pme_on_the_cpu(self):
         """GPU PME is not implemented for more than one PME rank."""
-        self.assertEqual(utils.get_gpu_mdrun_options(True, 4), ["-nb", "gpu"])
+        self.assertEqual(utils.get_mdrun_hardware_options(True, 4), ["-nb", "gpu"])
 
     def test_never_offloads_tasks_that_clash_with_position_restraints(self):
         for ranks in (1, 2, 8):
-            options = utils.get_gpu_mdrun_options(True, ranks)
+            options = utils.get_mdrun_hardware_options(True, ranks)
             self.assertNotIn("-bonded", options)
             self.assertNotIn("-update", options)
 

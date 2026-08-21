@@ -568,7 +568,7 @@ def on_generate_simulation_box(working_directory_path: str, input_file_name: str
 
         print(f"Running command: {' '.join(cmd)}")
 
-        run_checked_command(cmd)
+        run_checked_command(cmd, cwd=working_directory_path)
         status = "Simulation box generated successfully."
     except Exception as exc:
         status = "Error generating simulation box!\n" + str(exc)
@@ -593,7 +593,7 @@ def on_solvate_protein(working_directory_path: str, input_file_name: str, output
 
         print(f"Running command: {' '.join(cmd)}")
 
-        run_checked_command(cmd)
+        run_checked_command(cmd, cwd=working_directory_path)
         status = "Protein solvated successfully."
     except Exception as exc:
         status = "Error solvating protein!\n" + str(exc)
@@ -634,7 +634,7 @@ def on_generate_ions_tpr_file(working_directory_path: str, input_file_name: str,
 
         print(f"Running command: {' '.join(cmd)}")
 
-        run_checked_command(cmd)
+        run_checked_command(cmd, cwd=working_directory_path)
         status = "Ion addition run input file generated successfully."
     except Exception as exc:
         status = "Error generating ion addition run input file!\n" + str(exc)
@@ -755,7 +755,7 @@ def on_generate_energy_minimization_tpr_file(working_directory_path: str, input_
 
         print(f"Running command: {' '.join(cmd)}")
 
-        run_checked_command(cmd)
+        run_checked_command(cmd, cwd=working_directory_path)
         status = "Energy minimization run input file generated successfully."
     except Exception as exc:
         status = "Error generating energy minimization run input file!\n" + str(exc)
@@ -772,15 +772,19 @@ def on_run_energy_minimization(working_directory_path: str, run_input_file_name:
     try:
         base_name = os.path.splitext(run_input_file_name)[0]
 
+        # Every mdrun runs from the job directory with plain file names. -deffnm
+        # would place its own outputs correctly either way, but the PDBs mdrun
+        # dumps when constraints fail (step<n>b.pdb / step<n>c.pdb) have hardcoded
+        # names and no flag to redirect them, so they follow the working directory.
         cmd = [
             "gmx", "mdrun",
-            "-deffnm", os.path.join(working_directory_path, base_name),
+            "-deffnm", base_name,
             "-ntmpi", str(mpi_rank),
             "-ntomp", str(omp_threads),
             "-v"
         ] + get_cpu_only_mdrun_options()
 
-        run_checked_command(cmd)
+        run_checked_command(cmd, cwd=working_directory_path)
         status = "Energy minimization completed successfully."
     except Exception as exc:
         status = "Error during energy minimization!\n" + str(exc)
@@ -823,7 +827,7 @@ def on_generate_nvt_equilibration_tpr_file(working_directory_path: str, input_fi
 
         print(f"Running command: {' '.join(cmd)}")
 
-        run_checked_command(cmd)
+        run_checked_command(cmd, cwd=working_directory_path)
         status = "NVT equilibration run input file generated successfully."
     except Exception as exc:
         status = "Error generating NVT equilibration run input file!\n" + str(exc)
@@ -876,15 +880,15 @@ def on_run_nvt_equilibration(working_directory_path: str, run_input_file_name: s
 
         cmd = [
             "gmx", "mdrun",
-            "-deffnm", os.path.join(working_directory_path, base_name),
+            "-deffnm", base_name,
             "-ntmpi", str(mpi_rank),
             "-ntomp", str(omp_threads),
             "-v"
-        ] + get_gpu_mdrun_options(use_gpu, mpi_rank)
+        ] + get_mdrun_hardware_options(use_gpu, mpi_rank)
 
         print(f"Running command: {' '.join(cmd)}")
 
-        proc = subprocess.Popen(cmd, cwd='.', text=True)
+        proc = subprocess.Popen(cmd, cwd=working_directory_path, text=True)
 
         with process_state["lock"]:
             process_state["proc"] = proc
@@ -944,7 +948,7 @@ def on_generate_npt_equilibration_tpr_file(working_directory_path: str, input_fi
         
         print(f"Running command: {' '.join(cmd)}")
 
-        run_checked_command(cmd)
+        run_checked_command(cmd, cwd=working_directory_path)
         status = "NPT equilibration run input file generated successfully."
     except Exception as exc:
         status = "Error generating NPT equilibration run input file!\n" + str(exc)
@@ -978,15 +982,15 @@ def on_run_npt_equilibration(working_directory_path: str, run_input_file_name: s
 
         cmd = [
             "gmx", "mdrun",
-            "-deffnm", os.path.join(working_directory_path, base_name),
+            "-deffnm", base_name,
             "-ntmpi", str(mpi_rank),
             "-ntomp", str(omp_threads),
             "-v"
-        ] + get_gpu_mdrun_options(use_gpu, mpi_rank)
+        ] + get_mdrun_hardware_options(use_gpu, mpi_rank)
 
         print(f"Running command: {' '.join(cmd)}")
 
-        proc = subprocess.Popen(cmd, cwd='.', text=True)
+        proc = subprocess.Popen(cmd, cwd=working_directory_path, text=True)
 
         with process_state["lock"]:
             process_state["proc"] = proc
@@ -1076,7 +1080,7 @@ def on_generate_prod_md_tpr_file(working_directory_path: str, input_file_name: s
 
         print(f"Running command: {' '.join(cmd)}")
 
-        run_checked_command(cmd)
+        run_checked_command(cmd, cwd=working_directory_path)
         status = "Production MD run input file generated successfully."
     except Exception as exc:
         status = "Error generating production MD run input file!\n" + str(exc)
@@ -1112,7 +1116,7 @@ def on_run_prod_md(working_directory_path: str, run_input_file_name: str, mpi_ra
 
         cmd = [
             "gmx", "mdrun",
-            "-deffnm", os.path.join(working_directory_path, base_name),
+            "-deffnm", base_name,
             "-ntmpi", str(mpi_rank),
             "-ntomp", str(omp_threads),
             "-v"
@@ -1126,10 +1130,14 @@ def on_run_prod_md(working_directory_path: str, run_input_file_name: str, mpi_ra
                 "-pin", "on",
                 "-dlb", "yes"
             ])
+        elif not use_gpu:
+            # Not merely "do not ask for the GPU": every task defaults to auto,
+            # which picks a detected GPU, so the CPU has to be named.
+            cmd.extend(get_cpu_only_mdrun_options())
 
         print(f"Running command: {' '.join(cmd)}")
 
-        proc = subprocess.Popen(cmd, cwd='.', text=True)
+        proc = subprocess.Popen(cmd, cwd=working_directory_path, text=True)
 
         with process_state["lock"]:
             process_state["proc"] = proc
@@ -1182,8 +1190,8 @@ def on_continue_prod_md(working_directory_path: str, run_input_file_name: str, c
 
         cmd = [
             "gmx", "mdrun",
-            "-deffnm", os.path.join(working_directory_path, base_name),
-            "-cpi", os.path.join(working_directory_path, checkpoint_file_name),
+            "-deffnm", base_name,
+            "-cpi", checkpoint_file_name,
             "-ntmpi", str(mpi_rank),
             "-ntomp", str(omp_threads),
             "-append",
@@ -1198,10 +1206,14 @@ def on_continue_prod_md(working_directory_path: str, run_input_file_name: str, c
                 "-pin", "on",
                 "-dlb", "yes"
             ])
+        elif not use_gpu:
+            # Not merely "do not ask for the GPU": every task defaults to auto,
+            # which picks a detected GPU, so the CPU has to be named.
+            cmd.extend(get_cpu_only_mdrun_options())
 
         print(f"Running command: {' '.join(cmd)}")
 
-        proc = subprocess.Popen(cmd, cwd='.', text=True)
+        proc = subprocess.Popen(cmd, cwd=working_directory_path, text=True)
 
         with process_state["lock"]:
             process_state["proc"] = proc
