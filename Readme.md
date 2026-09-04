@@ -1,5 +1,13 @@
 ## Introduction
-This web UI is for running molecular dynamics simulation with [Gromacs](https://www.gromacs.org/):
+This web UI is for running molecular dynamics simulation with [Gromacs](https://www.gromacs.org/).
+
+![webui1](./images/webui1.png)
+![webui2](./images/webui2.gif)
+![webui3](./images/webui3.png)
+![webui4](./images/webui4.png)
+![webui5](./images/webui5.png)
+![webui6](./images/webui6.png)
+![webui7](./images/webui7.png)
 
 ## Installation  (Linux only)
 - Install [Anaconda](https://www.anaconda.com/download)
