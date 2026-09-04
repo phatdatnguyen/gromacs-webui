@@ -1,5 +1,6 @@
 flagged/
 gromacs-env/
+gmx-mmpbsa-env/
 models/
 data/
 static/
@@ -25,5 +26,9 @@ __pycache__/
 *.xtc
 *.npz
 *.txt
+*.xvg
+*.ndx
+*.dat
+*.xpm
 
 CLAUDE.md

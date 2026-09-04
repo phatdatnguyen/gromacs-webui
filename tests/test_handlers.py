@@ -258,6 +258,76 @@ class FileListChangeTests(WorkingDirectoryTestCase):
         # the box input follows pdb2gmx's output structure
         self.assertEqual(result[2]["value"], "protein.gro")
 
+    def test_the_results_dropdown_offers_the_dat_files_in_the_job(self):
+        """gmx_MMPBSA writes its report as .dat, and a job can hold several."""
+        for name in ("FINAL_RESULTS_MMPBSA.dat", "older_run.dat", "notes.txt"):
+            with open(self.path(name), "w") as handle:
+                handle.write("x")
+
+        import inspect
+        parameters = inspect.signature(complex_workflow.on_file_list_change).parameters
+        values = {name: "unused.txt" for name in parameters}
+        values["working_directory_path"] = self.working_directory_path
+
+        results = complex_workflow.on_file_list_change(**values)[-1]
+        self.assertEqual(sorted(results["choices"]), ["FINAL_RESULTS_MMPBSA.dat", "older_run.dat"])
+        # The name gmx_MMPBSA writes wins when it is there.
+        self.assertEqual(results["value"], "FINAL_RESULTS_MMPBSA.dat")
+
+    def test_every_dropdown_is_offered_files_of_its_own_kind(self):
+        """Order, not just count.
+
+        The return tuple and the .change() outputs list are matched positionally,
+        so inserting an update in the wrong place silently feeds every later
+        dropdown its neighbour's files. The count test cannot see that: the
+        lengths still agree. This checks each component against what its label
+        says it wants.
+        """
+        import gradio as gr
+        import webui
+
+        expected = {
+            "Structure File Name": (".pdb", ".gro"),
+            "Input Topology File Name": (".top", ".itp"),
+            "Parameter File Name": (".mdp",),
+            "Run Input File Name": (".tpr",),
+            "Run Input File Name (.tpr)": (".tpr",),
+            "Checkpoint File Name": (".cpt",),
+            "Input Trajectory File Name": (".xtc", ".trr"),
+            "Protein Topology File Name": (".top", ".itp"),
+            "Ligand Topology File Name": (".top", ".itp"),
+            "Results File Name": (".dat",),
+        }
+        for name in ("protein.pdb", "protein.gro", "topol.top", "ligand.itp", "em.mdp",
+                     "md.tpr", "md.cpt", "md.xtc", "md.trr", "FINAL_RESULTS_MMPBSA.dat"):
+            with open(self.path(name), "w") as handle:
+                handle.write("x")
+
+        handlers = (webui.blocks.fns.values() if hasattr(webui.blocks.fns, "values")
+                    else webui.blocks.fns)
+        checked = 0
+        for handler in handlers:
+            if getattr(handler.fn, "__name__", "") != "on_file_list_change":
+                continue
+            import inspect
+            required = len(inspect.signature(handler.fn).parameters)
+            returned = handler.fn(self.working_directory_path, *self.arguments(required - 1))
+
+            for component, update in zip(handler.outputs, returned):
+                if not isinstance(component, gr.Dropdown):
+                    continue
+                suffixes = expected.get(component.label)
+                if suffixes is None:
+                    continue
+                for choice in update["choices"]:
+                    name = choice[1] if isinstance(choice, (list, tuple)) else choice
+                    with self.subTest(label=component.label, choice=name):
+                        self.assertTrue(name.endswith(suffixes),
+                                        f"{component.label!r} was offered {name!r}")
+                    checked += 1
+
+        self.assertGreater(checked, 40, "expected to check many dropdown choices")
+
     def test_return_count_matches_the_wired_outputs(self):
         """A mismatch here breaks every file refresh at runtime."""
         import webui
@@ -276,13 +346,13 @@ class FileListChangeTests(WorkingDirectoryTestCase):
 class LigandUploadTests(WorkingDirectoryTestCase):
     """The analysis selects the ligand as "resname LIG", so the upload enforces it."""
 
-    def upload(self, content, name="ligand.pdb"):
+    def upload(self, content, name="ligand.pdb", residue_name="LIG"):
         source = os.path.join(tempfile.mkdtemp(), name)
         self.addCleanup(shutil.rmtree, os.path.dirname(source), ignore_errors=True)
         with open(source, "w") as handle:
             handle.write(content)
         return complex_workflow.on_upload_ligand_structure_file(
-            self.working_directory_path, name, source)
+            self.working_directory_path, name, residue_name, source)
 
     def test_an_unk_ligand_is_stored_as_lig(self):
         files, status = self.upload(UNK_LIGAND_PDB)
@@ -308,6 +378,44 @@ class LigandUploadTests(WorkingDirectoryTestCase):
         with open(self.path("ligand.pdb")) as handle:
             self.assertEqual(handle.read(), content)
         self.assertNotIn("renamed", self.plain_text(status))
+
+    def test_a_ligand_with_an_empty_residue_field_is_named_lig(self):
+        """The regression that made data/3BAJ_5a unanalysable.
+
+        Real ligand PDBs come with columns 18-20 blank. Those records were being
+        skipped by the guard that leaves a bare "TER" alone, so the file reached
+        acpype unnamed, came back as UNK, and "resname LIG" then matched nothing.
+        """
+        blank = UNK_LIGAND_PDB.replace("UNK", "   ")
+        files, status = self.upload(blank)
+
+        with open(self.path("ligand.pdb")) as handle:
+            stored = handle.read()
+        universe = mda.Universe(self.path("ligand.pdb"))
+        self.assertEqual(universe.select_atoms("resname LIG").n_atoms, 2)
+        self.assertIn("(blank)", self.plain_text(status))
+        self.assertNotIn("HETATM    1  C1     ", stored)
+
+    def test_the_named_residue_is_the_one_renamed(self):
+        """A file holding more than the ligand: only the named residue moves."""
+        mixed = (UNK_LIGAND_PDB.replace("END\n", "")
+                 + "HETATM    3  O   HOH A 902      20.000  20.000  20.000  1.00  0.00           O\n"
+                 + "END\n")
+        files, status = self.upload(mixed, residue_name="UNK")
+
+        universe = mda.Universe(self.path("ligand.pdb"))
+        self.assertEqual(universe.select_atoms("resname LIG").n_atoms, 2)
+        self.assertEqual(universe.select_atoms("resname HOH").n_atoms, 1)
+        self.assertIn("UNK", self.plain_text(status))
+
+    def test_a_name_absent_from_the_file_falls_back_to_renaming_everything(self):
+        """An uploaded ligand file is the ligand, so the default still works when
+        the residue is called something the user did not type."""
+        files, status = self.upload(UNK_LIGAND_PDB.replace("UNK", "5A "), residue_name="LIG")
+
+        universe = mda.Universe(self.path("ligand.pdb"))
+        self.assertEqual(universe.select_atoms("resname LIG").n_atoms, 2)
+        self.assertIn("5A", self.plain_text(status))
 
     def test_a_protein_upload_keeps_its_own_residue_names(self):
         source = write_structure_pdb(os.path.join(tempfile.mkdtemp(), "protein.pdb"))

@@ -7,12 +7,14 @@ neither GROMACS nor any file from ./data.
 
 from __future__ import annotations
 
+import inspect
 import os
 import shutil
 import tempfile
 import unittest
 
 import MDAnalysis as mda
+import numpy
 
 # The application resolves ./data and ./static relative to the process working
 # directory, which must therefore be the repository root, one level up from here.
@@ -78,15 +80,44 @@ def write_structure_pdb(path: str, n_residues: int = 3, ions: dict[str, int] | N
 
 
 def write_trajectory(structure_path: str, trajectory_path: str, n_frames: int = 5,
-                     step: float = 1.0) -> str:
-    """Write an XTC whose every frame differs, so frame handling is observable."""
+                     step: float = 1.0, noise: float = 0.0, seed: int = 0) -> str:
+    """Write an XTC whose every frame differs, so frame handling is observable.
+
+    The default motion is a rigid translation, which is enough to tell frames
+    apart. ``noise`` adds an independent per-atom displacement on top, which is
+    what anything measuring *internal* motion needs: the covariance matrix of a
+    pure translation is singular, so PCA on it has nothing to decompose.
+    """
     universe = mda.Universe(structure_path)
+    generator = numpy.random.default_rng(seed)
+    start = universe.atoms.positions.copy()
     with mda.Writer(trajectory_path, universe.atoms.n_atoms) as writer:
         for frame in range(n_frames):
-            universe.atoms.positions = universe.atoms.positions + step
+            positions = start + step * (frame + 1)
+            if noise:
+                positions = positions + generator.normal(0.0, noise, positions.shape)
+            universe.atoms.positions = positions
             writer.write(universe.atoms)
     universe.trajectory.close()
     return trajectory_path
+
+
+def streamed(outputs) -> list:
+    """Every value a handler produced, whether it streams or returns once.
+
+    The gmx-backed analyses are generators so the command being run reaches the
+    status markdown before it blocks. Tests care about the last value, but the
+    intermediate ones are what the user sees while waiting, so both are kept.
+    """
+    if inspect.isgenerator(outputs):
+        return list(outputs)
+
+    return [outputs]
+
+
+def final_result(outputs):
+    """The value a handler ends with, draining it first if it streams."""
+    return streamed(outputs)[-1]
 
 
 def frames_of(structure_path: str, trajectory_path: str) -> list:

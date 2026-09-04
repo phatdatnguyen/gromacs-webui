@@ -102,8 +102,10 @@ def on_file_list_change(working_directory_path: str, protein_structure_file_name
             file_type = "Trajectory File"
         elif f.endswith('.cpt'):
             file_type = "Checkpoint File"
-        elif f.endswith('.csv'):
+        elif f.endswith('.csv') or f.endswith('.xvg'):
             file_type = "Data File"
+        elif f.endswith('.ndx'):
+            file_type = "Index File"
         else:
             file_type = "Other File"
         modified_time = time.ctime(os.path.getmtime(file_path))
@@ -340,7 +342,8 @@ def on_file_list_change(working_directory_path: str, protein_structure_file_name
         gr.update(choices=structure_files, value=analysis_structure_file_name_value), \
         gr.update(choices=trajectory_files, value=analysis_input_traj_file_name_value), \
         gr.update(choices=structure_files, value=analysis_structure_file_name_value), \
-        gr.update(choices=viewer_trajectory_files, value=analysis_input_traj_file_name_value)
+        gr.update(choices=viewer_trajectory_files, value=analysis_input_traj_file_name_value), \
+        gr.update(choices=run_input_files, value=fix_traj_run_input_file_name_value)
 
 def on_select_file(evt: gr.SelectData) -> tuple[Any, ...]:
     """Route the clicked file row to the structure or text viewer state."""
@@ -673,12 +676,11 @@ def _find_sol_group(genion_cmd: Sequence[str], working_directory_path: str) -> s
             except OSError:
                 pass
 
-    for line in stderr_probe.splitlines():
-        m = re.search(r'Group\s+(\d+)\s+\(\s*SOL\s*\)', line)
-        if m:
-            return m.group(1)
+    sol_group = find_gmx_group_number(stderr_probe, "SOL")
+    if sol_group is None:
+        raise Exception(f"Could not find SOL group in genion output:\n{stderr_probe}")
 
-    raise Exception(f"Could not find SOL group in genion output:\n{stderr_probe}")
+    return sol_group
 
 def on_add_ions(working_directory_path: str, run_input_file_name: str, output_file_name: str,
                 input_topology_file_name: str, output_topology_file_name: str, cation_name: str,
@@ -1311,55 +1313,299 @@ def on_fit_backbone(working_directory_path: str, run_input_file_name: str, input
         
     return get_files_in_working_directory(working_directory_path), "<span style='color:green;'>" + status + "</span>"
 
-def on_analyze_md_traj(working_directory_path: str, structure_file_name: str,
-                       input_traj_file_name: str) -> tuple[pd.DataFrame, plt.Figure,
-                                                           pd.DataFrame, plt.Figure]:
-    """Compute backbone RMSD and per-residue C-alpha RMSF for the trajectory."""
-    u = mda.Universe(os.path.join(working_directory_path, structure_file_name), os.path.join(working_directory_path, input_traj_file_name))
-    
-    # Calculate protein RMSD
-    protein_rmsd = rms.RMSD(
-        u,
-        select="protein and backbone",
-        groupselections=["protein"],
-        ref_frame=0
-    ).run()
+def on_analyze_rmsd(working_directory_path: str, structure_file_name: str,
+                    input_traj_file_name: str) -> tuple[Any, ...]:
+    """Backbone RMSD of the protein against the first frame."""
+    try:
+        universe = mda.Universe(os.path.join(working_directory_path, structure_file_name),
+                                os.path.join(working_directory_path, input_traj_file_name))
+        protein_rmsd = rms.RMSD(
+            universe,
+            select="protein and backbone",
+            groupselections=["protein"],
+            ref_frame=0
+        ).run()
 
-    time_ns = protein_rmsd.results.rmsd[:,1] / 1000
-    protein_rmsd_values = protein_rmsd.results.rmsd[:,2]
-    protein_rmsd_df = pd.DataFrame({"Time (ns)": time_ns, "Protein RMSD (Å)": protein_rmsd_values})
+        frame = pd.DataFrame({"Time (ns)": protein_rmsd.results.rmsd[:, 1] / 1000,
+                              "Protein RMSD (Å)": protein_rmsd.results.rmsd[:, 2]})
+        figure = make_line_figure(frame, "Time (ns)", ylabel="RMSD (Å)", title="RMSD vs Time")
+        status = "RMSD calculated successfully."
+    except Exception as exc:
+        status = "Error calculating RMSD!\n" + str(exc)
+        return None, None, "<span style='color:red;'>" + status + "</span>"
 
-    protein_rmsd_fig = plt.figure(figsize=(8, 6))
-    plt.plot(time_ns, protein_rmsd_values, label="Protein")
+    return frame, figure, "<span style='color:green;'>" + status + "</span>"
 
-    plt.xlabel("Time (ns)")
-    plt.ylabel("RMSD (Å)")
-    plt.legend()
-    plt.title("RMSD vs Time")
-    plt.tight_layout()
-    
-    # Calculate mean Cα RMSF
-    ca_selector = u.select_atoms("protein and name CA")
-    RMSF_ca = rms.RMSF(ca_selector).run()
-    ca_rmsf = RMSF_ca.results.rmsf
+def on_analyze_rmsf(working_directory_path: str, structure_file_name: str,
+                    input_traj_file_name: str) -> tuple[Any, ...]:
+    """Per-residue fluctuation of the C-alpha atoms over the whole trajectory."""
+    try:
+        universe = mda.Universe(os.path.join(working_directory_path, structure_file_name),
+                                os.path.join(working_directory_path, input_traj_file_name))
+        ca_selector = universe.select_atoms("protein and name CA")
+        if ca_selector.n_atoms == 0:
+            raise Exception("No C-alpha atoms found. Is this a protein structure?")
 
-    mean_ca_rmsf = ca_rmsf.mean()
-    cd_rmsf_df = pd.DataFrame({"Residue Index": ca_selector.resids, "Cα RMSF (Å)": ca_rmsf})
+        ca_rmsf = rms.RMSF(ca_selector).run().results.rmsf
 
-    ca_rmsf_fig = plt.figure(figsize=(8, 6))
-    plt.plot(ca_selector.residues.resids, ca_rmsf, label="Cα RMSF")
-    plt.axhline(mean_ca_rmsf, color="red", linestyle="--", label="Mean Cα RMSF")
+        frame = pd.DataFrame({"Residue Index": ca_selector.resids, "Cα RMSF (Å)": ca_rmsf})
+        figure = make_line_figure(frame, "Residue Index", ylabel="RMSF (Å)",
+                                  title="Cα RMSF per Residue", mean_line=True)
+        status = "RMSF calculated successfully."
+    except Exception as exc:
+        status = "Error calculating RMSF!\n" + str(exc)
+        return None, None, "<span style='color:red;'>" + status + "</span>"
 
-    plt.xlabel("Residue ID")
-    plt.ylabel("RMSF (Å)")
-    plt.title("Cα RMSF per Residue")
-    plt.legend()
-    plt.tight_layout()
+    return frame, figure, "<span style='color:green;'>" + status + "</span>"
 
-    return protein_rmsd_df, protein_rmsd_fig, cd_rmsf_df, ca_rmsf_fig
+def _selection_error(exc: Exception, run_input_file_name: str,
+                     working_directory_path: str) -> str:
+    """A gmx failure message, with the structure's own residue groups appended
+    when the cause was a selection that matched nothing."""
+    message = str(exc)
+    if "never matches any atoms" not in message and "Invalid selection" not in message:
+        return message
+
+    hint = describe_selection_candidates(run_input_file_name, working_directory_path)
+    return f"{message}\n\n{hint}" if hint else message
+
+def on_analyze_sasa(working_directory_path: str, run_input_file_name: str,
+                    input_traj_file_name: str, surface_selection: str, output_selection: str,
+                    probe_radius: float, sasa_file_name: str,
+                    sasa_residue_file_name: str) -> Any:
+    """Solvent accessible surface area over time, and averaged per residue.
+
+    A generator, so the command being run reaches the status markdown before it
+    blocks rather than only afterwards: gmx sasa over a long trajectory can take
+    minutes, and an unchanging page looks like nothing happened.
+
+    stdin is closed for every gmx analysis here. These tools fall back to an
+    interactive group prompt when a selection option is missing, and with a
+    blocking stdin that wedges the worker thread indefinitely (measured: no
+    -surface plus a live stdin hangs forever, stdin closed fails in a second).
+    """
+    cmd = [
+        "gmx", "sasa",
+        "-s", run_input_file_name,
+        "-f", input_traj_file_name,
+        "-o", sasa_file_name,
+        "-or", sasa_residue_file_name,
+        "-surface", surface_selection,
+        "-probe", str(probe_radius),
+        "-tu", "ns"
+    ]
+    if output_selection and output_selection.strip():
+        cmd.extend(["-output", output_selection])
+
+    print(f"Running command (in {working_directory_path}): {' '.join(cmd)}")
+    yield get_files_in_working_directory(working_directory_path), None, None, None, None, \
+        format_running_status(cmd)
+
+    try:
+        run_checked_command(cmd, cwd=working_directory_path, stdin_input="")
+
+        area = read_xvg(os.path.join(working_directory_path, sasa_file_name))
+        # The x column name comes from the file: -tu rewrites the axis label, so
+        # hardcoding "Time (ns)" would break the moment the unit changes.
+        area_figure = make_line_figure(area["frame"], ylabel=area["ylabel"],
+                                       title=area["title"] or "Solvent accessible surface area")
+
+        residue = read_xvg(os.path.join(working_directory_path, sasa_residue_file_name))
+        # gmx writes an average and a standard deviation per output group; plot the
+        # average of the surface group and leave the rest to the exported table.
+        residue_figure = make_line_figure(residue["frame"],
+                                          y_columns=[residue["frame"].columns[1]],
+                                          ylabel=residue["ylabel"],
+                                          title=residue["title"] or "Area per residue")
+
+        status = "SASA calculated successfully."
+    except Exception as exc:
+        status = "Error calculating SASA!\n" + _selection_error(
+            exc, run_input_file_name, working_directory_path)
+        yield get_files_in_working_directory(working_directory_path), None, None, None, None, \
+            "<span style='color:red;'>" + status + "</span>"
+        return
+
+    yield get_files_in_working_directory(working_directory_path), area["frame"], area_figure, \
+        residue["frame"], residue_figure, "<span style='color:green;'>" + status + "</span>"
+
+def on_analyze_gyrate(working_directory_path: str, run_input_file_name: str,
+                      input_traj_file_name: str, gyrate_selection: str, weighting_mode: str,
+                      gyrate_file_name: str) -> Any:
+    """Radius of gyration over time, total and about each axis."""
+    cmd = [
+        "gmx", "gyrate",
+        "-s", run_input_file_name,
+        "-f", input_traj_file_name,
+        "-o", gyrate_file_name,
+        "-sel", gyrate_selection,
+        "-mode", weighting_mode,
+        "-tu", "ns"
+    ]
+
+    print(f"Running command (in {working_directory_path}): {' '.join(cmd)}")
+    yield get_files_in_working_directory(working_directory_path), None, None, \
+        format_running_status(cmd)
+
+    try:
+        run_checked_command(cmd, cwd=working_directory_path, stdin_input="")
+
+        gyration = read_xvg(os.path.join(working_directory_path, gyrate_file_name))
+        figure = make_line_figure(gyration["frame"], ylabel=gyration["ylabel"],
+                                  title=gyration["title"] or "Radius of gyration")
+
+        status = "Radius of gyration calculated successfully."
+    except Exception as exc:
+        status = "Error calculating radius of gyration!\n" + _selection_error(
+            exc, run_input_file_name, working_directory_path)
+        yield get_files_in_working_directory(working_directory_path), None, None, \
+            "<span style='color:red;'>" + status + "</span>"
+        return
+
+    yield get_files_in_working_directory(working_directory_path), gyration["frame"], figure, \
+        "<span style='color:green;'>" + status + "</span>"
+
+def on_run_pca(working_directory_path: str, run_input_file_name: str, input_traj_file_name: str,
+               pca_selection: str, first_eigenvector: int, second_eigenvector: int,
+               pca_index_file_name: str, pca_eigenvector_file_name: str,
+               pca_eigenvalue_file_name: str,
+               pca_projection_file_name: str) -> Any:
+    """Principal component analysis of the trajectory, via gmx covar and anaeig.
+
+    A generator: three commands run back to back and covar is the slow one, so
+    each is announced in the status markdown before it blocks.
+
+    covar and anaeig are legacy tools that ask which group to fit and which to
+    analyse. Rather than answering with a group number - which shifts with the
+    force field and the contents of the system - a one-group index file is built
+    first with gmx select, which leaves them nothing to ask about. Using the same
+    index for both guarantees the fit and analysis groups match, which is what
+    PCA wants, and that anaeig sees the same atom count the eigenvectors were
+    built from.
+    """
+    files = get_files_in_working_directory(working_directory_path)
+    try:
+        select_cmd = [
+            "gmx", "select",
+            "-s", run_input_file_name,
+            "-select", pca_selection,
+            "-on", pca_index_file_name
+        ]
+        print(f"Running command (in {working_directory_path}): {' '.join(select_cmd)}")
+        yield files, None, None, None, None, format_running_status(select_cmd, "Step 1 of 3")
+        run_checked_command(select_cmd, cwd=working_directory_path, stdin_input="")
+
+        covar_cmd = [
+            "gmx", "covar",
+            "-s", run_input_file_name,
+            "-f", input_traj_file_name,
+            "-n", pca_index_file_name,
+            "-o", pca_eigenvalue_file_name,
+            "-v", pca_eigenvector_file_name,
+            "-av", "pca_average.pdb",
+            "-l", "pca_covar.log",
+            "-xvg", "xmgrace"
+        ]
+        print(f"Running command (in {working_directory_path}): {' '.join(covar_cmd)}")
+        yield files, None, None, None, None, format_running_status(covar_cmd, "Step 2 of 3")
+        run_checked_command(covar_cmd, cwd=working_directory_path, stdin_input="")
+
+        first = int(first_eigenvector)
+        second = int(second_eigenvector)
+        if second <= first:
+            raise Exception("The second eigenvector must be higher than the first.")
+
+        anaeig_cmd = [
+            "gmx", "anaeig",
+            "-s", run_input_file_name,
+            "-f", input_traj_file_name,
+            "-n", pca_index_file_name,
+            "-v", pca_eigenvector_file_name,
+            "-eig", pca_eigenvalue_file_name,
+            "-first", str(first),
+            "-last", str(second),
+            "-2d", pca_projection_file_name,
+            "-xvg", "xmgrace"
+        ]
+        print(f"Running command (in {working_directory_path}): {' '.join(anaeig_cmd)}")
+        yield files, None, None, None, None, format_running_status(anaeig_cmd, "Step 3 of 3")
+        run_checked_command(anaeig_cmd, cwd=working_directory_path, stdin_input="")
+
+        eigenvalues = read_xvg(os.path.join(working_directory_path, pca_eigenvalue_file_name))
+        eigenvalue_figure = make_scree_figure(eigenvalues["frame"],
+                                              title="Eigenvalues and cumulative variance")
+
+        projection = read_xvg(os.path.join(working_directory_path, pca_projection_file_name))
+        projection_figure = make_scatter_figure(
+            projection["frame"], xlabel=projection["xlabel"], ylabel=projection["ylabel"],
+            title=f"Projection on eigenvectors {first} and {second}")
+
+        status = "PCA completed successfully."
+    except Exception as exc:
+        status = "Error running PCA!\n" + _selection_error(
+            exc, run_input_file_name, working_directory_path)
+        yield get_files_in_working_directory(working_directory_path), None, None, None, None, \
+            "<span style='color:red;'>" + status + "</span>"
+        return
+
+    yield get_files_in_working_directory(working_directory_path), eigenvalues["frame"], \
+        eigenvalue_figure, projection["frame"], projection_figure, \
+        "<span style='color:green;'>" + status + "</span>"
+
+def on_analyze_free_energy_landscape(working_directory_path: str, projection_file_name: str,
+                                     temperature: float,
+                                     bin_count: int) -> tuple[Any, ...]:
+    """Gibbs free energy landscape over the two principal components.
+
+    Reads the projection back off disk rather than taking it through gr.State, so
+    the landscape can be recomputed at a different temperature or resolution
+    without rerunning the PCA, and survives a page reload.
+    """
+    try:
+        projection_file_path = os.path.join(working_directory_path, projection_file_name)
+        if not os.path.exists(projection_file_path):
+            raise Exception(f"{projection_file_name} was not found. Run the PCA first.")
+
+        projection = read_xvg(projection_file_path)
+        if len(projection["frame"].columns) < 2:
+            raise Exception(f"{projection_file_name} has only one column, so it holds no "
+                            f"2D projection. Rerun the PCA to write it.")
+
+        first_component = projection["frame"].iloc[:, 0]
+        second_component = projection["frame"].iloc[:, 1]
+        x_centres, y_centres, probability, free_energy = compute_free_energy_landscape(
+            first_component, second_component, bin_count=int(bin_count),
+            temperature=float(temperature))
+
+        figure = make_landscape_figure(x_centres, y_centres, free_energy,
+                                       xlabel=projection["xlabel"] or "PC1",
+                                       ylabel=projection["ylabel"] or "PC2",
+                                       title=f"Free energy landscape at {float(temperature):g} K")
+
+        # Long form, one row per bin, so the surface exports as a plain table.
+        x_grid, y_grid = np.meshgrid(x_centres, y_centres, indexing="ij")
+        frame = pd.DataFrame({
+            projection["xlabel"] or "PC1": x_grid.ravel(),
+            projection["ylabel"] or "PC2": y_grid.ravel(),
+            "Probability": probability.ravel(),
+            "ΔG (kJ/mol)": free_energy.ravel(),
+        })
+
+        status = "Free energy landscape calculated successfully."
+    except Exception as exc:
+        status = "Error calculating free energy landscape!\n" + str(exc)
+        return None, None, "<span style='color:red;'>" + status + "</span>"
+
+    return frame, figure, "<span style='color:green;'>" + status + "</span>"
 
 def on_export_df(working_directory_path: str, df: pd.DataFrame, file_name: str) -> tuple[list[str], str]:
     """Write an analysis table to CSV inside the job directory."""
+    if df is None:
+        # One export button per analysis now, so exporting before running the
+        # matching analysis is an easy mistake to make.
+        return get_files_in_working_directory(working_directory_path), \
+            "<span style='color:red;'>Run the analysis before exporting its results.</span>"
+
     try:
         df.to_csv(os.path.join(working_directory_path, file_name), index=False)
         status = f"File exported: {file_name}"
@@ -1669,24 +1915,95 @@ def protein_md_simulation_tab_content() -> None:
                                 fit_backbone_button = gr.Button("Run")
                 with gr.Accordion(label="MD Trajectory Analysis", open=False):
                     with gr.Row():
-                        analysis_structure_file_name_dropdown = gr.Dropdown(label="Input Trajectory File Name", choices=[], value=None)
-                        analysis_input_traj_file_name_dropdown = gr.Dropdown(label="Input Trajectory File Name", choices=[], value=None)
-                        analyze_button = gr.Button("Analyze")
-                    with gr.Row():
-                        with gr.Column():
-                            gr.Markdown("***Protein RMSD***")
-                            protein_rmsd_df_state = gr.State()
-                            protein_rmsd_plot = gr.Plot()
-                            with gr.Row():
-                                protein_rmsd_file_name_texbox = gr.Textbox(label="Protein RMSD File Name", value="Protein_RMSD.csv")
-                                protein_rmsd_export_button = gr.Button("Export protein RMSD (.csv)")
-                        with gr.Column():
-                            gr.Markdown("***Cα RMSF***")
-                            ca_rmsf_df_state = gr.State()
-                            ca_rmsf_plot = gr.Plot()
-                            with gr.Row():
-                                ca_rmsf_file_name_texbox = gr.Textbox(label="Cα RMSF File Name", value="C_alpha_RMSF.csv")
-                                ca_rmsf_export_button = gr.Button("Export Cα RMSF (.csv)")
+                        with gr.Column(scale=1):
+                            analysis_structure_file_name_dropdown = gr.Dropdown(label="Structure File Name", choices=[], value=None)
+                            analysis_input_traj_file_name_dropdown = gr.Dropdown(label="Input Trajectory File Name", choices=[], value=None)
+                            analysis_run_input_file_name_dropdown = gr.Dropdown(label="Run Input File Name (.tpr)", choices=[], value=None)
+                        with gr.Column(scale=3):
+                            with gr.Accordion(label="Protein RMSD", open=True):
+                                with gr.Row():
+                                    protein_rmsd_analyze_button = gr.Button("Run", variant="primary")
+                                protein_rmsd_df_state = gr.State()
+                                protein_rmsd_plot = gr.Plot()
+                                with gr.Row():
+                                    protein_rmsd_file_name_texbox = gr.Textbox(label="Protein RMSD File Name", value="Protein_RMSD.csv")
+                                    protein_rmsd_export_button = gr.Button("Export protein RMSD (.csv)")
+                            with gr.Accordion(label="Cα RMSF", open=False):
+                                with gr.Row():
+                                    ca_rmsf_analyze_button = gr.Button("Run", variant="primary")
+                                ca_rmsf_df_state = gr.State()
+                                ca_rmsf_plot = gr.Plot()
+                                with gr.Row():
+                                    ca_rmsf_file_name_texbox = gr.Textbox(label="Cα RMSF File Name", value="C_alpha_RMSF.csv")
+                                    ca_rmsf_export_button = gr.Button("Export Cα RMSF (.csv)")
+                            with gr.Accordion(label="Solvent Accessible Surface Area", open=False):
+                                with gr.Row():
+                                    sasa_surface_selection_textbox = gr.Textbox(label="Surface Selection", value="group Protein", info="A bare word is read as an index group whose name can span several words, so combine with the explicit form: group Protein or resname LIG")
+                                    sasa_output_selection_textbox = gr.Textbox(label="Output Selection (optional)", value="")
+                                    sasa_probe_radius_slider = gr.Slider(label="Probe Radius (nm)", minimum=0.05, maximum=0.30, value=0.14, step=0.01)
+                                with gr.Row():
+                                    sasa_output_file_name_textbox = gr.Textbox(label="Area File Name", value="sasa.xvg")
+                                    sasa_residue_output_file_name_textbox = gr.Textbox(label="Per-residue File Name", value="sasa_residue.xvg")
+                                    sasa_analyze_button = gr.Button("Run", variant="primary")
+                                with gr.Row():
+                                    with gr.Column():
+                                        sasa_df_state = gr.State()
+                                        sasa_plot = gr.Plot()
+                                        with gr.Row():
+                                            sasa_file_name_texbox = gr.Textbox(label="SASA File Name", value="SASA.csv")
+                                            sasa_export_button = gr.Button("Export SASA (.csv)")
+                                    with gr.Column():
+                                        sasa_residue_df_state = gr.State()
+                                        sasa_residue_plot = gr.Plot()
+                                        with gr.Row():
+                                            sasa_residue_file_name_texbox = gr.Textbox(label="Per-residue File Name", value="SASA_per_residue.csv")
+                                            sasa_residue_export_button = gr.Button("Export per-residue (.csv)")
+                            with gr.Accordion(label="Radius of Gyration", open=False):
+                                with gr.Row():
+                                    gyrate_selection_textbox = gr.Textbox(label="Selection", value="group Protein", info="A bare word is read as an index group whose name can span several words, so combine with the explicit form: group Protein or resname LIG")
+                                    gyrate_mode_dropdown = gr.Dropdown(label="Weighting", choices=["mass", "charge", "geometry"], value="mass")
+                                    gyrate_output_file_name_textbox = gr.Textbox(label="Output File Name", value="gyrate.xvg")
+                                    gyrate_analyze_button = gr.Button("Run", variant="primary")
+                                gyrate_df_state = gr.State()
+                                gyrate_plot = gr.Plot()
+                                with gr.Row():
+                                    gyrate_file_name_texbox = gr.Textbox(label="Gyration File Name", value="Radius_of_gyration.csv")
+                                    gyrate_export_button = gr.Button("Export gyration (.csv)")
+                            with gr.Accordion(label="Principal Component Analysis", open=False):
+                                with gr.Row():
+                                    pca_selection_textbox = gr.Textbox(label="Selection", value="group Backbone", info="A bare word is read as an index group whose name can span several words, so combine with the explicit form: group Protein or resname LIG")
+                                    pca_first_eigenvector_slider = gr.Slider(label="First Eigenvector", minimum=1, maximum=10, value=1, step=1)
+                                    pca_second_eigenvector_slider = gr.Slider(label="Second Eigenvector", minimum=2, maximum=20, value=2, step=1)
+                                    pca_analyze_button = gr.Button("Run", variant="primary")
+                                with gr.Row():
+                                    pca_index_file_name_textbox = gr.Textbox(label="Index File Name", value="pca_index.ndx")
+                                    pca_eigenvector_file_name_textbox = gr.Textbox(label="Eigenvector File Name", value="pca_eigenvec.trr")
+                                    pca_eigenvalue_file_name_textbox = gr.Textbox(label="Eigenvalue File Name", value="pca_eigenval.xvg")
+                                    pca_projection_file_name_textbox = gr.Textbox(label="Projection File Name", value="pca_2dproj.xvg")
+                                with gr.Row():
+                                    with gr.Column():
+                                        pca_eigenvalue_df_state = gr.State()
+                                        pca_eigenvalue_plot = gr.Plot()
+                                        with gr.Row():
+                                            pca_eigenvalue_file_name_texbox = gr.Textbox(label="Eigenvalue File Name", value="PCA_eigenvalues.csv")
+                                            pca_eigenvalue_export_button = gr.Button("Export eigenvalues (.csv)")
+                                    with gr.Column():
+                                        pca_projection_df_state = gr.State()
+                                        pca_projection_plot = gr.Plot()
+                                        with gr.Row():
+                                            pca_projection_file_name_texbox = gr.Textbox(label="Projection File Name", value="PCA_projection.csv")
+                                            pca_projection_export_button = gr.Button("Export projection (.csv)")
+                            with gr.Accordion(label="Gibbs Free Energy Landscape", open=False):
+                                with gr.Row():
+                                    fel_projection_file_name_textbox = gr.Textbox(label="Projection File Name", value="pca_2dproj.xvg")
+                                    fel_temperature_slider = gr.Slider(label="Temperature (K)", minimum=100, maximum=500, value=300, step=1)
+                                    fel_bin_count_slider = gr.Slider(label="Bins", minimum=20, maximum=200, value=100, step=10)
+                                    fel_analyze_button = gr.Button("Run", variant="primary")
+                                fel_df_state = gr.State()
+                                fel_plot = gr.Plot()
+                                with gr.Row():
+                                    fel_file_name_texbox = gr.Textbox(label="Landscape File Name", value="Free_energy_landscape.csv")
+                                    fel_export_button = gr.Button("Export landscape (.csv)")
 
     # Working directory interactions
     working_directory_dropdown.change(on_open_working_directory, working_directory_dropdown, [working_directory_dropdown, working_directory_path_state, working_directory_file_list_state, clean_working_directory_button, protein_structure_file])
@@ -1709,7 +2026,8 @@ def protein_md_simulation_tab_content() -> None:
                                               prod_md_input_file_name_dropdown, prod_md_input_topology_file_name_dropdown, prod_md_parameter_file_dropdown, prod_md_run_input_file_dropdown, checkpoint_file_dropdown,
                                               fix_traj_run_input_file_name_dropdown, make_mol_whole_input_traj_file_name_dropdown, center_protein_input_traj_file_name_dropdown, fit_backbone_input_traj_file_name_dropdown,
                                               analysis_structure_file_name_dropdown, analysis_input_traj_file_name_dropdown,
-                                              trajectory_viewer_structure_file_dropdown, trajectory_viewer_trajectory_file_dropdown])
+                                              trajectory_viewer_structure_file_dropdown, trajectory_viewer_trajectory_file_dropdown,
+                                              analysis_run_input_file_name_dropdown])
     working_directory_file_dataframe.select(on_select_file, [], [selected_file_state, selected_structure_file_state, selected_text_file_state, delete_file_button])
     selected_structure_file_state.change(on_selected_structure_file_state_change, selected_structure_file_state, [view_structure_button, structure_viewer_accordion])
     selected_text_file_state.change(on_selected_text_file_state_change, selected_text_file_state, [view_text_file_button, text_file_viewer_accordion])
@@ -1771,8 +2089,19 @@ def protein_md_simulation_tab_content() -> None:
     fit_backbone_button.click(on_fit_backbone, [working_directory_path_state, fix_traj_run_input_file_name_dropdown, fit_backbone_input_traj_file_name_dropdown, fit_backbone_output_traj_file_name_textbox], [working_directory_file_list_state, status_markdown])
 
     # Analysis
-    analyze_button.click(on_analyze_md_traj, [working_directory_path_state, analysis_structure_file_name_dropdown, analysis_input_traj_file_name_dropdown], [protein_rmsd_df_state, protein_rmsd_plot, ca_rmsf_df_state, ca_rmsf_plot])
+    protein_rmsd_analyze_button.click(on_analyze_rmsd, [working_directory_path_state, analysis_structure_file_name_dropdown, analysis_input_traj_file_name_dropdown], [protein_rmsd_df_state, protein_rmsd_plot, status_markdown])
+    ca_rmsf_analyze_button.click(on_analyze_rmsf, [working_directory_path_state, analysis_structure_file_name_dropdown, analysis_input_traj_file_name_dropdown], [ca_rmsf_df_state, ca_rmsf_plot, status_markdown])
+    sasa_analyze_button.click(on_analyze_sasa, [working_directory_path_state, analysis_run_input_file_name_dropdown, analysis_input_traj_file_name_dropdown, sasa_surface_selection_textbox, sasa_output_selection_textbox, sasa_probe_radius_slider, sasa_output_file_name_textbox, sasa_residue_output_file_name_textbox], [working_directory_file_list_state, sasa_df_state, sasa_plot, sasa_residue_df_state, sasa_residue_plot, status_markdown])
+    pca_analyze_button.click(on_run_pca, [working_directory_path_state, analysis_run_input_file_name_dropdown, analysis_input_traj_file_name_dropdown, pca_selection_textbox, pca_first_eigenvector_slider, pca_second_eigenvector_slider, pca_index_file_name_textbox, pca_eigenvector_file_name_textbox, pca_eigenvalue_file_name_textbox, pca_projection_file_name_textbox], [working_directory_file_list_state, pca_eigenvalue_df_state, pca_eigenvalue_plot, pca_projection_df_state, pca_projection_plot, status_markdown])
+    fel_analyze_button.click(on_analyze_free_energy_landscape, [working_directory_path_state, fel_projection_file_name_textbox, fel_temperature_slider, fel_bin_count_slider], [fel_df_state, fel_plot, status_markdown])
+    gyrate_analyze_button.click(on_analyze_gyrate, [working_directory_path_state, analysis_run_input_file_name_dropdown, analysis_input_traj_file_name_dropdown, gyrate_selection_textbox, gyrate_mode_dropdown, gyrate_output_file_name_textbox], [working_directory_file_list_state, gyrate_df_state, gyrate_plot, status_markdown])
     protein_rmsd_export_button.click(on_export_df, [working_directory_path_state, protein_rmsd_df_state, protein_rmsd_file_name_texbox], [working_directory_file_list_state, status_markdown])
     ca_rmsf_export_button.click(on_export_df, [working_directory_path_state, ca_rmsf_df_state, ca_rmsf_file_name_texbox], [working_directory_file_list_state, status_markdown])
+    sasa_export_button.click(on_export_df, [working_directory_path_state, sasa_df_state, sasa_file_name_texbox], [working_directory_file_list_state, status_markdown])
+    sasa_residue_export_button.click(on_export_df, [working_directory_path_state, sasa_residue_df_state, sasa_residue_file_name_texbox], [working_directory_file_list_state, status_markdown])
+    pca_eigenvalue_export_button.click(on_export_df, [working_directory_path_state, pca_eigenvalue_df_state, pca_eigenvalue_file_name_texbox], [working_directory_file_list_state, status_markdown])
+    pca_projection_export_button.click(on_export_df, [working_directory_path_state, pca_projection_df_state, pca_projection_file_name_texbox], [working_directory_file_list_state, status_markdown])
+    fel_export_button.click(on_export_df, [working_directory_path_state, fel_df_state, fel_file_name_texbox], [working_directory_file_list_state, status_markdown])
+    gyrate_export_button.click(on_export_df, [working_directory_path_state, gyrate_df_state, gyrate_file_name_texbox], [working_directory_file_list_state, status_markdown])
 
     return protein_md_simulation_tab

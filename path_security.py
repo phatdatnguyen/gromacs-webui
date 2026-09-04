@@ -56,9 +56,8 @@ def secure_working_directory_callback(callback: Callable[..., Any]) -> Callable[
     if "working_directory_path" not in signature.parameters:
         return callback
 
-    @functools.wraps(callback)
-    def secured(*args: Any, **kwargs: Any) -> Any:
-        """Validate the client-supplied paths, then defer to the callback."""
+    def validated(args: Any, kwargs: Any) -> inspect.BoundArguments:
+        """Validate the client-supplied paths and return the bound arguments."""
         bound = signature.bind(*args, **kwargs)
         bound.arguments["working_directory_path"] = validate_working_directory(
             bound.arguments["working_directory_path"]
@@ -69,6 +68,25 @@ def secure_working_directory_callback(callback: Callable[..., Any]) -> Callable[
             # "path" (including protein_input_file and selected_file_name).
             if "file" in name and "path" not in name and isinstance(value, str):
                 validate_local_file_path(bound.arguments["working_directory_path"], value, name)
+        return bound
+
+    # A generator callback needs a generator wrapper. functools.wraps sets
+    # __wrapped__, but inspect.isgeneratorfunction reads the code flags of the
+    # object it is handed and does not follow it, so a plain wrapper would look
+    # like an ordinary function to Gradio. Gradio would then treat the returned
+    # generator as the output value instead of streaming what it yields, and
+    # every streaming analysis would render as an object repr.
+    if inspect.isgeneratorfunction(callback):
+        @functools.wraps(callback)
+        def secured_generator(*args: Any, **kwargs: Any) -> Any:
+            bound = validated(args, kwargs)
+            yield from callback(*bound.args, **bound.kwargs)
+
+        return secured_generator
+
+    @functools.wraps(callback)
+    def secured(*args: Any, **kwargs: Any) -> Any:
+        bound = validated(args, kwargs)
         return callback(*bound.args, **bound.kwargs)
 
     return secured

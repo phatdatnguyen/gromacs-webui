@@ -7,6 +7,7 @@ import importlib.util
 import math
 import os
 import re
+import shutil
 import subprocess
 import threading
 from collections.abc import Sequence
@@ -14,6 +15,8 @@ from typing import Any, TypedDict
 
 import MDAnalysis as mda
 import nglview
+import numpy as np
+import pandas as pd
 
 # Machine learning potentials are optional. torch, e3nn and the model packages are
 # large, so they are neither imported nor required at start-up: availability is
@@ -68,6 +71,15 @@ class TrajectoryViewerInfo(TypedDict):
     species: StructureSpecies
 
 
+class XvgData(TypedDict):
+    """A parsed GROMACS .xvg file: the numbers plus the labels it carries itself."""
+
+    frame: pd.DataFrame
+    title: str
+    xlabel: str
+    ylabel: str
+
+
 
 def get_missing_nnpot_packages() -> list[str]:
     """Which machine learning potential packages are absent from this environment."""
@@ -91,6 +103,88 @@ def get_nnpot_unavailable_reason() -> str | None:
 
     return (f"Machine learning potentials are disabled: {', '.join(missing)} "
             f"not installed. See the Readme for the optional install steps.")
+
+
+GMX_MMPBSA_EXECUTABLE_ENVIRONMENT_VARIABLE: str = "GMX_MMPBSA_EXECUTABLE"
+# The environment the Readme tells you to build, beside the application's own.
+GMX_MMPBSA_ENVIRONMENT_PATH: str = "./gmx-mmpbsa-env"
+
+def get_gmx_mmpbsa_executable() -> str | None:
+    """Where gmx_MMPBSA lives, or None when it is not installed.
+
+    Looked for in the project's own gmx-mmpbsa-env first, so the documented
+    install just works, then on PATH; an explicit environment variable overrides
+    both. Never taken from a value typed into the UI: this string becomes argv[0]
+    of a subprocess, and a client-supplied one would mean "run any binary on this
+    machine" even though nothing is passed to a shell.
+    """
+    configured = os.environ.get(GMX_MMPBSA_EXECUTABLE_ENVIRONMENT_VARIABLE)
+    if configured:
+        return configured if _is_executable(configured) else None
+
+    local = os.path.abspath(os.path.join(GMX_MMPBSA_ENVIRONMENT_PATH, "bin", "gmx_MMPBSA"))
+    if _is_executable(local):
+        return local
+
+    return shutil.which("gmx_MMPBSA")
+
+
+def _is_executable(path: str) -> bool:
+    return os.path.isfile(path) and os.access(path, os.X_OK)
+
+
+# gmx_MMPBSA imports mpi4py unconditionally, even for a serial run, so MPI has to
+# initialise before it can fall back to its serial path.
+GMX_MMPBSA_FABRIC_ENVIRONMENT_VARIABLE: str = "I_MPI_FABRICS"
+GMX_MMPBSA_DEFAULT_FABRIC: str = "shm"
+
+def get_gmx_mmpbsa_environment(executable: str) -> dict[str, str]:
+    """The environment gmx_MMPBSA needs to start out of its own installation.
+
+    Two things it cannot do for itself:
+
+    * Its bin goes on PATH, because mpirun is a shell script that looks up
+      mpiexec.hydra by name and would otherwise not find it.
+    * I_MPI_FABRICS defaults to shared memory. The Intel MPI this package pulls
+      in probes for a fast fabric on startup and aborts in its OFI provider when
+      there is none - which is every laptop, container and WSL install. MM-PBSA
+      runs on a single node regardless, so shared memory is the right fabric,
+      not merely a workaround.
+
+    An existing value is left alone, so a cluster can set its own.
+    """
+    environment = dict(os.environ)
+    bin_directory = os.path.dirname(os.path.abspath(executable))
+    environment["PATH"] = bin_directory + os.pathsep + environment.get("PATH", "")
+    environment.setdefault(GMX_MMPBSA_FABRIC_ENVIRONMENT_VARIABLE, GMX_MMPBSA_DEFAULT_FABRIC)
+
+    return environment
+
+
+def get_mpirun_beside(executable: str) -> str:
+    """The mpirun from the same installation, so its own MPI is the one used."""
+    candidate = os.path.join(os.path.dirname(os.path.abspath(executable)), "mpirun")
+
+    return candidate if _is_executable(candidate) else "mpirun"
+
+
+def get_gmx_mmpbsa_unavailable_reason() -> str | None:
+    """A message naming what to install, or None when MM-PBSA can be run."""
+    if get_gmx_mmpbsa_executable() is not None:
+        return None
+
+    return ("MM-PBSA is disabled: gmx_MMPBSA was not found. It pins older "
+            "dependencies, so it goes in its own environment beside this one:\n\n"
+            f"    conda create -p {GMX_MMPBSA_ENVIRONMENT_PATH} python=3.9\n"
+            f"    conda install -p {GMX_MMPBSA_ENVIRONMENT_PATH} -c conda-forge gmx_mmpbsa\n\n"
+            f"That location is found automatically. Otherwise put its bin on PATH or "
+            f"point {GMX_MMPBSA_EXECUTABLE_ENVIRONMENT_VARIABLE} at the binary. "
+            "See the Readme.")
+
+
+def is_gmx_mmpbsa_available() -> bool:
+    """Whether the optional MM-PBSA support can be used."""
+    return get_gmx_mmpbsa_executable() is not None
 
 
 def is_nnpot_available() -> bool:
@@ -342,6 +436,109 @@ def run_checked_command(cmd: Sequence[str], cwd: str | None = None, stdin_input:
                         f"(exit status {process.returncode}):\n{detail}")
 
     return process
+
+# "Group     1 (        Protein) has 45 elements" — the menu every interactive gmx
+# analysis tool prints before asking which group to use.
+_GMX_GROUP_LINE = re.compile(r'Group\s+(\d+)\s*\(\s*([^)]+?)\s*\)')
+
+def find_gmx_group_number(gmx_output: str, group_name: str) -> str | None:
+    """The index gmx offered for a named group, or None when it offered no such group.
+
+    Group numbering is not fixed: it depends on the force field and on what the
+    system contains. Every caller must look the number up in the tool's own menu
+    rather than assuming a well-known index."""
+    for number, name in _GMX_GROUP_LINE.findall(gmx_output):
+        if name == group_name:
+            return number
+
+    return None
+
+def parse_gmx_groups(gmx_output: str) -> dict[str, str]:
+    """Every group gmx offered, as {name: index}, first occurrence winning."""
+    groups: dict[str, str] = {}
+    for number, name in _GMX_GROUP_LINE.findall(gmx_output):
+        groups.setdefault(name, number)
+
+    return groups
+
+# "  13 UNK                 :    74 atoms" - the listing gmx make_ndx prints. Note
+# this is a different shape from the "Group 13 ( UNK )" the analysis tools print.
+_GMX_MAKE_NDX_LINE = re.compile(r'^\s*(\d+)\s+(\S.*?)\s*:\s*(\d+)\s+atoms\s*$')
+
+# Groups gmx builds for every system, so none of them identifies a ligand.
+GMX_STANDARD_INDEX_GROUPS: frozenset[str] = frozenset({
+    "System", "Protein", "Protein-H", "C-alpha", "Backbone", "MainChain",
+    "MainChain+Cb", "MainChain+H", "SideChain", "SideChain-H", "Prot-Masses",
+    "non-Protein", "Other", "Water", "SOL", "non-Water", "Ion", "Water_and_ions",
+    "DNA", "RNA",
+})
+GMX_COMMON_ION_NAMES: frozenset[str] = frozenset({
+    "NA", "CL", "K", "MG", "ZN", "CA", "NA+", "CL-", "CU", "FE",
+})
+
+def list_gmx_index_groups(structure_file_name: str,
+                          working_directory_path: str) -> list[tuple[str, int]]:
+    """The default index groups gmx builds for a structure, as (name, atom count).
+
+    Uses gmx make_ndx because it works with any tpr, including versions newer
+    than the MDAnalysis parser understands.
+    """
+    output_file_name = ".probe_make_ndx.ndx"
+    try:
+        completed = run_checked_command(
+            ["gmx", "make_ndx", "-f", structure_file_name, "-o", output_file_name],
+            cwd=working_directory_path, stdin_input="q\n")
+    finally:
+        try:
+            os.remove(os.path.join(working_directory_path, output_file_name))
+        except OSError:
+            pass
+
+    groups: list[tuple[str, int]] = []
+    for line in (completed.stderr + completed.stdout).splitlines():
+        match = _GMX_MAKE_NDX_LINE.match(line)
+        if match:
+            groups.append((match.group(2), int(match.group(3))))
+
+    return groups
+
+def describe_selection_candidates(structure_file_name: str,
+                                  working_directory_path: str) -> str:
+    """A sentence naming what a selection could have meant, or "" if unavailable.
+
+    A selection that matches nothing is nearly always a residue name that differs
+    from the one assumed - a job set up before the ligand was normalised to LIG,
+    for instance - so the fix is to say what the structure does contain.
+    """
+    try:
+        groups = list_gmx_index_groups(structure_file_name, working_directory_path)
+    except Exception:
+        # Only ever used to enrich another error; never replace it with this one.
+        return ""
+
+    candidates = [f"{name} ({count} atoms)" for name, count in groups
+                  if name not in GMX_STANDARD_INDEX_GROUPS
+                  and name.upper() not in GMX_COMMON_ION_NAMES]
+    if not candidates:
+        return ""
+
+    return (f"{structure_file_name} contains {', '.join(candidates)}. "
+            f"If one of those is the ligand, select it by name, for example "
+            f"'resname {candidates[0].split(' ')[0]}'.")
+
+def probe_gmx_groups(cmd: Sequence[str], cwd: str | None = None) -> dict[str, str]:
+    """Run a command far enough to capture the group menu it prints, then discard it.
+
+    The tool is answered immediately and its output is thrown away; only the menu
+    matters. Answers go in up front because the menu lands on a block-buffered pipe,
+    so reading before replying would deadlock."""
+    probe = subprocess.Popen(list(cmd), cwd=cwd, stdin=subprocess.PIPE,
+                             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    stdout, stderr = probe.communicate(input="\n" * 8)
+
+    # trjconv and the analysis tools print the menu on stderr, but not all of them
+    # agree on that, so search both streams.
+    return parse_gmx_groups(stderr + stdout)
 
 def stop_process_gracefully(proc: subprocess.Popen[str] | None, timeout: float = 15) -> None:
     """Ask a run to stop, only killing it if it ignores the request.
@@ -702,17 +899,44 @@ LIGAND_RESNAME: str = "LIG"
 # Columns 18-20 of a PDB ATOM/HETATM/TER record, 1-based and inclusive.
 _PDB_RESNAME_SLICE = slice(17, 20)
 
-def rename_pdb_residues(pdb_file_path: str, resname: str = LIGAND_RESNAME) -> list[str]:
-    """Rewrite every residue name in a PDB file in place, returning the old names.
+BLANK_RESNAME_LABEL: str = "(blank)"
 
-    An uploaded ligand often calls its molecule UNK, MOL or a PDB chemical
-    component id. Trajectory analysis selects the ligand as "resname LIG", so
-    anything else silently analyses an empty selection; normalising the name at
-    upload keeps the rest of the workflow able to find the ligand. Returns the
-    replaced names in the order met, empty when the file already used `resname`.
+def read_pdb_residue_names(pdb_file_path: str) -> list[str]:
+    """Distinct residue names on the ATOM/HETATM records, in the order met.
+
+    A record with nothing in columns 18-20 is reported as BLANK_RESNAME_LABEL:
+    real files do come with the field empty, and it has to be visible rather
+    than silently treated as "no residues here".
+    """
+    names: list[str] = []
+    with open(pdb_file_path) as handle:
+        for line in handle:
+            if not line.startswith(("ATOM  ", "HETATM")):
+                continue
+            name = line.rstrip("\r\n")[_PDB_RESNAME_SLICE].strip() or BLANK_RESNAME_LABEL
+            if name not in names:
+                names.append(name)
+
+    return names
+
+def rename_pdb_residues(pdb_file_path: str, resname: str = LIGAND_RESNAME,
+                        source_resname: str | None = None) -> list[str]:
+    """Rewrite residue names in a PDB file in place, returning the old names.
+
+    An uploaded ligand often calls its molecule UNK, MOL, a PDB chemical
+    component id, or nothing at all. Trajectory analysis selects the ligand as
+    "resname LIG", so anything else silently analyses an empty selection.
+
+    ``source_resname`` restricts the rewrite to one residue name, for a file that
+    holds more than the ligand. When it is None, or names nothing in the file,
+    every ATOM/HETATM record is rewritten - an uploaded ligand file is the
+    ligand. Returns the replaced names, empty when nothing needed changing.
     """
     with open(pdb_file_path) as handle:
         lines = handle.readlines()
+
+    present = read_pdb_residue_names(pdb_file_path)
+    selective = bool(source_resname) and source_resname in present
 
     replaced: list[str] = []
     rewritten: list[str] = []
@@ -724,13 +948,21 @@ def rename_pdb_residues(pdb_file_path: str, resname: str = LIGAND_RESNAME) -> li
         body = line.rstrip("\r\n")
         newline = line[len(body):]
         current = body[_PDB_RESNAME_SLICE].strip()
-        if not current:
-            # A bare "TER" carries no residue name; leave it that way.
+
+        # A bare "TER" carries no residue name and is left alone. An ATOM or
+        # HETATM with the field empty is a different matter: it still needs a
+        # name, and skipping it was why a blank-resname ligand reached acpype
+        # unnamed and came back as UNK.
+        if line.startswith("TER") and not current:
+            rewritten.append(line)
+            continue
+        if selective and current != source_resname:
             rewritten.append(line)
             continue
 
-        if current != resname and current not in replaced:
-            replaced.append(current)
+        label = current or BLANK_RESNAME_LABEL
+        if current != resname and label not in replaced:
+            replaced.append(label)
 
         rewritten.append(body[:_PDB_RESNAME_SLICE.start] + resname.rjust(3)
                          + body[_PDB_RESNAME_SLICE.stop:] + newline)
@@ -742,6 +974,561 @@ def rename_pdb_residues(pdb_file_path: str, resname: str = LIGAND_RESNAME) -> li
         handle.writelines(rewritten)
 
     return replaced
+
+# Grace commands in an .xvg header. Every gmx analysis tool writes these, so the
+# axis labels and per-series legends come from the file rather than from hardcoded
+# per-tool knowledge.
+_XVG_TITLE = re.compile(r'^@\s+title\s+"(.*)"')
+_XVG_AXIS_LABEL = re.compile(r'^@\s+(x|y)axis\s+label\s+"(.*)"')
+_XVG_LEGEND = re.compile(r'^@\s+s(\d+)\s+legend\s+"(.*)"')
+
+def read_xvg(xvg_file_path: str) -> XvgData:
+    """Parse a GROMACS .xvg into a DataFrame whose columns are its own legends.
+
+    The format is '#' comments, '@' grace commands carrying the title, axis labels
+    and one legend per series, then whitespace-separated numbers. Files written
+    with -xvg none carry no header at all, so every label is optional.
+    """
+    title = ""
+    xlabel = ""
+    ylabel = ""
+    legends: dict[int, str] = {}
+    rows: list[list[float]] = []
+
+    with open(xvg_file_path) as handle:
+        for line in handle:
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+
+            if line.startswith("@"):
+                match = _XVG_LEGEND.match(line)
+                if match:
+                    legends[int(match.group(1))] = match.group(2)
+                    continue
+                match = _XVG_AXIS_LABEL.match(line)
+                if match:
+                    if match.group(1) == "x":
+                        xlabel = match.group(2)
+                    else:
+                        ylabel = match.group(2)
+                    continue
+                match = _XVG_TITLE.match(line)
+                if match:
+                    title = match.group(1)
+                continue
+
+            try:
+                rows.append([float(value) for value in line.split()])
+            except ValueError:
+                # '&' separates datasets in multi-set files. Anything else that does
+                # not parse is not data either, so skip it rather than fail outright.
+                continue
+
+    if not rows:
+        raise ValueError(f"{os.path.basename(xvg_file_path)} contains no data rows.")
+
+    # A run killed mid-write leaves a short final line; keep only the full-width rows
+    # so one truncated line cannot turn the whole frame into NaNs.
+    width = len(rows[0])
+    rows = [row for row in rows if len(row) == width]
+
+    columns = [xlabel or "x"]
+    for index in range(width - 1):
+        # A two-column file usually names its single series only on the y axis.
+        default = ylabel if width == 2 and ylabel else f"y{index}"
+        columns.append(legends.get(index) or default)
+
+    # Duplicate legends happen (gmx sasa -or repeats a label); pandas would allow the
+    # collision but every lookup by name would then return a frame, not a series.
+    seen: dict[str, int] = {}
+    for index, name in enumerate(columns):
+        if name in seen:
+            seen[name] += 1
+            columns[index] = f"{name} ({seen[name]})"
+        else:
+            seen[name] = 1
+
+    return XvgData(frame=pd.DataFrame(rows, columns=columns), title=title,
+                   xlabel=xlabel, ylabel=ylabel)
+
+def make_line_figure(frame: pd.DataFrame, x_column: str | None = None,
+                     y_columns: Sequence[str] | None = None, xlabel: str | None = None,
+                     ylabel: str | None = None, title: str | None = None,
+                     mean_line: bool = False) -> Any:
+    """Plot columns of a frame onto a standalone matplotlib Figure.
+
+    Deliberately not plt.figure(): the pyplot API draws into a process-wide "current
+    figure", so two analyses running at once in the Gradio worker would draw into
+    each other. A bare Figure has no global state. Gradio encodes it just the same.
+    """
+    # Local import: utils is imported directly by the tests, and pulling matplotlib
+    # in at module scope would make them depend on a writable cache directory.
+    from matplotlib.figure import Figure
+
+    x_column = x_column if x_column is not None else frame.columns[0]
+    if y_columns is None:
+        y_columns = [column for column in frame.columns if column != x_column]
+
+    figure = Figure(figsize=(8, 6))
+    axes = figure.subplots()
+    for column in y_columns:
+        axes.plot(frame[x_column], frame[column], label=column)
+
+    if mean_line and len(y_columns) == 1:
+        mean = frame[y_columns[0]].mean()
+        axes.axhline(mean, color="red", linestyle="--", label=f"Mean {y_columns[0]}")
+
+    axes.set_xlabel(xlabel if xlabel is not None else x_column)
+    if ylabel is not None:
+        axes.set_ylabel(ylabel)
+    if title:
+        axes.set_title(title)
+    if len(y_columns) > 1 or mean_line:
+        axes.legend()
+
+    figure.tight_layout()
+    return figure
+
+def format_running_status(cmd: Sequence[str], note: str = "") -> str:
+    """The status shown while a command is still running.
+
+    Escaped, because selection strings reach here straight from a textbox and
+    GROMACS syntax is full of characters that would otherwise be read as HTML.
+    """
+    import html
+
+    message = f"Running command:<br><code>{html.escape(' '.join(str(part) for part in cmd))}</code>"
+    if note:
+        message = f"{html.escape(note)}<br>{message}"
+
+    return f"<span style='color:orange;'>{message}</span>"
+
+# idecomp, as gmx_MMPBSA numbers the schemes. 1 and 2 are per-residue; 3 and 4
+# are pairwise, which produces a residue-by-residue matrix and is far slower.
+MMPBSA_DECOMPOSITION_SCHEMES: tuple[tuple[str, int], ...] = (
+    ("Per-residue, 1-4 terms added to internal", 1),
+    ("Per-residue, 1-4 terms added to EEL/VDW", 2),
+    ("Pairwise, 1-4 terms added to internal", 3),
+    ("Pairwise, 1-4 terms added to EEL/VDW", 4),
+)
+
+def get_default_mmpbsa_input_file_content(start_frame: int = 1, end_frame: int = 0,
+                                          interval: int = 1, salt_concentration: float = 0.150,
+                                          temperature: float = 300.0, use_gb: bool = True,
+                                          use_pb: bool = False, gb_model: int = 2,
+                                          use_decomposition: bool = True,
+                                          decomposition_scheme: int = 2,
+                                          print_residues: str = "within 6",
+                                          protein_force_field: str = "leaprc.protein.ff14SB",
+                                          ligand_force_field: str = "leaprc.gaff2") -> str:
+    """The &general/&gb/&pb/&decomp namelists gmx_MMPBSA reads from its -i file.
+
+    endframe = 0 means "to the end of the trajectory" here; gmx_MMPBSA wants a
+    real frame number, so it is only written when the caller gives one.
+
+    The &decomp namelist is what makes the per-residue contributions appear;
+    without it gmx_MMPBSA reports only the total binding energy.
+    """
+    if not use_gb and not use_pb:
+        raise ValueError("Select at least one of Generalised Born or Poisson-Boltzmann.")
+
+    content = ("Input file generated by GROMACS WebUI\n"
+               "&general\n"
+               f"  startframe        = {int(start_frame)},\n")
+    if int(end_frame) > 0:
+        content += f"  endframe          = {int(end_frame)},\n"
+    content += (f"  interval          = {int(interval)},\n"
+                f"  temperature       = {float(temperature)},\n"
+                f"  forcefields       = \"{protein_force_field}\", \"{ligand_force_field}\",\n"
+                "  sys_name          = \"Protein-ligand complex\",\n"
+                "  verbose           = 2,\n"
+                "/\n")
+
+    if use_gb:
+        content += ("&gb\n"
+                    f"  igb               = {int(gb_model)},\n"
+                    f"  saltcon           = {float(salt_concentration)},\n"
+                    "/\n")
+    if use_pb:
+        content += ("&pb\n"
+                    f"  istrng            = {float(salt_concentration)},\n"
+                    "  inp               = 2,\n"
+                    "  radiopt           = 0,\n"
+                    "/\n")
+
+    if use_decomposition:
+        # dec_verbose = 3 prints the per-residue breakdown for the complex, the
+        # receptor, the ligand and the delta; the delta is the one worth reading,
+        # and the others make the difference checkable.
+        content += ("&decomp\n"
+                    f"  idecomp           = {int(decomposition_scheme)},\n"
+                    "  dec_verbose       = 3,\n"
+                    f"  print_res         = \"{print_residues}\",\n"
+                    "  csv_format        = 1,\n"
+                    "/\n")
+
+    return content
+
+# The five statistics gmx_MMPBSA prints per term, in the order of its own header:
+# "Energy Component  Average  SD(Prop.)  SD  SEM(Prop.)  SEM".
+MMPBSA_STATISTIC_COLUMNS: tuple[str, ...] = ("Average (kcal/mol)", "SD(Prop.)", "SD",
+                                             "SEM(Prop.)", "SEM")
+
+def _is_number(text: str) -> bool:
+    """Whether a whitespace-separated field parses as a float."""
+    try:
+        float(text)
+    except ValueError:
+        return False
+
+    return True
+
+def parse_mmpbsa_results(dat_file_path: str) -> pd.DataFrame:
+    """Pull the energy decomposition out of a FINAL_RESULTS_MMPBSA.dat file.
+
+    The file is a human-readable report rather than a table: several sections,
+    each with a header line then "TERM  average  sd  sd(mean)" rows. Only the
+    delta section matters, so parsing stops once it has been read.
+    """
+    with open(dat_file_path) as handle:
+        lines = handle.readlines()
+
+    rows: list[dict[str, Any]] = []
+    in_delta = False
+    for line in lines:
+        stripped = line.strip()
+        if not stripped:
+            continue
+
+        fields = stripped.split()
+        # One section per component, headed by its name: "Complex:", "Receptor:",
+        # "Ligand:", "Delta (Complex - Receptor - Ligand):". Those same words also
+        # begin summary rows carrying numbers, so a heading is the one with none.
+        section = fields[0].rstrip(":").lower()
+        if section in ("complex", "receptor", "ligand", "delta"):
+            if not any(_is_number(field) for field in fields[1:]):
+                in_delta = section == "delta"
+                continue
+
+        if not in_delta:
+            continue
+
+        # A term row is a name followed by its statistics. Split from the right
+        # because the name itself can contain a space ("Δ1-4 VDW"), and take the
+        # count from the row rather than assuming it: a GB run and a PB run print
+        # different terms, and the column header line has no numbers at all.
+        numbers: list[float] = []
+        while len(numbers) < len(fields) and _is_number(fields[len(fields) - 1 - len(numbers)]):
+            numbers.insert(0, float(fields[len(fields) - 1 - len(numbers)]))
+        if not numbers or len(numbers) == len(fields):
+            continue
+
+        row: dict[str, Any] = {"Term": " ".join(fields[:len(fields) - len(numbers)])}
+        for column, value in zip(MMPBSA_STATISTIC_COLUMNS, numbers):
+            row[column] = value
+        rows.append(row)
+
+    if not rows:
+        raise ValueError(f"No energy decomposition found in {os.path.basename(dat_file_path)}. "
+                         f"Open it in the text viewer to see what gmx_MMPBSA reported.")
+
+    return pd.DataFrame(rows)
+
+def _read_mmpbsa_csv_block(lines: list[str], header_index: int) -> pd.DataFrame:
+    """Read one "Frame #,..." table out of a gmx_MMPBSA CSV, stopping at its end.
+
+    These files hold several tables separated by blank lines and section titles,
+    so a plain read_csv would swallow the lot.
+    """
+    header = [field.strip() for field in lines[header_index].strip().split(",")]
+    rows: list[list[str]] = []
+    for line in lines[header_index + 1:]:
+        stripped = line.strip()
+        if not stripped or not stripped[0].isdigit():
+            break
+        fields = [field.strip() for field in stripped.split(",")]
+        if len(fields) != len(header):
+            break
+        rows.append(fields)
+
+    frame = pd.DataFrame(rows, columns=header)
+    for column in frame.columns:
+        converted = pd.to_numeric(frame[column], errors="coerce")
+        if not converted.isna().all():
+            frame[column] = converted
+
+    return frame
+
+def _find_mmpbsa_section(lines: list[str], *titles: str) -> int:
+    """Index of the header row belonging to the last of the given section titles.
+
+    Titles are matched in order, so ("DELTAS:", "Total Decomposition") finds the
+    delta section's own table rather than the complex's table of the same name.
+    """
+    position = 0
+    for title in titles:
+        for index in range(position, len(lines)):
+            if lines[index].strip().startswith(title):
+                position = index + 1
+                break
+        else:
+            raise ValueError(f"No '{title}' section found.")
+
+    for index in range(position - 1, len(lines)):
+        if lines[index].strip().startswith("Frame #"):
+            return index
+
+    raise ValueError("No data table follows the section title.")
+
+def parse_mmpbsa_per_frame(csv_file_path: str) -> pd.DataFrame:
+    """The binding energy of each individual frame, from gmx_MMPBSA's -eo file.
+
+    That is the "Delta Energy Terms" table: complex minus receptor minus ligand,
+    one row per frame, which is what a distribution of the binding energy is
+    built from.
+    """
+    with open(csv_file_path) as handle:
+        lines = handle.readlines()
+
+    frame = _read_mmpbsa_csv_block(lines, _find_mmpbsa_section(lines, "Delta Energy Terms"))
+    if frame.empty:
+        raise ValueError(f"{os.path.basename(csv_file_path)} holds no per-frame energies.")
+
+    return frame
+
+def parse_mmpbsa_decomposition(csv_file_path: str) -> pd.DataFrame:
+    """Per-residue contributions to the binding energy, averaged over frames.
+
+    Read from the DELTAS section of gmx_MMPBSA's -deo file, which reports every
+    printed residue for every frame; the mean is the contribution and the spread
+    across frames says how steady it is.
+    """
+    with open(csv_file_path) as handle:
+        lines = handle.readlines()
+
+    per_frame = _read_mmpbsa_csv_block(
+        lines, _find_mmpbsa_section(lines, "DELTAS:", "Total Decomposition Contribution"))
+    if per_frame.empty:
+        raise ValueError(f"{os.path.basename(csv_file_path)} holds no decomposition data.")
+
+    value_columns = [c for c in per_frame.columns
+                     if c not in ("Frame #", "Residue") and per_frame[c].dtype.kind in "if"]
+    grouped = per_frame.groupby("Residue", sort=False)
+    frame = grouped[value_columns].mean().reset_index()
+    frame["TOTAL SD"] = grouped["TOTAL"].std().to_numpy() if "TOTAL" in value_columns else float("nan")
+
+    return frame.sort_values("TOTAL").reset_index(drop=True) if "TOTAL" in frame else frame
+
+# gmx_MMPBSA labels a receptor residue "R:A:LEU:37" and a ligand one "L:B:LIG:245".
+MMPBSA_LIGAND_RESIDUE_PREFIX: str = "L:"
+MMPBSA_LIGAND_BAR_COLOUR: str = "tab:orange"
+MMPBSA_RECEPTOR_BAR_COLOUR: str = "tab:blue"
+
+def mmpbsa_residue_colours(residues: Sequence[str]) -> tuple[list[str], dict[str, str]]:
+    """Bar colours that separate the ligand's own term from the receptor residues.
+
+    The ligand contributes most of the binding energy almost by definition, so
+    left in one colour it simply dwarfs the residues you are trying to read.
+    """
+    colours = [MMPBSA_LIGAND_BAR_COLOUR if str(name).startswith(MMPBSA_LIGAND_RESIDUE_PREFIX)
+               else MMPBSA_RECEPTOR_BAR_COLOUR for name in residues]
+    legend = {}
+    if MMPBSA_RECEPTOR_BAR_COLOUR in colours:
+        legend[MMPBSA_RECEPTOR_BAR_COLOUR] = "Receptor residue"
+    if MMPBSA_LIGAND_BAR_COLOUR in colours:
+        legend[MMPBSA_LIGAND_BAR_COLOUR] = "Ligand"
+
+    return colours, legend
+
+def read_mmpbsa_frame_selection(input_file_path: str) -> tuple[int, int]:
+    """The startframe and interval an mmpbsa.in asked for, defaulting to 1 and 1.
+
+    gmx_MMPBSA numbers its own frames 1..N over the frames it selected, so these
+    two are what map a result back onto the trajectory it came from.
+    """
+    start_frame, interval = 1, 1
+    with open(input_file_path) as handle:
+        for line in handle:
+            match = re.match(r"\s*(startframe|interval)\s*=\s*(\d+)", line)
+            if match:
+                if match.group(1) == "startframe":
+                    start_frame = int(match.group(2))
+                else:
+                    interval = int(match.group(2))
+
+    return start_frame, interval
+
+def get_trajectory_frame_times_ns(structure_file_path: str, trajectory_file_path: str,
+                                  start_frame: int, interval: int, count: int) -> list[float]:
+    """Simulation time, in ns, of the frames a gmx_MMPBSA run actually used.
+
+    Read from the trajectory rather than assumed from a constant step, so a
+    trajectory that was concatenated or written unevenly still lines up.
+    """
+    universe = mda.Universe(structure_file_path, trajectory_file_path)
+    total = len(universe.trajectory)
+    times: list[float] = []
+    for number in range(count):
+        index = (start_frame - 1) + number * interval
+        if index >= total:
+            break
+        times.append(universe.trajectory[index].time / 1000)
+    universe.trajectory.close()
+
+    return times
+
+def make_histogram_figure(values: Any, bins: int = 30, xlabel: str = "", title: str = "") -> Any:
+    """Distribution of a per-frame quantity, with its mean marked."""
+    from matplotlib.figure import Figure
+
+    series = np.asarray(values, dtype=float)
+    figure = Figure(figsize=(8, 6))
+    axes = figure.subplots()
+    axes.hist(series, bins=bins, color="tab:blue", edgecolor="white")
+    axes.axvline(series.mean(), color="red", linestyle="--",
+                 label=f"Mean {series.mean():.2f}")
+
+    axes.set_xlabel(xlabel)
+    axes.set_ylabel("Frames")
+    if title:
+        axes.set_title(title)
+    axes.legend()
+    figure.tight_layout()
+    return figure
+
+def make_bar_figure(frame: pd.DataFrame, label_column: str, value_column: str,
+                    error_column: str | None = None, ylabel: str = "",
+                    title: str = "", colors: Sequence[str] | None = None,
+                    legend: dict[str, str] | None = None) -> Any:
+    """Bar chart of an energy decomposition, with error bars when available.
+
+    ``colors`` overrides the default colouring by sign, for when the bars are
+    grouped by something more interesting than whether they are positive.
+    ``legend`` maps a colour to its meaning and is drawn with proxy handles,
+    since the bars themselves carry no labels.
+    """
+    from matplotlib.figure import Figure
+    from matplotlib.patches import Patch
+
+    figure = Figure(figsize=(8, 6))
+    axes = figure.subplots()
+    errors = frame[error_column] if error_column and error_column in frame else None
+    axes.bar(frame[label_column], frame[value_column], yerr=errors, capsize=4,
+             color=list(colors) if colors is not None else
+             ["tab:red" if value > 0 else "tab:blue" for value in frame[value_column]])
+    axes.axhline(0, color="black", linewidth=0.8)
+    if legend:
+        axes.legend(handles=[Patch(facecolor=colour, label=text)
+                             for colour, text in legend.items()])
+
+    axes.set_ylabel(ylabel or value_column)
+    if title:
+        axes.set_title(title)
+    axes.tick_params(axis="x", rotation=45)
+    figure.tight_layout()
+    return figure
+
+# Gas constant in the units GROMACS reports energies in.
+BOLTZMANN_CONSTANT_KJ_PER_MOL_K: float = 0.008314462618
+
+def compute_free_energy_landscape(x_values: Any, y_values: Any, bin_count: int = 100,
+                                  temperature: float = 300.0) -> tuple[Any, Any, Any, Any]:
+    """Turn a 2D sample into a Gibbs free energy surface.
+
+    G = -kT ln(P / P_max), so the most populated bin sits at exactly 0 and every
+    other bin is positive: a depth below the deepest well, which is what a free
+    energy landscape is read as. Bins nothing ever visited are NaN rather than
+    +inf, because matplotlib leaves NaN blank but +inf would flatten the colour
+    scale onto a single level.
+
+    Returns (x_centres, y_centres, probability, free_energy), the two grids
+    indexed [x, y] as numpy.histogram2d returns them.
+    """
+    counts, x_edges, y_edges = np.histogram2d(np.asarray(x_values, dtype=float),
+                                              np.asarray(y_values, dtype=float),
+                                              bins=int(bin_count))
+    if counts.sum() == 0:
+        raise ValueError("The projection contains no points to build a landscape from.")
+
+    probability = counts / counts.sum()
+    free_energy = np.full(probability.shape, np.nan)
+    populated = probability > 0
+    free_energy[populated] = (-BOLTZMANN_CONSTANT_KJ_PER_MOL_K * float(temperature)
+                              * np.log(probability[populated] / probability.max()))
+
+    x_centres = (x_edges[:-1] + x_edges[1:]) / 2
+    y_centres = (y_edges[:-1] + y_edges[1:]) / 2
+
+    return x_centres, y_centres, probability, free_energy
+
+def make_landscape_figure(x_centres: Any, y_centres: Any, free_energy: Any,
+                          xlabel: str = "", ylabel: str = "", title: str = "",
+                          levels: int = 30) -> Any:
+    """Filled contour plot of a free energy surface, with its minimum marked."""
+    from matplotlib.figure import Figure
+
+    figure = Figure(figsize=(8, 6))
+    axes = figure.subplots()
+    # histogram2d indexes [x, y] but contourf reads [row, column] as [y, x], so the
+    # grid is transposed here. Without this the landscape is silently mirrored
+    # about the diagonal and still looks entirely plausible.
+    contours = axes.contourf(x_centres, y_centres, free_energy.T, levels=levels, cmap="viridis")
+    figure.colorbar(contours, ax=axes, label="ΔG (kJ/mol)")
+
+    deepest = np.unravel_index(np.nanargmin(free_energy), free_energy.shape)
+    axes.plot(x_centres[deepest[0]], y_centres[deepest[1]], "wx", markersize=12,
+              markeredgewidth=2, label="Minimum")
+    axes.legend(loc="upper right")
+
+    axes.set_xlabel(xlabel)
+    axes.set_ylabel(ylabel)
+    if title:
+        axes.set_title(title)
+    figure.tight_layout()
+    return figure
+
+def make_scree_figure(frame: pd.DataFrame, count: int = 20, title: str = "") -> Any:
+    """Eigenvalue bars with the cumulative share of the variance over them."""
+    from matplotlib.figure import Figure
+
+    indices = frame.iloc[:count, 0].to_numpy()
+    eigenvalues = frame.iloc[:count, 1].to_numpy()
+    cumulative = np.cumsum(eigenvalues) / frame.iloc[:, 1].to_numpy().sum() * 100
+
+    figure = Figure(figsize=(8, 6))
+    axes = figure.subplots()
+    axes.bar(indices, eigenvalues, color="tab:blue", label="Eigenvalue")
+    axes.set_xlabel(frame.columns[0])
+    axes.set_ylabel(f"Eigenvalue {frame.columns[1]}")
+
+    share = axes.twinx()
+    share.plot(indices, cumulative, color="tab:red", marker="o", label="Cumulative variance")
+    share.set_ylabel("Cumulative variance (%)")
+    share.set_ylim(0, 100)
+
+    if title:
+        axes.set_title(title)
+    figure.tight_layout()
+    return figure
+
+def make_scatter_figure(frame: pd.DataFrame, xlabel: str = "", ylabel: str = "",
+                        title: str = "", colour_label: str = "Frame") -> Any:
+    """Scatter of the first two columns, coloured by row order."""
+    from matplotlib.figure import Figure
+
+    figure = Figure(figsize=(8, 6))
+    axes = figure.subplots()
+    points = axes.scatter(frame.iloc[:, 0], frame.iloc[:, 1],
+                          c=np.arange(len(frame)), cmap="viridis", s=12)
+    figure.colorbar(points, ax=axes, label=colour_label)
+
+    axes.set_xlabel(xlabel or frame.columns[0])
+    axes.set_ylabel(ylabel or frame.columns[1])
+    if title:
+        axes.set_title(title)
+    figure.tight_layout()
+    return figure
 
 def read_gromacs_structure_file(filename: str) -> tuple[str, int, list[str], str]:
     """Split a GRO file into its title, atom count, atom lines and box line."""

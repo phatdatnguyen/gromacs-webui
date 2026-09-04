@@ -13,7 +13,7 @@ import pandas as pd
 import gradio as gr
 import nglview
 import MDAnalysis as mda
-from MDAnalysis.analysis import rms
+from MDAnalysis.analysis import distances, rms
 import matplotlib.pyplot as plt
 from utils import *
 from collections.abc import Sequence
@@ -29,14 +29,19 @@ def get_working_directories() -> list[str]:
     os.makedirs(base_path, exist_ok=True)
     return sorted((d for d in os.listdir(base_path) if os.path.isdir(os.path.join(base_path, d))), key=str.lower)
 
+# gmx_MMPBSA runs in the job directory, because a topology's #include lines only
+# resolve beside it, and leaves dozens of these behind. They are working files,
+# not results, so they are hidden the same way GROMACS backups are.
+MMPBSA_SCRATCH_PREFIX: str = "_GMXMMPBSA_"
+
 def get_files_in_working_directory(working_directory_path: str | None) -> list[str]:
-    """Visible files in a job directory, hiding GROMACS backups and Zone.Identifier files.
+    """Visible files in a job directory, hiding backups and tool scratch files.
 
     Sorted by name: os.listdir() order is arbitrary, and every file dropdown in
     the UI is filtered straight out of this list."""
     if working_directory_path is None or not os.path.isdir(working_directory_path):
         return []
-    files = [f for f in os.listdir(working_directory_path) if not (f.startswith('#') or f.endswith("Zone.Identifier") or os.path.isdir(os.path.join(working_directory_path, f)))]
+    files = [f for f in os.listdir(working_directory_path) if not (f.startswith('#') or f.startswith(MMPBSA_SCRATCH_PREFIX) or f.endswith("Zone.Identifier") or os.path.isdir(os.path.join(working_directory_path, f)))]
     return sorted(files, key=str.lower)
 
 def get_default_cpu_count() -> int:
@@ -104,8 +109,10 @@ def on_file_list_change(working_directory_path: str, protein_structure_file_name
             file_type = "Trajectory File"
         elif f.endswith('.cpt'):
             file_type = "Checkpoint File"
-        elif f.endswith('.csv'):
+        elif f.endswith('.csv') or f.endswith('.xvg'):
             file_type = "Data File"
+        elif f.endswith('.ndx'):
+            file_type = "Index File"
         else:
             file_type = "Other File"
         modified_time = time.ctime(os.path.getmtime(file_path))
@@ -122,6 +129,9 @@ def on_file_list_change(working_directory_path: str, protein_structure_file_name
     trajectory_files = [f for f in files if f.endswith('.xtc')]
     # NGL and MDAnalysis both read .trr, so the viewer accepts it as well.
     viewer_trajectory_files = [f for f in files if f.endswith('.xtc') or f.endswith('.trr')]
+    # gmx_MMPBSA writes its report as .dat, and a job can hold several from
+    # different runs, so the results panel picks one rather than being told a name.
+    results_files = [f for f in files if f.endswith('.dat')]
 
     # Update protein topology input file name dropdown
     if protein_structure_file_name in structure_files:
@@ -339,6 +349,12 @@ def on_file_list_change(working_directory_path: str, protein_structure_file_name
     else:
         analysis_input_traj_file_name_value = trajectory_files[0] if trajectory_files else None
 
+    # Update MM-PBSA results file dropdown, preferring the name gmx_MMPBSA uses.
+    if MMPBSA_RESULTS_FILE_NAME in results_files:
+        mmpbsa_results_file_name_value = MMPBSA_RESULTS_FILE_NAME
+    else:
+        mmpbsa_results_file_name_value = results_files[0] if results_files else None
+
     return file_df, \
         gr.update(choices=structure_files, value=protein_topology_input_file_name_value), \
         gr.update(choices=structure_files, value=ligand_topology_input_file_name_value), \
@@ -377,7 +393,10 @@ def on_file_list_change(working_directory_path: str, protein_structure_file_name
         gr.update(choices=structure_files, value=analysis_structure_file_name_value), \
         gr.update(choices=trajectory_files, value=analysis_input_traj_file_name_value), \
         gr.update(choices=structure_files, value=analysis_structure_file_name_value), \
-        gr.update(choices=viewer_trajectory_files, value=analysis_input_traj_file_name_value)
+        gr.update(choices=viewer_trajectory_files, value=analysis_input_traj_file_name_value), \
+        gr.update(choices=run_input_files, value=fix_traj_run_input_file_name_value), \
+        gr.update(choices=topology_files, value=prod_md_input_topology_file_name_value), \
+        gr.update(choices=results_files, value=mmpbsa_results_file_name_value)
 
 def on_select_file(evt: gr.SelectData) -> tuple[Any, ...]:
     """Route the clicked file row to the structure or text viewer state."""
@@ -538,8 +557,15 @@ def on_upload_protein_structure_file(working_directory_path: str, protein_struct
         return get_files_in_working_directory(working_directory_path), "<span style='color:red;'>" + status + "</span>"
 
 def on_upload_ligand_structure_file(working_directory_path: str, ligand_structure_file_name: str,
+                                    ligand_residue_name: str,
                                     ligand_structure_file_path: str) -> tuple[list[str], str]:
-    """Copy an uploaded ligand structure into the job directory as residue LIG."""
+    """Copy an uploaded ligand structure into the job directory as residue LIG.
+
+    ``ligand_residue_name`` is what the ligand is called in the file being
+    uploaded. It only needs changing when the file holds more than the ligand:
+    if the name is absent from the file, every atom in it is treated as ligand,
+    which is the usual case and covers files whose residue field is empty.
+    """
     # Upload and rename the file
     save_file_path = os.path.join(working_directory_path, ligand_structure_file_name)
     try:
@@ -548,14 +574,20 @@ def on_upload_ligand_structure_file(working_directory_path: str, ligand_structur
 
         shutil.copy2(ligand_structure_file_path, save_file_path)
 
-        # Files in the wild name the molecule UNK, MOL or a component id, but
-        # the trajectory analysis below selects the ligand as "resname LIG".
-        replaced = rename_pdb_residues(save_file_path, LIGAND_RESNAME)
+        # Files in the wild name the molecule UNK, MOL, a component id, or leave
+        # the field empty, but the analysis selects the ligand as "resname LIG".
+        present = read_pdb_residue_names(save_file_path)
+        replaced = rename_pdb_residues(save_file_path, LIGAND_RESNAME, ligand_residue_name)
 
         status = "File uploaded successfully."
         if replaced:
             status += (f" Residue name {', '.join(replaced)} renamed to "
                        f"{LIGAND_RESNAME} so the ligand stays selectable in the analysis.")
+        elif present == [LIGAND_RESNAME]:
+            status += f" The ligand is already residue {LIGAND_RESNAME}."
+        else:
+            status += (f" Nothing was renamed: this file contains "
+                       f"{', '.join(present) or 'no atoms'}.")
         return get_files_in_working_directory(working_directory_path), "<span style='color:green;'>" + status + "</span>"
     except Exception as exc:
         status = "Error uploading file!\n" + str(exc)
@@ -813,12 +845,11 @@ def _find_sol_group(genion_cmd: Sequence[str], working_directory_path: str) -> s
             except OSError:
                 pass
 
-    for line in stderr_probe.splitlines():
-        m = re.search(r'Group\s+(\d+)\s+\(\s*SOL\s*\)', line)
-        if m:
-            return m.group(1)
+    sol_group = find_gmx_group_number(stderr_probe, "SOL")
+    if sol_group is None:
+        raise Exception(f"Could not find SOL group in genion output:\n{stderr_probe}")
 
-    raise Exception(f"Could not find SOL group in genion output:\n{stderr_probe}")
+    return sol_group
 
 def on_add_ions(working_directory_path: str, run_input_file_name: str, output_file_name: str,
                 input_topology_file_name: str, output_topology_file_name: str, cation_name: str,
@@ -1453,83 +1484,729 @@ def on_fit_backbone(working_directory_path: str, run_input_file_name: str, input
         
     return get_files_in_working_directory(working_directory_path), "<span style='color:green;'>" + status + "</span>"
 
-def on_analyze_md_traj(working_directory_path: str, structure_file_name: str,
-                       input_traj_file_name: str) -> tuple[pd.DataFrame, plt.Figure, pd.DataFrame,
-                                                           plt.Figure, pd.DataFrame, plt.Figure]:
-    """Compute RMSD, protein-ligand COM distance and C-alpha RMSF for the trajectory."""
-    u = mda.Universe(os.path.join(working_directory_path, structure_file_name), os.path.join(working_directory_path, input_traj_file_name))
-    protein_selector = u.select_atoms("protein")
-    ligand_selector = u.select_atoms("resname LIG")
-    
-    # Calculate protein RMSD
-    protein_rmsd = rms.RMSD(
-        u,
-        select="protein and backbone",
-        groupselections=["protein"],
-        ref_frame=0
-    ).run()
-    protein_rmsd_values = protein_rmsd.results.rmsd[:,2]
+def _require_ligand(universe):
+    """The ligand selection every complex analysis depends on.
 
-    # Calculate ligand RMSD
-    ligand_rmsd = rms.RMSD(
-        u,
-        select="resname LIG",
-        groupselections=["resname LIG"],
-        ref_frame=0,
-        rmsd_kwargs={"center": True, "superposition": True}
-    ).run()
-    ligand_rmsd_values = ligand_rmsd.results.rmsd[:,2]
+    Uploads are normalised to LIG (see on_upload_ligand_structure_file), so an
+    empty selection here means the structure came from somewhere else. Say that,
+    rather than letting MDAnalysis raise about an empty AtomGroup.
+    """
+    ligand_selector = universe.select_atoms(f"resname {LIGAND_RESNAME}")
+    if ligand_selector.n_atoms == 0:
+        raise Exception(f"No residue named {LIGAND_RESNAME} in this structure, so the "
+                        f"ligand cannot be located. Uploading the ligand through this "
+                        f"tab renames it to {LIGAND_RESNAME} automatically.")
 
-    time_ns = protein_rmsd.results.rmsd[:,1] / 1000
-    rmsd_df = pd.DataFrame({"Time (ns)": time_ns, "Protein RMSD (Å)": protein_rmsd_values, "Ligand RMSD (Å)": ligand_rmsd_values})
-    
-    # Plot RMSD
-    rmsd_fig = plt.figure(figsize=(8, 6))
-    plt.plot(time_ns, protein_rmsd_values, label="Protein")
-    plt.plot(time_ns, ligand_rmsd_values, label="Ligand")
-    plt.xlabel("Time (ns)")
-    plt.ylabel("RMSD (Å)")
-    plt.legend()
-    plt.title("RMSD vs Time")
-    plt.tight_layout()
-    
-    # Calculate protein–ligand center of mass distance
-    com_dist = []
-    for _ in u.trajectory:
-        d = np.linalg.norm(
-            protein_selector.center_of_mass() - ligand_selector.center_of_mass()
-        )
-        com_dist.append(d)
-    
-    com_dist_df = pd.DataFrame({"Time (ns)": time_ns, "Center of mass distance (Å)": com_dist})
-    
-    com_dist_fig = plt.figure(figsize=(8, 6))
-    plt.plot(time_ns, com_dist)
-    plt.xlabel("Time (ns)")
-    plt.ylabel("Center of mass distance (Å)")
+    return ligand_selector
 
-    # Calculate mean Cα RMSF
-    ca_selector = u.select_atoms("protein and name CA")
-    RMSF_ca = rms.RMSF(ca_selector).run()
-    ca_rmsf = RMSF_ca.results.rmsf
+def on_analyze_rmsd(working_directory_path: str, structure_file_name: str,
+                    input_traj_file_name: str) -> tuple[Any, ...]:
+    """Backbone RMSD of the protein and of the ligand against the first frame.
 
-    mean_ca_rmsf = ca_rmsf.mean()
-    cd_rmsf_df = pd.DataFrame({"Residue Index": ca_selector.resids, "Cα RMSF (Å)": ca_rmsf})
+    Both series stay on one plot: they are two readings of the same measurement
+    and are compared against each other.
+    """
+    try:
+        universe = mda.Universe(os.path.join(working_directory_path, structure_file_name),
+                                os.path.join(working_directory_path, input_traj_file_name))
+        _require_ligand(universe)
 
-    ca_rmsf_fig = plt.figure(figsize=(8, 6))
-    plt.plot(ca_selector.residues.resids, ca_rmsf, label="Cα RMSF")
-    plt.axhline(mean_ca_rmsf, color="red", linestyle="--", label="Mean Cα RMSF")
+        protein_rmsd = rms.RMSD(
+            universe,
+            select="protein and backbone",
+            groupselections=["protein"],
+            ref_frame=0
+        ).run()
 
-    plt.xlabel("Residue ID")
-    plt.ylabel("RMSF (Å)")
-    plt.title("Cα RMSF per Residue")
-    plt.legend()
-    plt.tight_layout()
+        ligand_rmsd = rms.RMSD(
+            universe,
+            select=f"resname {LIGAND_RESNAME}",
+            groupselections=[f"resname {LIGAND_RESNAME}"],
+            ref_frame=0,
+            rmsd_kwargs={"center": True, "superposition": True}
+        ).run()
 
-    return rmsd_df, rmsd_fig, com_dist_df, com_dist_fig, cd_rmsf_df, ca_rmsf_fig
+        frame = pd.DataFrame({"Time (ns)": protein_rmsd.results.rmsd[:, 1] / 1000,
+                              "Protein RMSD (Å)": protein_rmsd.results.rmsd[:, 2],
+                              "Ligand RMSD (Å)": ligand_rmsd.results.rmsd[:, 2]})
+        figure = make_line_figure(frame, "Time (ns)", ylabel="RMSD (Å)", title="RMSD vs Time")
+        status = "RMSD calculated successfully."
+    except Exception as exc:
+        status = "Error calculating RMSD!\n" + str(exc)
+        return None, None, "<span style='color:red;'>" + status + "</span>"
+
+    return frame, figure, "<span style='color:green;'>" + status + "</span>"
+
+def on_analyze_min_distance(working_directory_path: str, structure_file_name: str,
+                            input_traj_file_name: str) -> tuple[Any, ...]:
+    """Closest approach between any protein atom and any ligand atom, per frame.
+
+    Complements the centre of mass distance: two molecules in contact can still
+    have their centres far apart, so this is what tells you whether the ligand is
+    actually touching the protein rather than merely near it.
+    """
+    try:
+        universe = mda.Universe(os.path.join(working_directory_path, structure_file_name),
+                                os.path.join(working_directory_path, input_traj_file_name))
+        protein_selector = universe.select_atoms("protein")
+        if protein_selector.n_atoms == 0:
+            raise Exception("No protein atoms found. Is this a protein-ligand complex?")
+        ligand_selector = _require_ligand(universe)
+
+        times_ns = []
+        minimum_distances = []
+        for timestep in universe.trajectory:
+            # The box is passed so a ligand that has wrapped around the periodic
+            # boundary still measures as close as it physically is. A structure
+            # without box information gives None, which distance_array accepts.
+            pairwise = distances.distance_array(protein_selector.positions,
+                                                ligand_selector.positions,
+                                                box=universe.dimensions)
+            times_ns.append(timestep.time / 1000)
+            minimum_distances.append(float(pairwise.min()))
+
+        frame = pd.DataFrame({"Time (ns)": times_ns,
+                              "Minimum distance (Å)": minimum_distances})
+        figure = make_line_figure(frame, "Time (ns)", ylabel="Minimum distance (Å)",
+                                  title="Protein-ligand minimum distance", mean_line=True)
+        status = "Minimum distance calculated successfully."
+    except Exception as exc:
+        status = "Error calculating minimum distance!\n" + str(exc)
+        return None, None, "<span style='color:red;'>" + status + "</span>"
+
+    return frame, figure, "<span style='color:green;'>" + status + "</span>"
+
+def on_analyze_com_distance(working_directory_path: str, structure_file_name: str,
+                            input_traj_file_name: str) -> tuple[Any, ...]:
+    """Distance between the protein and ligand centres of mass, frame by frame."""
+    try:
+        universe = mda.Universe(os.path.join(working_directory_path, structure_file_name),
+                                os.path.join(working_directory_path, input_traj_file_name))
+        protein_selector = universe.select_atoms("protein")
+        ligand_selector = _require_ligand(universe)
+
+        # The time axis is built here rather than borrowed from an RMSD result, so
+        # this analysis stands on its own now that it has its own button.
+        times_ns = []
+        distances = []
+        for timestep in universe.trajectory:
+            times_ns.append(timestep.time / 1000)
+            distances.append(float(np.linalg.norm(
+                protein_selector.center_of_mass() - ligand_selector.center_of_mass())))
+
+        frame = pd.DataFrame({"Time (ns)": times_ns,
+                              "Center of mass distance (Å)": distances})
+        figure = make_line_figure(frame, "Time (ns)", ylabel="Center of mass distance (Å)",
+                                  title="Protein-ligand centre of mass distance")
+        status = "Center of mass distance calculated successfully."
+    except Exception as exc:
+        status = "Error calculating center of mass distance!\n" + str(exc)
+        return None, None, "<span style='color:red;'>" + status + "</span>"
+
+    return frame, figure, "<span style='color:green;'>" + status + "</span>"
+
+def on_analyze_rmsf(working_directory_path: str, structure_file_name: str,
+                    input_traj_file_name: str) -> tuple[Any, ...]:
+    """Per-residue fluctuation of the C-alpha atoms over the whole trajectory."""
+    try:
+        universe = mda.Universe(os.path.join(working_directory_path, structure_file_name),
+                                os.path.join(working_directory_path, input_traj_file_name))
+        ca_selector = universe.select_atoms("protein and name CA")
+        if ca_selector.n_atoms == 0:
+            raise Exception("No C-alpha atoms found. Is this a protein structure?")
+
+        ca_rmsf = rms.RMSF(ca_selector).run().results.rmsf
+
+        frame = pd.DataFrame({"Residue Index": ca_selector.resids, "Cα RMSF (Å)": ca_rmsf})
+        figure = make_line_figure(frame, "Residue Index", ylabel="RMSF (Å)",
+                                  title="Cα RMSF per Residue", mean_line=True)
+        status = "RMSF calculated successfully."
+    except Exception as exc:
+        status = "Error calculating RMSF!\n" + str(exc)
+        return None, None, "<span style='color:red;'>" + status + "</span>"
+
+    return frame, figure, "<span style='color:green;'>" + status + "</span>"
+
+def _selection_error(exc: Exception, run_input_file_name: str,
+                     working_directory_path: str) -> str:
+    """A gmx failure message, with the structure's own residue groups appended
+    when the cause was a selection that matched nothing."""
+    message = str(exc)
+    if "never matches any atoms" not in message and "Invalid selection" not in message:
+        return message
+
+    hint = describe_selection_candidates(run_input_file_name, working_directory_path)
+    return f"{message}\n\n{hint}" if hint else message
+
+def on_analyze_sasa(working_directory_path: str, run_input_file_name: str,
+                    input_traj_file_name: str, surface_selection: str, output_selection: str,
+                    probe_radius: float, sasa_file_name: str,
+                    sasa_residue_file_name: str) -> Any:
+    """Solvent accessible surface area over time, and averaged per residue.
+
+    A generator, so the command being run reaches the status markdown before it
+    blocks rather than only afterwards: gmx sasa over a long trajectory can take
+    minutes, and an unchanging page looks like nothing happened.
+
+    stdin is closed for every gmx analysis here. These tools fall back to an
+    interactive group prompt when a selection option is missing, and with a
+    blocking stdin that wedges the worker thread indefinitely (measured: no
+    -surface plus a live stdin hangs forever, stdin closed fails in a second).
+    """
+    cmd = [
+        "gmx", "sasa",
+        "-s", run_input_file_name,
+        "-f", input_traj_file_name,
+        "-o", sasa_file_name,
+        "-or", sasa_residue_file_name,
+        "-surface", surface_selection,
+        "-probe", str(probe_radius),
+        "-tu", "ns"
+    ]
+    if output_selection and output_selection.strip():
+        cmd.extend(["-output", output_selection])
+
+    print(f"Running command (in {working_directory_path}): {' '.join(cmd)}")
+    yield get_files_in_working_directory(working_directory_path), None, None, None, None, \
+        format_running_status(cmd)
+
+    try:
+        run_checked_command(cmd, cwd=working_directory_path, stdin_input="")
+
+        area = read_xvg(os.path.join(working_directory_path, sasa_file_name))
+        # The x column name comes from the file: -tu rewrites the axis label, so
+        # hardcoding "Time (ns)" would break the moment the unit changes.
+        area_figure = make_line_figure(area["frame"], ylabel=area["ylabel"],
+                                       title=area["title"] or "Solvent accessible surface area")
+
+        residue = read_xvg(os.path.join(working_directory_path, sasa_residue_file_name))
+        # gmx writes an average and a standard deviation per output group; plot the
+        # average of the surface group and leave the rest to the exported table.
+        residue_figure = make_line_figure(residue["frame"],
+                                          y_columns=[residue["frame"].columns[1]],
+                                          ylabel=residue["ylabel"],
+                                          title=residue["title"] or "Area per residue")
+
+        status = "SASA calculated successfully."
+    except Exception as exc:
+        status = "Error calculating SASA!\n" + _selection_error(
+            exc, run_input_file_name, working_directory_path)
+        yield get_files_in_working_directory(working_directory_path), None, None, None, None, \
+            "<span style='color:red;'>" + status + "</span>"
+        return
+
+    yield get_files_in_working_directory(working_directory_path), area["frame"], area_figure, \
+        residue["frame"], residue_figure, "<span style='color:green;'>" + status + "</span>"
+
+def on_analyze_gyrate(working_directory_path: str, run_input_file_name: str,
+                      input_traj_file_name: str, gyrate_selection: str, weighting_mode: str,
+                      gyrate_file_name: str) -> Any:
+    """Radius of gyration over time, total and about each axis."""
+    cmd = [
+        "gmx", "gyrate",
+        "-s", run_input_file_name,
+        "-f", input_traj_file_name,
+        "-o", gyrate_file_name,
+        "-sel", gyrate_selection,
+        "-mode", weighting_mode,
+        "-tu", "ns"
+    ]
+
+    print(f"Running command (in {working_directory_path}): {' '.join(cmd)}")
+    yield get_files_in_working_directory(working_directory_path), None, None, \
+        format_running_status(cmd)
+
+    try:
+        run_checked_command(cmd, cwd=working_directory_path, stdin_input="")
+
+        gyration = read_xvg(os.path.join(working_directory_path, gyrate_file_name))
+        figure = make_line_figure(gyration["frame"], ylabel=gyration["ylabel"],
+                                  title=gyration["title"] or "Radius of gyration")
+
+        status = "Radius of gyration calculated successfully."
+    except Exception as exc:
+        status = "Error calculating radius of gyration!\n" + _selection_error(
+            exc, run_input_file_name, working_directory_path)
+        yield get_files_in_working_directory(working_directory_path), None, None, \
+            "<span style='color:red;'>" + status + "</span>"
+        return
+
+    yield get_files_in_working_directory(working_directory_path), gyration["frame"], figure, \
+        "<span style='color:green;'>" + status + "</span>"
+
+def on_run_pca(working_directory_path: str, run_input_file_name: str, input_traj_file_name: str,
+               pca_selection: str, first_eigenvector: int, second_eigenvector: int,
+               pca_index_file_name: str, pca_eigenvector_file_name: str,
+               pca_eigenvalue_file_name: str,
+               pca_projection_file_name: str) -> Any:
+    """Principal component analysis of the trajectory, via gmx covar and anaeig.
+
+    A generator: three commands run back to back and covar is the slow one, so
+    each is announced in the status markdown before it blocks.
+
+    covar and anaeig are legacy tools that ask which group to fit and which to
+    analyse. Rather than answering with a group number - which shifts with the
+    force field and the contents of the system - a one-group index file is built
+    first with gmx select, which leaves them nothing to ask about. Using the same
+    index for both guarantees the fit and analysis groups match, which is what
+    PCA wants, and that anaeig sees the same atom count the eigenvectors were
+    built from.
+    """
+    files = get_files_in_working_directory(working_directory_path)
+    try:
+        select_cmd = [
+            "gmx", "select",
+            "-s", run_input_file_name,
+            "-select", pca_selection,
+            "-on", pca_index_file_name
+        ]
+        print(f"Running command (in {working_directory_path}): {' '.join(select_cmd)}")
+        yield files, None, None, None, None, format_running_status(select_cmd, "Step 1 of 3")
+        run_checked_command(select_cmd, cwd=working_directory_path, stdin_input="")
+
+        covar_cmd = [
+            "gmx", "covar",
+            "-s", run_input_file_name,
+            "-f", input_traj_file_name,
+            "-n", pca_index_file_name,
+            "-o", pca_eigenvalue_file_name,
+            "-v", pca_eigenvector_file_name,
+            "-av", "pca_average.pdb",
+            "-l", "pca_covar.log",
+            "-xvg", "xmgrace"
+        ]
+        print(f"Running command (in {working_directory_path}): {' '.join(covar_cmd)}")
+        yield files, None, None, None, None, format_running_status(covar_cmd, "Step 2 of 3")
+        run_checked_command(covar_cmd, cwd=working_directory_path, stdin_input="")
+
+        first = int(first_eigenvector)
+        second = int(second_eigenvector)
+        if second <= first:
+            raise Exception("The second eigenvector must be higher than the first.")
+
+        anaeig_cmd = [
+            "gmx", "anaeig",
+            "-s", run_input_file_name,
+            "-f", input_traj_file_name,
+            "-n", pca_index_file_name,
+            "-v", pca_eigenvector_file_name,
+            "-eig", pca_eigenvalue_file_name,
+            "-first", str(first),
+            "-last", str(second),
+            "-2d", pca_projection_file_name,
+            "-xvg", "xmgrace"
+        ]
+        print(f"Running command (in {working_directory_path}): {' '.join(anaeig_cmd)}")
+        yield files, None, None, None, None, format_running_status(anaeig_cmd, "Step 3 of 3")
+        run_checked_command(anaeig_cmd, cwd=working_directory_path, stdin_input="")
+
+        eigenvalues = read_xvg(os.path.join(working_directory_path, pca_eigenvalue_file_name))
+        eigenvalue_figure = make_scree_figure(eigenvalues["frame"],
+                                              title="Eigenvalues and cumulative variance")
+
+        projection = read_xvg(os.path.join(working_directory_path, pca_projection_file_name))
+        projection_figure = make_scatter_figure(
+            projection["frame"], xlabel=projection["xlabel"], ylabel=projection["ylabel"],
+            title=f"Projection on eigenvectors {first} and {second}")
+
+        status = "PCA completed successfully."
+    except Exception as exc:
+        status = "Error running PCA!\n" + _selection_error(
+            exc, run_input_file_name, working_directory_path)
+        yield get_files_in_working_directory(working_directory_path), None, None, None, None, \
+            "<span style='color:red;'>" + status + "</span>"
+        return
+
+    yield get_files_in_working_directory(working_directory_path), eigenvalues["frame"], \
+        eigenvalue_figure, projection["frame"], projection_figure, \
+        "<span style='color:green;'>" + status + "</span>"
+
+def on_analyze_free_energy_landscape(working_directory_path: str, projection_file_name: str,
+                                     temperature: float,
+                                     bin_count: int) -> tuple[Any, ...]:
+    """Gibbs free energy landscape over the two principal components.
+
+    Reads the projection back off disk rather than taking it through gr.State, so
+    the landscape can be recomputed at a different temperature or resolution
+    without rerunning the PCA, and survives a page reload.
+    """
+    try:
+        projection_file_path = os.path.join(working_directory_path, projection_file_name)
+        if not os.path.exists(projection_file_path):
+            raise Exception(f"{projection_file_name} was not found. Run the PCA first.")
+
+        projection = read_xvg(projection_file_path)
+        if len(projection["frame"].columns) < 2:
+            raise Exception(f"{projection_file_name} has only one column, so it holds no "
+                            f"2D projection. Rerun the PCA to write it.")
+
+        first_component = projection["frame"].iloc[:, 0]
+        second_component = projection["frame"].iloc[:, 1]
+        x_centres, y_centres, probability, free_energy = compute_free_energy_landscape(
+            first_component, second_component, bin_count=int(bin_count),
+            temperature=float(temperature))
+
+        figure = make_landscape_figure(x_centres, y_centres, free_energy,
+                                       xlabel=projection["xlabel"] or "PC1",
+                                       ylabel=projection["ylabel"] or "PC2",
+                                       title=f"Free energy landscape at {float(temperature):g} K")
+
+        # Long form, one row per bin, so the surface exports as a plain table.
+        x_grid, y_grid = np.meshgrid(x_centres, y_centres, indexing="ij")
+        frame = pd.DataFrame({
+            projection["xlabel"] or "PC1": x_grid.ravel(),
+            projection["ylabel"] or "PC2": y_grid.ravel(),
+            "Probability": probability.ravel(),
+            "ΔG (kJ/mol)": free_energy.ravel(),
+        })
+
+        status = "Free energy landscape calculated successfully."
+    except Exception as exc:
+        status = "Error calculating free energy landscape!\n" + str(exc)
+        return None, None, "<span style='color:red;'>" + status + "</span>"
+
+    return frame, figure, "<span style='color:green;'>" + status + "</span>"
+
+MMPBSA_SUBDIRECTORY: str = "mmpbsa"
+MMPBSA_RESULTS_FILE_NAME: str = "FINAL_RESULTS_MMPBSA.dat"
+MMPBSA_LOG_FILE_NAME: str = "mmpbsa_run.log"
+# -eo gives every energy term per frame, which is what the binding energy
+# histogram is built from; -do and -deo are the per-residue decomposition.
+MMPBSA_PER_FRAME_FILE_NAME: str = "FINAL_RESULTS_MMPBSA.csv"
+MMPBSA_DECOMP_FILE_NAME: str = "FINAL_DECOMP_MMPBSA.dat"
+MMPBSA_DECOMP_PER_FRAME_FILE_NAME: str = "FINAL_DECOMP_MMPBSA.csv"
+# How many residues the contribution chart shows; the exported table keeps all.
+MMPBSA_DECOMPOSITION_RESIDUES_SHOWN: int = 15
+
+def _whole_number(value: Any, label: str, minimum: int = 0) -> int:
+    """Read a frame number out of a textbox, or say which box is wrong.
+
+    The frame range is typed rather than dragged, because a production
+    trajectory holds more frames than any slider range would guess.
+    """
+    try:
+        number = int(str(value).strip())
+    except (TypeError, ValueError):
+        raise Exception(f"{label} must be a whole number, not '{value}'.") from None
+
+    if number < minimum:
+        raise Exception(f"{label} must be {minimum} or greater.")
+
+    return number
+
+def on_generate_mmpbsa_input_file(working_directory_path: str, mmpbsa_input_file_name: str,
+                                  start_frame: str, end_frame: str, interval: int,
+                                  salt_concentration: float, temperature: float,
+                                  methods: Sequence[str], use_decomposition: bool,
+                                  decomposition_scheme: int,
+                                  print_residues: str) -> tuple[list[str], str]:
+    """Write the &general/&gb/&pb/&decomp namelists gmx_MMPBSA reads."""
+    try:
+        first = _whole_number(start_frame, "Start Frame", minimum=1)
+        last = _whole_number(end_frame, "End Frame", minimum=0)
+        if last and last < first:
+            raise Exception(f"End Frame ({last}) is before Start Frame ({first}). "
+                            f"Use 0 to run to the end of the trajectory.")
+
+        file_content = get_default_mmpbsa_input_file_content(
+            start_frame=first, end_frame=last, interval=interval,
+            salt_concentration=salt_concentration, temperature=temperature,
+            use_gb="MM-GBSA" in methods, use_pb="MM-PBSA" in methods,
+            use_decomposition=bool(use_decomposition),
+            decomposition_scheme=decomposition_scheme,
+            print_residues=print_residues)
+
+        with open(os.path.join(working_directory_path, mmpbsa_input_file_name), "w") as file:
+            file.write(file_content)
+        status = "MM-PBSA input file generated successfully."
+    except Exception as exc:
+        status = "Error generating MM-PBSA input file!\n" + str(exc)
+        return get_files_in_working_directory(working_directory_path), "<span style='color:red;'>" + status + "</span>"
+
+    return get_files_in_working_directory(working_directory_path), "<span style='color:green;'>" + status + "</span>"
+
+def _build_mmpbsa_index(working_directory_path: str, run_input_file_name: str,
+                        receptor_selection: str, ligand_selection: str,
+                        mmpbsa_index_file_name: str) -> None:
+    """Write a two-group index: receptor first, ligand second.
+
+    gmx select writes the groups in the order they are given, so -cg 0 1 always
+    means receptor then ligand and no group number has to be guessed. Both are
+    checked here because an empty ligand group only surfaces as a gmx_MMPBSA
+    failure much later, after the expensive part has already run.
+    """
+    # One -select holding both selections separated by ";". Passing -select twice
+    # is rejected outright ("Option specified multiple times"); the semicolon form
+    # writes one group per selection, in the order given, so the receptor is
+    # always group 0 and the ligand group 1.
+    cmd = [
+        "gmx", "select",
+        "-s", run_input_file_name,
+        "-select", f"{receptor_selection}; {ligand_selection}",
+        "-on", mmpbsa_index_file_name
+    ]
+    print(f"Running command (in {working_directory_path}): {' '.join(cmd)}")
+    run_checked_command(cmd, cwd=working_directory_path, stdin_input="")
+
+    with open(os.path.join(working_directory_path, mmpbsa_index_file_name)) as handle:
+        index_content = handle.read()
+
+    groups = [block for block in index_content.split("[") if block.strip()]
+    if len(groups) != 2:
+        raise Exception(f"Expected a receptor group and a ligand group in "
+                        f"{mmpbsa_index_file_name}, found {len(groups)}.")
+    for name, block in zip((receptor_selection, ligand_selection), groups):
+        if not block.split("]", 1)[1].split():
+            raise Exception(f"The selection '{name}' matched no atoms.")
+
+def on_run_mmpbsa(working_directory_path: str, run_input_file_name: str,
+                  input_traj_file_name: str, input_topology_file_name: str,
+                  mmpbsa_input_file_name: str, mmpbsa_index_file_name: str,
+                  receptor_selection: str, ligand_selection: str, mmpbsa_processes: int,
+                  process_state: ProcessStateDict) -> tuple[Any, ...]:
+    """Start an MM-PBSA/MM-GBSA run, or stop the one already in progress.
+
+    gmx_MMPBSA is run as an external command rather than imported: it pins older
+    numpy, pandas and AmberTools than this application uses, so it lives in its
+    own environment and the two dependency sets never meet.
+    """
+    # ---------- STOP ----------
+    with process_state["lock"]:
+        was_running = process_state["running"]
+        proc = process_state["proc"] if was_running else None
+        process_state["proc"] = None
+        process_state["running"] = False
+
+    if was_running:
+        # Outside the lock: waiting on the shutdown must not block the timer that
+        # polls this state.
+        stop_process_gracefully(proc)
+
+        status = "MM-PBSA stopped by user."
+
+        return get_files_in_working_directory(working_directory_path), f"<span style='color:red;'>{status}</span>", process_state, gr.update(value="Start", variant="primary")
+
+    # ---------- START ----------
+    try:
+        executable = get_gmx_mmpbsa_executable()
+        if executable is None:
+            # "or" guards the case where the two helpers disagree: raising
+            # Exception(None) would show the user the word "None".
+            raise Exception(get_gmx_mmpbsa_unavailable_reason()
+                            or "gmx_MMPBSA was not found. See the Readme for how to install it.")
+
+        _build_mmpbsa_index(working_directory_path, run_input_file_name, receptor_selection,
+                            ligand_selection, mmpbsa_index_file_name)
+
+        # gmx_MMPBSA scatters dozens of _GMXMMPBSA_* scratch files, so it runs in a
+        # subdirectory. The file listing skips directories, so they stay out of the
+        # file table; only the results are copied back out.
+        # Run in the job directory itself, not a scratch subdirectory. A topology
+        # is not self-contained: it #includes ligand_GMX.itp, posre.itp and
+        # whatever else sits beside it, resolved relative to the working
+        # directory. Copying the named inputs somewhere else leaves those behind
+        # and the run dies in the preprocessor. The scratch files gmx_MMPBSA
+        # leaves are hidden from the file listing instead.
+        cmd = [
+            executable, "-O", "-nogui",
+            "-i", mmpbsa_input_file_name,
+            "-cs", run_input_file_name,
+            "-ct", input_traj_file_name,
+            "-ci", mmpbsa_index_file_name,
+            "-cg", "0", "1",
+            "-cp", input_topology_file_name,
+            "-o", MMPBSA_RESULTS_FILE_NAME,
+            "-eo", MMPBSA_PER_FRAME_FILE_NAME,
+            "-do", MMPBSA_DECOMP_FILE_NAME,
+            "-deo", MMPBSA_DECOMP_PER_FRAME_FILE_NAME
+        ]
+        if int(mmpbsa_processes) > 1:
+            cmd = [get_mpirun_beside(executable), "-np", str(int(mmpbsa_processes))] + cmd + ["MPI"]
+
+        print(f"Running command (in {working_directory_path}): {' '.join(cmd)}")
+
+        # Everything the run prints goes to a log in the job directory, so a
+        # failure can be read in the text viewer instead of only in the terminal
+        # the server happens to be attached to. The handle is closed straight
+        # away; the child keeps its own descriptor.
+        log_file_path = os.path.join(working_directory_path, MMPBSA_LOG_FILE_NAME)
+        with open(log_file_path, "w") as log_file:
+            # stdin is closed: gmx_MMPBSA prompts before overwriting in some paths,
+            # and an inherited stdin would wait on an answer nobody sees.
+            proc = subprocess.Popen(cmd, cwd=working_directory_path, text=True,
+                                    stdin=subprocess.DEVNULL, stdout=log_file,
+                                    stderr=subprocess.STDOUT,
+                                    env=get_gmx_mmpbsa_environment(executable))
+
+        with process_state["lock"]:
+            process_state["proc"] = proc
+            process_state["running"] = True
+
+        threading.Thread(
+            target=watch_process,
+            args=(proc, process_state),
+            daemon=True
+        ).start()
+
+        status = (f"MM-PBSA started. This can take a long time; load the results when "
+                  f"the button returns to Start. Progress and any error are written to "
+                  f"{MMPBSA_LOG_FILE_NAME}, which opens in the text viewer.")
+
+        return get_files_in_working_directory(working_directory_path), f"<span style='color:orange;'>{status}</span>", process_state, gr.update(value="Stop", variant="stop")
+
+    except Exception as exc:
+        with process_state["lock"]:
+            process_state["proc"] = None
+            process_state["running"] = False
+
+        status = "Error starting MM-PBSA:<br>" + _selection_error(
+            exc, run_input_file_name, working_directory_path).replace("\n", "<br>")
+
+        return get_files_in_working_directory(working_directory_path), f"<span style='color:red;'>{status}</span>", process_state, gr.update(value="Start", variant="primary")
+
+def on_load_mmpbsa_results(working_directory_path: str, mmpbsa_results_file_name: str,
+                           structure_file_name: str, input_traj_file_name: str,
+                           mmpbsa_input_file_name: str) -> tuple[Any, ...]:
+    """Read the finished run's energy decomposition into a table and a bar chart.
+
+    Separate from the run button because the run is asynchronous: nothing can be
+    returned at the moment it is launched.
+    """
+    try:
+        results_file_path = os.path.join(working_directory_path, mmpbsa_results_file_name)
+        if not os.path.exists(results_file_path):
+            # Runs started before the move out of the scratch subdirectory left
+            # their results there, so those stay readable.
+            legacy_path = os.path.join(working_directory_path, MMPBSA_SUBDIRECTORY,
+                                       mmpbsa_results_file_name)
+            if os.path.exists(legacy_path):
+                results_file_path = legacy_path
+            else:
+                raise Exception(f"{mmpbsa_results_file_name} was not found. Has the run "
+                                f"finished? {MMPBSA_LOG_FILE_NAME} shows how far it got.")
+
+        frame = parse_mmpbsa_results(results_file_path)
+        # Error bars use the plain per-frame SD rather than SD(Prop.): the
+        # propagated one describes the components, not the spread of the delta.
+        figure = make_bar_figure(frame, "Term", "Average (kcal/mol)", "SD",
+                                 ylabel="ΔG (kcal/mol)", title="MM-PBSA energy decomposition")
+
+        # Copy the results out of the scratch directory so they show in the file
+        # table and can be opened in the text viewer.
+        if os.path.dirname(results_file_path) != os.path.abspath(working_directory_path):
+            shutil.copy2(results_file_path,
+                         os.path.join(working_directory_path, mmpbsa_results_file_name))
+
+        results_directory_path = os.path.dirname(results_file_path)
+        # The per-frame and per-residue files sit beside the summary and are only
+        # written when the run asked for them, so each is optional.
+        histogram_figure, missing = _load_binding_energy_histogram(results_directory_path)
+        series_figure, series_note = _load_binding_energy_series(
+            results_directory_path, working_directory_path, structure_file_name,
+            input_traj_file_name, mmpbsa_input_file_name)
+        decomposition, decomposition_figure, decomposition_missing = \
+            _load_residue_decomposition(results_directory_path)
+
+        status = "MM-PBSA results loaded successfully."
+        for note in (missing, series_note, decomposition_missing):
+            if note:
+                status += " " + note
+    except Exception as exc:
+        status = "Error loading MM-PBSA results!\n" + str(exc)
+        return get_files_in_working_directory(working_directory_path), None, None, None, \
+            None, None, None, "<span style='color:red;'>" + status + "</span>"
+
+    return get_files_in_working_directory(working_directory_path), frame, figure, \
+        series_figure, histogram_figure, decomposition, decomposition_figure, \
+        "<span style='color:green;'>" + status + "</span>"
+
+def _load_binding_energy_histogram(results_directory_path: str) -> tuple[Any, str]:
+    """The spread of the binding energy over the frames, if -eo was written."""
+    per_frame_path = os.path.join(results_directory_path, MMPBSA_PER_FRAME_FILE_NAME)
+    if not os.path.exists(per_frame_path):
+        return None, (f"No {MMPBSA_PER_FRAME_FILE_NAME}, so there is no per-frame "
+                      f"distribution to plot.")
+
+    per_frame = parse_mmpbsa_per_frame(per_frame_path)
+    figure = make_histogram_figure(per_frame["TOTAL"], bins=30,
+                                   xlabel="ΔG binding (kcal/mol)",
+                                   title=f"Binding energy over {len(per_frame)} frames")
+    return figure, ""
+
+def _load_residue_decomposition(results_directory_path: str) -> tuple[Any, Any, str]:
+    """Per-residue contributions, if the run enabled decomposition."""
+    decomposition_path = os.path.join(results_directory_path,
+                                      MMPBSA_DECOMP_PER_FRAME_FILE_NAME)
+    if not os.path.exists(decomposition_path):
+        return None, None, (f"No {MMPBSA_DECOMP_PER_FRAME_FILE_NAME}: tick "
+                            f"'Per-residue decomposition' before running to get "
+                            f"residue contributions.")
+
+    decomposition = parse_mmpbsa_decomposition(decomposition_path)
+    # Only the residues that matter: a long tail of near-zero contributions
+    # would leave the significant ones unreadable.
+    strongest = decomposition.reindex(
+        decomposition["TOTAL"].abs().sort_values(ascending=False).index
+    ).head(MMPBSA_DECOMPOSITION_RESIDUES_SHOWN).sort_values("TOTAL")
+    colours, legend = mmpbsa_residue_colours(strongest["Residue"])
+    figure = make_bar_figure(strongest, "Residue", "TOTAL", "TOTAL SD",
+                             ylabel="ΔG contribution (kcal/mol)",
+                             title=f"Strongest {len(strongest)} residue contributions",
+                             colors=colours, legend=legend)
+    return decomposition, figure, ""
+
+def _load_binding_energy_series(results_directory_path: str, working_directory_path: str,
+                                structure_file_name: str, input_traj_file_name: str,
+                                mmpbsa_input_file_name: str) -> tuple[Any, str]:
+    """Binding energy against simulation time, if the per-frame file was written.
+
+    gmx_MMPBSA numbers its frames 1..N over the ones it selected, so the x axis
+    is recovered from the trajectory using the startframe and interval the run
+    asked for. Falls back to the frame number when the trajectory cannot be
+    read, since a plot against frame number still beats no plot.
+    """
+    per_frame_path = os.path.join(results_directory_path, MMPBSA_PER_FRAME_FILE_NAME)
+    if not os.path.exists(per_frame_path):
+        return None, ""
+
+    per_frame = parse_mmpbsa_per_frame(per_frame_path)
+    note = ""
+    times_ns: list[float] = []
+    input_file_path = os.path.join(working_directory_path, mmpbsa_input_file_name)
+    try:
+        start_frame, interval = read_mmpbsa_frame_selection(input_file_path)
+        times_ns = get_trajectory_frame_times_ns(
+            os.path.join(working_directory_path, structure_file_name),
+            os.path.join(working_directory_path, input_traj_file_name),
+            start_frame, interval, len(per_frame))
+    except Exception as exc:
+        note = (f"Binding energy is plotted against frame number: the times could "
+                f"not be read from {input_traj_file_name} ({exc}).")
+
+    if len(times_ns) == len(per_frame):
+        frame = pd.DataFrame({"Time (ns)": times_ns,
+                              "ΔG binding (kcal/mol)": per_frame["TOTAL"].to_numpy()})
+        x_column = "Time (ns)"
+    else:
+        if not note:
+            note = (f"Binding energy is plotted against frame number: the trajectory "
+                    f"holds fewer frames than the run used.")
+        frame = pd.DataFrame({"Frame": per_frame["Frame #"].to_numpy(),
+                              "ΔG binding (kcal/mol)": per_frame["TOTAL"].to_numpy()})
+        x_column = "Frame"
+
+    figure = make_line_figure(frame, x_column, ylabel="ΔG binding (kcal/mol)",
+                              title="Binding energy over the trajectory", mean_line=True)
+    return figure, note
 
 def on_export_df(working_directory_path: str, df: pd.DataFrame, file_name: str) -> tuple[list[str], str]:
     """Write an analysis table to CSV inside the job directory."""
+    if df is None:
+        # One export button per analysis now, so exporting before running the
+        # matching analysis is an easy mistake to make.
+        return get_files_in_working_directory(working_directory_path), \
+            "<span style='color:red;'>Run the analysis before exporting its results.</span>"
+
     try:
         df.to_csv(os.path.join(working_directory_path, file_name), index=False)
         status = f"File exported: {file_name}"
@@ -1593,6 +2270,7 @@ def protein_ligand_complex_md_simulation_tab_content() -> None:
                         with gr.Accordion(label="Upload Ligand Structure", open=True):
                             with gr.Row():
                                 ligand_structure_file_name_textbox = gr.Textbox(label="Ligand File Name", value="ligand.pdb")
+                                ligand_residue_name_textbox = gr.Textbox(label="Ligand Residue Name (in the uploaded file)", value=LIGAND_RESNAME)
                                 ligand_structure_file = gr.File(label="Upload Ligand Structure File", file_types=['.pdb'], interactive=False)
                 with gr.Row():
                     with gr.Column(scale=1):
@@ -1869,32 +2547,163 @@ def protein_ligand_complex_md_simulation_tab_content() -> None:
                                 fit_backbone_output_traj_file_name_textbox = gr.Textbox(label="Output Trajectory File Name", value="md_fit.xtc")
                                 fit_backbone_button = gr.Button("Run")
                 with gr.Accordion(label="MD Trajectory Analysis", open=False):
+                    # Shared inputs on the left, one collapsible block per analysis on
+                    # the right: the same shape as Fix MD Trajectory above, which is
+                    # what lets this hold many analyses without squeezing them.
                     with gr.Row():
-                        analysis_structure_file_name_dropdown = gr.Dropdown(label="Input Trajectory File Name", choices=[], value=None)
-                        analysis_input_traj_file_name_dropdown = gr.Dropdown(label="Input Trajectory File Name", choices=[], value=None)
-                        analyze_button = gr.Button("Analyze")
-                    with gr.Row():
-                        with gr.Column():
-                            gr.Markdown("***Protein RMSD***")
-                            rmsd_df_state = gr.State()
-                            rmsd_plot = gr.Plot()
-                            with gr.Row():
-                                rmsd_file_name_texbox = gr.Textbox(label="RMSD File Name", value="RMSD.csv")
-                                rmsd_export_button = gr.Button("Export RMSD (.csv)")
-                        with gr.Column():
-                            gr.Markdown("***Center of mass distance***")
-                            com_dist_df_state = gr.State()
-                            com_dist_plot = gr.Plot()
-                            with gr.Row():
-                                com_dist_file_name_texbox = gr.Textbox(label="COM Distance File Name", value="COM_distance.csv")
-                                com_dist_export_button = gr.Button("Export COM Distance (.csv)")
-                        with gr.Column():
-                            gr.Markdown("***Cα RMSF***")
-                            ca_rmsf_df_state = gr.State()
-                            ca_rmsf_plot = gr.Plot()
-                            with gr.Row():
-                                ca_rmsf_file_name_texbox = gr.Textbox(label="Cα RMSF File Name", value="C_alpha_RMSF.csv")
-                                ca_rmsf_export_button = gr.Button("Export Cα RMSF (.csv)")
+                        with gr.Column(scale=1):
+                            analysis_structure_file_name_dropdown = gr.Dropdown(label="Structure File Name", choices=[], value=None)
+                            analysis_input_traj_file_name_dropdown = gr.Dropdown(label="Input Trajectory File Name", choices=[], value=None)
+                            analysis_run_input_file_name_dropdown = gr.Dropdown(label="Run Input File Name (.tpr)", choices=[], value=None)
+                        with gr.Column(scale=3):
+                            with gr.Accordion(label="RMSD (protein and ligand)", open=True):
+                                with gr.Row():
+                                    rmsd_analyze_button = gr.Button("Run", variant="primary")
+                                rmsd_df_state = gr.State()
+                                rmsd_plot = gr.Plot()
+                                with gr.Row():
+                                    rmsd_file_name_texbox = gr.Textbox(label="RMSD File Name", value="RMSD.csv")
+                                    rmsd_export_button = gr.Button("Export RMSD (.csv)")
+                            with gr.Accordion(label="Minimum distance", open=False):
+                                with gr.Row():
+                                    min_dist_analyze_button = gr.Button("Run", variant="primary")
+                                min_dist_df_state = gr.State()
+                                min_dist_plot = gr.Plot()
+                                with gr.Row():
+                                    min_dist_file_name_texbox = gr.Textbox(label="Minimum Distance File Name", value="Minimum_distance.csv")
+                                    min_dist_export_button = gr.Button("Export minimum distance (.csv)")
+                            with gr.Accordion(label="Center of mass distance", open=False):
+                                with gr.Row():
+                                    com_dist_analyze_button = gr.Button("Run", variant="primary")
+                                com_dist_df_state = gr.State()
+                                com_dist_plot = gr.Plot()
+                                with gr.Row():
+                                    com_dist_file_name_texbox = gr.Textbox(label="COM Distance File Name", value="COM_distance.csv")
+                                    com_dist_export_button = gr.Button("Export COM Distance (.csv)")
+                            with gr.Accordion(label="Cα RMSF", open=False):
+                                with gr.Row():
+                                    ca_rmsf_analyze_button = gr.Button("Run", variant="primary")
+                                ca_rmsf_df_state = gr.State()
+                                ca_rmsf_plot = gr.Plot()
+                                with gr.Row():
+                                    ca_rmsf_file_name_texbox = gr.Textbox(label="Cα RMSF File Name", value="C_alpha_RMSF.csv")
+                                    ca_rmsf_export_button = gr.Button("Export Cα RMSF (.csv)")
+                            with gr.Accordion(label="Solvent Accessible Surface Area", open=False):
+                                with gr.Row():
+                                    sasa_surface_selection_textbox = gr.Textbox(label="Surface Selection", value=f"group Protein or resname {LIGAND_RESNAME}", info="A bare word is read as an index group whose name can span several words, so combine with the explicit form: group Protein or resname LIG")
+                                    sasa_output_selection_textbox = gr.Textbox(label="Output Selection (optional)", value=f"resname {LIGAND_RESNAME}")
+                                    sasa_probe_radius_slider = gr.Slider(label="Probe Radius (nm)", minimum=0.05, maximum=0.30, value=0.14, step=0.01)
+                                with gr.Row():
+                                    sasa_output_file_name_textbox = gr.Textbox(label="Area File Name", value="sasa.xvg")
+                                    sasa_residue_output_file_name_textbox = gr.Textbox(label="Per-residue File Name", value="sasa_residue.xvg")
+                                    sasa_analyze_button = gr.Button("Run", variant="primary")
+                                with gr.Row():
+                                    with gr.Column():
+                                        sasa_df_state = gr.State()
+                                        sasa_plot = gr.Plot()
+                                        with gr.Row():
+                                            sasa_file_name_texbox = gr.Textbox(label="SASA File Name", value="SASA.csv")
+                                            sasa_export_button = gr.Button("Export SASA (.csv)")
+                                    with gr.Column():
+                                        sasa_residue_df_state = gr.State()
+                                        sasa_residue_plot = gr.Plot()
+                                        with gr.Row():
+                                            sasa_residue_file_name_texbox = gr.Textbox(label="Per-residue File Name", value="SASA_per_residue.csv")
+                                            sasa_residue_export_button = gr.Button("Export per-residue (.csv)")
+                            with gr.Accordion(label="Radius of Gyration", open=False):
+                                with gr.Row():
+                                    gyrate_selection_textbox = gr.Textbox(label="Selection", value="group Protein", info="A bare word is read as an index group whose name can span several words, so combine with the explicit form: group Protein or resname LIG")
+                                    gyrate_mode_dropdown = gr.Dropdown(label="Weighting", choices=["mass", "charge", "geometry"], value="mass")
+                                    gyrate_output_file_name_textbox = gr.Textbox(label="Output File Name", value="gyrate.xvg")
+                                    gyrate_analyze_button = gr.Button("Run", variant="primary")
+                                gyrate_df_state = gr.State()
+                                gyrate_plot = gr.Plot()
+                                with gr.Row():
+                                    gyrate_file_name_texbox = gr.Textbox(label="Gyration File Name", value="Radius_of_gyration.csv")
+                                    gyrate_export_button = gr.Button("Export gyration (.csv)")
+                            with gr.Accordion(label="Principal Component Analysis", open=False):
+                                with gr.Row():
+                                    pca_selection_textbox = gr.Textbox(label="Selection", value="group Backbone", info="A bare word is read as an index group whose name can span several words, so combine with the explicit form: group Protein or resname LIG")
+                                    pca_first_eigenvector_slider = gr.Slider(label="First Eigenvector", minimum=1, maximum=10, value=1, step=1)
+                                    pca_second_eigenvector_slider = gr.Slider(label="Second Eigenvector", minimum=2, maximum=20, value=2, step=1)
+                                    pca_analyze_button = gr.Button("Run", variant="primary")
+                                with gr.Row():
+                                    pca_index_file_name_textbox = gr.Textbox(label="Index File Name", value="pca_index.ndx")
+                                    pca_eigenvector_file_name_textbox = gr.Textbox(label="Eigenvector File Name", value="pca_eigenvec.trr")
+                                    pca_eigenvalue_file_name_textbox = gr.Textbox(label="Eigenvalue File Name", value="pca_eigenval.xvg")
+                                    pca_projection_file_name_textbox = gr.Textbox(label="Projection File Name", value="pca_2dproj.xvg")
+                                with gr.Row():
+                                    with gr.Column():
+                                        pca_eigenvalue_df_state = gr.State()
+                                        pca_eigenvalue_plot = gr.Plot()
+                                        with gr.Row():
+                                            pca_eigenvalue_file_name_texbox = gr.Textbox(label="Eigenvalue File Name", value="PCA_eigenvalues.csv")
+                                            pca_eigenvalue_export_button = gr.Button("Export eigenvalues (.csv)")
+                                    with gr.Column():
+                                        pca_projection_df_state = gr.State()
+                                        pca_projection_plot = gr.Plot()
+                                        with gr.Row():
+                                            pca_projection_file_name_texbox = gr.Textbox(label="Projection File Name", value="PCA_projection.csv")
+                                            pca_projection_export_button = gr.Button("Export projection (.csv)")
+                            with gr.Accordion(label="Gibbs Free Energy Landscape", open=False):
+                                with gr.Row():
+                                    fel_projection_file_name_textbox = gr.Textbox(label="Projection File Name", value="pca_2dproj.xvg")
+                                    fel_temperature_slider = gr.Slider(label="Temperature (K)", minimum=100, maximum=500, value=300, step=1)
+                                    fel_bin_count_slider = gr.Slider(label="Bins", minimum=20, maximum=200, value=100, step=10)
+                                    fel_analyze_button = gr.Button("Run", variant="primary")
+                                fel_df_state = gr.State()
+                                fel_plot = gr.Plot()
+                                with gr.Row():
+                                    fel_file_name_texbox = gr.Textbox(label="Landscape File Name", value="Free_energy_landscape.csv")
+                                    fel_export_button = gr.Button("Export landscape (.csv)")
+                            with gr.Accordion(label="MM-PBSA / MM-GBSA Binding Energy", open=False):
+                                mmpbsa_availability_markdown = gr.Markdown(get_gmx_mmpbsa_unavailable_reason() or "")
+                                with gr.Row():
+                                    mmpbsa_receptor_selection_textbox = gr.Textbox(label="Receptor Selection", value="group Protein", info="A bare word is read as an index group whose name can span several words, so combine with the explicit form: group Protein or resname LIG")
+                                    mmpbsa_ligand_selection_textbox = gr.Textbox(label="Ligand Selection", value=f"resname {LIGAND_RESNAME}")
+                                    mmpbsa_input_topology_file_name_dropdown = gr.Dropdown(label="Input Topology File Name", choices=[], value=None)
+                                with gr.Row():
+                                    mmpbsa_method_checkboxgroup = gr.CheckboxGroup(label="Method", choices=["MM-GBSA", "MM-PBSA"], value=["MM-GBSA"])
+                                    mmpbsa_start_frame_textbox = gr.Textbox(label="Start Frame", value="1")
+                                    mmpbsa_end_frame_textbox = gr.Textbox(label="End Frame (0 = last)", value="0")
+                                    mmpbsa_interval_slider = gr.Slider(label="Interval (use every Nth frame)", minimum=1, maximum=200, value=100, step=1)
+                                with gr.Row():
+                                    mmpbsa_temperature_slider = gr.Slider(label="Temperature (K)", minimum=100, maximum=500, value=300, step=1)
+                                    mmpbsa_salt_concentration_slider = gr.Slider(label="Salt Concentration (M)", minimum=0.0, maximum=1.0, value=0.15, step=0.01)
+                                    mmpbsa_input_file_name_textbox = gr.Textbox(label="Input File Name", value="mmpbsa.in")
+                                with gr.Row():
+                                    mmpbsa_decomposition_checkbox = gr.Checkbox(label="Per-residue decomposition", value=True)
+                                    mmpbsa_decomposition_scheme_dropdown = gr.Dropdown(label="Decomposition Scheme", choices=list(MMPBSA_DECOMPOSITION_SCHEMES), value=2)
+                                    mmpbsa_print_residues_textbox = gr.Textbox(label="Residues to Report", value="within 6", info="A gmx_MMPBSA residue selection, e.g. 'within 6' for everything within 6 A of the ligand")
+                                    mmpbsa_input_file_button = gr.Button("Generate input file")
+                                with gr.Row():
+                                    mmpbsa_index_file_name_textbox = gr.Textbox(label="Index File Name", value="mmpbsa_index.ndx")
+                                    mmpbsa_processes_slider = gr.Slider(label="MPI Processes", minimum=1, maximum=get_default_cpu_count(), value=1, step=1)
+                                    mmpbsa_process_state = gr.State(ProcessStateDict())
+                                    run_mmpbsa_button = gr.Button("Start", variant="primary")
+                                    mmpbsa_timer = gr.Timer(1.0)
+                                with gr.Row():
+                                    mmpbsa_results_file_name_dropdown = gr.Dropdown(label="Results File Name", choices=[], value=None)
+                                    mmpbsa_load_button = gr.Button("Load results")
+                                # The energy decomposition takes the whole width; the
+                                # two per-frame views share the row beneath it.
+                                mmpbsa_df_state = gr.State()
+                                mmpbsa_plot = gr.Plot()
+                                with gr.Row():
+                                    mmpbsa_file_name_texbox = gr.Textbox(label="Binding Energy File Name", value="MMPBSA_binding_energy.csv")
+                                    mmpbsa_export_button = gr.Button("Export binding energy (.csv)")
+                                with gr.Row():
+                                    # Left: how the binding energy moves through the
+                                    # run. Right: the same numbers as a distribution,
+                                    # where a wide or bimodal shape says the mean is
+                                    # not the whole story.
+                                    mmpbsa_time_series_plot = gr.Plot()
+                                    mmpbsa_histogram_plot = gr.Plot()
+                                mmpbsa_decomposition_df_state = gr.State()
+                                mmpbsa_decomposition_plot = gr.Plot()
+                                with gr.Row():
+                                    mmpbsa_decomposition_file_name_texbox = gr.Textbox(label="Residue Contribution File Name", value="MMPBSA_residue_contribution.csv")
+                                    mmpbsa_decomposition_export_button = gr.Button("Export residue contribution (.csv)")
 
     # Working directory interactions
     working_directory_dropdown.change(on_open_working_directory, working_directory_dropdown, [working_directory_dropdown, working_directory_path_state, working_directory_file_list_state, clean_working_directory_button, protein_structure_file, ligand_structure_file])
@@ -1919,7 +2728,9 @@ def protein_ligand_complex_md_simulation_tab_content() -> None:
                                               prod_md_input_file_name_dropdown, prod_md_input_topology_file_name_dropdown, prod_md_parameter_file_dropdown, prod_md_run_input_file_dropdown, checkpoint_file_dropdown,
                                               fix_traj_run_input_file_name_dropdown, make_mol_whole_input_traj_file_name_dropdown, center_protein_input_traj_file_name_dropdown, fit_backbone_input_traj_file_name_dropdown,
                                               analysis_structure_file_name_dropdown, analysis_input_traj_file_name_dropdown,
-                                              trajectory_viewer_structure_file_dropdown, trajectory_viewer_trajectory_file_dropdown])
+                                              trajectory_viewer_structure_file_dropdown, trajectory_viewer_trajectory_file_dropdown,
+                                              analysis_run_input_file_name_dropdown, mmpbsa_input_topology_file_name_dropdown,
+                                              mmpbsa_results_file_name_dropdown])
     working_directory_file_dataframe.select(on_select_file, [], [selected_file_state, selected_structure_file_state, selected_text_file_state, delete_file_button])
     selected_structure_file_state.change(on_selected_structure_file_state_change, selected_structure_file_state, [view_structure_button, structure_viewer_accordion])
     selected_text_file_state.change(on_selected_text_file_state_change, selected_text_file_state, [view_text_file_button, text_file_viewer_accordion])
@@ -1932,7 +2743,7 @@ def protein_ligand_complex_md_simulation_tab_content() -> None:
 
     # Protein and ligand structure file upload interaction
     protein_structure_file.upload(on_upload_protein_structure_file, [working_directory_path_state, protein_structure_file_name_textbox, protein_structure_file], [working_directory_file_list_state, status_markdown])
-    ligand_structure_file.upload(on_upload_ligand_structure_file, [working_directory_path_state, ligand_structure_file_name_textbox, ligand_structure_file], [working_directory_file_list_state, status_markdown])
+    ligand_structure_file.upload(on_upload_ligand_structure_file, [working_directory_path_state, ligand_structure_file_name_textbox, ligand_residue_name_textbox, ligand_structure_file], [working_directory_file_list_state, status_markdown])
     
     # Generate protein and ligand topology interaction
     generate_protein_topology_button.click(on_generate_protein_topology, [working_directory_path_state, protein_topology_input_file_name_dropdown, protein_topology_output_file_name_textbox, protein_topology_output_topology_file_name_textbox, protein_force_field_dropdown, water_model_dropdown, n_terminus_dropdown, c_terminus_dropdown], [working_directory_file_list_state, status_markdown])
@@ -1987,9 +2798,29 @@ def protein_ligand_complex_md_simulation_tab_content() -> None:
     fit_backbone_button.click(on_fit_backbone, [working_directory_path_state, fix_traj_run_input_file_name_dropdown, fit_backbone_input_traj_file_name_dropdown, fit_backbone_output_traj_file_name_textbox], [working_directory_file_list_state, status_markdown])
 
     # Analysis
-    analyze_button.click(on_analyze_md_traj, [working_directory_path_state, analysis_structure_file_name_dropdown, analysis_input_traj_file_name_dropdown], [rmsd_df_state, rmsd_plot, com_dist_df_state, com_dist_plot, ca_rmsf_df_state, ca_rmsf_plot])
+    rmsd_analyze_button.click(on_analyze_rmsd, [working_directory_path_state, analysis_structure_file_name_dropdown, analysis_input_traj_file_name_dropdown], [rmsd_df_state, rmsd_plot, status_markdown])
+    min_dist_analyze_button.click(on_analyze_min_distance, [working_directory_path_state, analysis_structure_file_name_dropdown, analysis_input_traj_file_name_dropdown], [min_dist_df_state, min_dist_plot, status_markdown])
+    com_dist_analyze_button.click(on_analyze_com_distance, [working_directory_path_state, analysis_structure_file_name_dropdown, analysis_input_traj_file_name_dropdown], [com_dist_df_state, com_dist_plot, status_markdown])
+    ca_rmsf_analyze_button.click(on_analyze_rmsf, [working_directory_path_state, analysis_structure_file_name_dropdown, analysis_input_traj_file_name_dropdown], [ca_rmsf_df_state, ca_rmsf_plot, status_markdown])
+    sasa_analyze_button.click(on_analyze_sasa, [working_directory_path_state, analysis_run_input_file_name_dropdown, analysis_input_traj_file_name_dropdown, sasa_surface_selection_textbox, sasa_output_selection_textbox, sasa_probe_radius_slider, sasa_output_file_name_textbox, sasa_residue_output_file_name_textbox], [working_directory_file_list_state, sasa_df_state, sasa_plot, sasa_residue_df_state, sasa_residue_plot, status_markdown])
+    mmpbsa_input_file_button.click(on_generate_mmpbsa_input_file, [working_directory_path_state, mmpbsa_input_file_name_textbox, mmpbsa_start_frame_textbox, mmpbsa_end_frame_textbox, mmpbsa_interval_slider, mmpbsa_salt_concentration_slider, mmpbsa_temperature_slider, mmpbsa_method_checkboxgroup, mmpbsa_decomposition_checkbox, mmpbsa_decomposition_scheme_dropdown, mmpbsa_print_residues_textbox], [working_directory_file_list_state, status_markdown])
+    run_mmpbsa_button.click(on_run_mmpbsa, [working_directory_path_state, analysis_run_input_file_name_dropdown, analysis_input_traj_file_name_dropdown, mmpbsa_input_topology_file_name_dropdown, mmpbsa_input_file_name_textbox, mmpbsa_index_file_name_textbox, mmpbsa_receptor_selection_textbox, mmpbsa_ligand_selection_textbox, mmpbsa_processes_slider, mmpbsa_process_state], [working_directory_file_list_state, status_markdown, mmpbsa_process_state, run_mmpbsa_button])
+    mmpbsa_timer.tick(sync_button_state, mmpbsa_process_state, run_mmpbsa_button)
+    mmpbsa_load_button.click(on_load_mmpbsa_results, [working_directory_path_state, mmpbsa_results_file_name_dropdown, analysis_structure_file_name_dropdown, analysis_input_traj_file_name_dropdown, mmpbsa_input_file_name_textbox], [working_directory_file_list_state, mmpbsa_df_state, mmpbsa_plot, mmpbsa_time_series_plot, mmpbsa_histogram_plot, mmpbsa_decomposition_df_state, mmpbsa_decomposition_plot, status_markdown])
+    pca_analyze_button.click(on_run_pca, [working_directory_path_state, analysis_run_input_file_name_dropdown, analysis_input_traj_file_name_dropdown, pca_selection_textbox, pca_first_eigenvector_slider, pca_second_eigenvector_slider, pca_index_file_name_textbox, pca_eigenvector_file_name_textbox, pca_eigenvalue_file_name_textbox, pca_projection_file_name_textbox], [working_directory_file_list_state, pca_eigenvalue_df_state, pca_eigenvalue_plot, pca_projection_df_state, pca_projection_plot, status_markdown])
+    fel_analyze_button.click(on_analyze_free_energy_landscape, [working_directory_path_state, fel_projection_file_name_textbox, fel_temperature_slider, fel_bin_count_slider], [fel_df_state, fel_plot, status_markdown])
+    gyrate_analyze_button.click(on_analyze_gyrate, [working_directory_path_state, analysis_run_input_file_name_dropdown, analysis_input_traj_file_name_dropdown, gyrate_selection_textbox, gyrate_mode_dropdown, gyrate_output_file_name_textbox], [working_directory_file_list_state, gyrate_df_state, gyrate_plot, status_markdown])
     rmsd_export_button.click(on_export_df, [working_directory_path_state, rmsd_df_state, rmsd_file_name_texbox], [working_directory_file_list_state, status_markdown])
     ca_rmsf_export_button.click(on_export_df, [working_directory_path_state, ca_rmsf_df_state, ca_rmsf_file_name_texbox], [working_directory_file_list_state, status_markdown])
+    sasa_export_button.click(on_export_df, [working_directory_path_state, sasa_df_state, sasa_file_name_texbox], [working_directory_file_list_state, status_markdown])
+    sasa_residue_export_button.click(on_export_df, [working_directory_path_state, sasa_residue_df_state, sasa_residue_file_name_texbox], [working_directory_file_list_state, status_markdown])
+    mmpbsa_export_button.click(on_export_df, [working_directory_path_state, mmpbsa_df_state, mmpbsa_file_name_texbox], [working_directory_file_list_state, status_markdown])
+    mmpbsa_decomposition_export_button.click(on_export_df, [working_directory_path_state, mmpbsa_decomposition_df_state, mmpbsa_decomposition_file_name_texbox], [working_directory_file_list_state, status_markdown])
+    pca_eigenvalue_export_button.click(on_export_df, [working_directory_path_state, pca_eigenvalue_df_state, pca_eigenvalue_file_name_texbox], [working_directory_file_list_state, status_markdown])
+    pca_projection_export_button.click(on_export_df, [working_directory_path_state, pca_projection_df_state, pca_projection_file_name_texbox], [working_directory_file_list_state, status_markdown])
+    fel_export_button.click(on_export_df, [working_directory_path_state, fel_df_state, fel_file_name_texbox], [working_directory_file_list_state, status_markdown])
+    gyrate_export_button.click(on_export_df, [working_directory_path_state, gyrate_df_state, gyrate_file_name_texbox], [working_directory_file_list_state, status_markdown])
+    min_dist_export_button.click(on_export_df, [working_directory_path_state, min_dist_df_state, min_dist_file_name_texbox], [working_directory_file_list_state, status_markdown])
     com_dist_export_button.click(on_export_df, [working_directory_path_state, com_dist_df_state, com_dist_file_name_texbox], [working_directory_file_list_state, status_markdown])
     
     return protein_ligand_complex_md_simulation_tab
