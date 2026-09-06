@@ -8,7 +8,9 @@ potential interface can call.
 import os
 import torch
 from torch import nn
-from typing import Optional
+from typing import Optional, Tuple
+
+from path_security import MODEL_ROOT
 
 def load_emle_model_classes() -> tuple[type, float, float]:
     """Import EMLE behind a TorchANI 2.8 shim and return its class and unit factors."""
@@ -67,15 +69,21 @@ class GmxANI1xModel(nn.Module):
         self.energy_conversion = 2625.5 # Hartree --> kJ/mol
 
     def forward(self, positions: torch.Tensor, atomic_numbers: torch.Tensor,
+                nnp_charge: torch.Tensor,
                 box: Optional[torch.Tensor] = None,
                 pbc: Optional[torch.Tensor] = None) -> torch.Tensor:
         """Return the potential energy in kJ/mol for GROMACS coordinates given in nm."""
+
+        if nnp_charge.numel() != 1:
+            raise RuntimeError("ANI-1x requires one total NNP-region charge")
+        if bool(torch.abs(nnp_charge.reshape(-1)[0]) > 1.0e-4):
+            raise RuntimeError("ANI-1x supports neutral NNP regions only")
 
         # Prepare the inputs for the model
         atomic_numbers = atomic_numbers.unsqueeze(0)
         positions = positions.unsqueeze(0) * self.length_conversion
         if box is not None:
-            box *= self.length_conversion
+            box = box * self.length_conversion
 
         # Forward pass
         result = self.model((atomic_numbers, positions), box, pbc)
@@ -103,15 +111,21 @@ class GmxANI2xModel(nn.Module):
         self.energy_conversion = 2625.5 # Hartree --> kJ/mol
 
     def forward(self, positions: torch.Tensor, atomic_numbers: torch.Tensor,
+                nnp_charge: torch.Tensor,
                 box: Optional[torch.Tensor] = None,
                 pbc: Optional[torch.Tensor] = None) -> torch.Tensor:
         """Return the potential energy in kJ/mol for GROMACS coordinates given in nm."""
+
+        if nnp_charge.numel() != 1:
+            raise RuntimeError("ANI-2x requires one total NNP-region charge")
+        if bool(torch.abs(nnp_charge.reshape(-1)[0]) > 1.0e-4):
+            raise RuntimeError("ANI-2x supports neutral NNP regions only")
 
         # Prepare the inputs for the model
         atomic_numbers = atomic_numbers.unsqueeze(0)
         positions = positions.unsqueeze(0) * self.length_conversion
         if box is not None:
-            box *= self.length_conversion
+            box = box * self.length_conversion
 
         # Forward pass
         result = self.model((atomic_numbers, positions), box, pbc)
@@ -126,10 +140,15 @@ class GmxMACEModel(torch.nn.Module):
         super().__init__()
         from mace.calculators import mace_off
 
-        assert size in ["small", "medium", "large"], "Invalid MACE model size"
+        if size not in ["small", "medium", "large"]:
+            raise ValueError("Invalid MACE model size")
         model = mace_off(size, device, return_raw_model=True).to(torch.float32)
         self.model = model
         self.z_table = model.atomic_numbers.tolist()
+        self.register_buffer(
+            "atomic_number_table",
+            torch.tensor(self.z_table, dtype=torch.int64, device=device),
+        )
         self.register_buffer("r_max", model.r_max)
         self.register_buffer("num_interactions", model.num_interactions)
         if not hasattr(model, "heads"):
@@ -146,59 +165,58 @@ class GmxMACEModel(torch.nn.Module):
         self.energy_conversion = 96.4853    # eV (mace) --> kJ/mol (gmx)
     
     def forward(self, positions: torch.Tensor, atomic_numbers: torch.Tensor,
+                nnp_charge: torch.Tensor, pairs: torch.Tensor, shifts: torch.Tensor,
                 cell: Optional[torch.Tensor] = None,
                 pbc: Optional[torch.Tensor] = None) -> torch.Tensor:
         """Return the potential energy in kJ/mol for GROMACS coordinates given in nm."""
-        
+
+        if nnp_charge.numel() != 1:
+            raise RuntimeError("MACE-OFF requires one total NNP-region charge")
+        if bool(torch.abs(nnp_charge.reshape(-1)[0]) > 1.0e-4):
+            raise RuntimeError("MACE-OFF supports neutral NNP regions only")
+
         # Prepare the model input
-        positions = positions * self.length_conversion
+        positions = positions.to(dtype=self.r_max.dtype) * self.length_conversion
         n_atoms = positions.shape[0]
         device = positions.device
         if cell is not None:
-            cell = cell * self.length_conversion
+            cell = cell.to(dtype=positions.dtype, device=device) * self.length_conversion
         else:
-            cell = torch.zeros(3, 3).to(device)
+            cell = torch.zeros(3, 3, dtype=positions.dtype, device=device)
 
-        # Build a directed neighbor list inside the scripted model. This follows
-        # the no-pairs wrapper style from gmx-nnpot-tools and avoids depending on
-        # GROMACS atom-pairs/pair-shifts inputs during grompp model checks.
-        atom_indices = torch.arange(n_atoms, dtype=torch.int64, device=device)
-        src_all = atom_indices.repeat_interleave(n_atoms)
-        dst_all = atom_indices.repeat(n_atoms)
-        non_self = src_all != dst_all
-        src_all = src_all[non_self]
-        dst_all = dst_all[non_self]
-
-        deltas = positions[src_all] - positions[dst_all]
-        use_pbc = False
-        if cell is not None:
-            use_pbc = bool(torch.abs(torch.linalg.det(cell)) > 1.0e-8)
-            if pbc is not None:
-                use_pbc = use_pbc and bool(torch.any(pbc))
-
-        if use_pbc:
-            shift_indices = torch.round(torch.mm(deltas, torch.linalg.inv(cell)))
-            shifts_all = torch.mm(shift_indices, cell)
-            wrapped_deltas = deltas - shifts_all
-        else:
-            shifts_all = torch.zeros((deltas.shape[0], 3), dtype=positions.dtype, device=device)
-            wrapped_deltas = deltas
-
-        within_cutoff = torch.linalg.norm(wrapped_deltas, dim=1) < self.r_max
-        pairs = torch.stack([src_all[within_cutoff], dst_all[within_cutoff]], dim=0)
-        shifts = shifts_all[within_cutoff]
+        # GROMACS already owns a scalable, PBC-aware neighbour list.  Consuming
+        # atom-pairs and pair-shifts here also handles triclinic/partial-PBC boxes
+        # and periodic images correctly; the former all-pairs/minimum-image code
+        # was both O(N^2) and physically incomplete.
+        if pairs.dim() != 2 or pairs.shape[1] != 2:
+            raise RuntimeError("MACE atom-pairs must have shape (N_pairs, 2)")
+        if shifts.dim() != 2 or shifts.shape[1] != 3 or shifts.shape[0] != pairs.shape[0]:
+            raise RuntimeError("MACE pair-shifts must have shape (N_pairs, 3)")
+        pairs = pairs.to(dtype=torch.int64, device=device)
+        if pairs.numel() > 0 and bool(torch.any((pairs < 0) | (pairs >= n_atoms))):
+            raise RuntimeError("MACE atom-pairs contain an out-of-range atom index")
+        reverse_pairs = pairs[:, [1, 0]]
+        pairs = torch.cat([pairs, reverse_pairs], dim=0).t()
+        shifts = shifts.to(dtype=positions.dtype, device=device)
+        shifts = torch.cat([-shifts, shifts], dim=0) * self.length_conversion
 
         # One hot encoding of atomic numbers
-        # no need to convert since gromacs and mace use the same atomic numbers
-        nodeAttrs = torch.zeros(n_atoms, len(self.z_table), device=device)
-        indices = torch.stack([torch.tensor(self.z_table.index(z)) for z in atomic_numbers])
-        nodeAttrs[torch.arange(n_atoms), indices] = 1.0
+        # (GROMACS and MACE use the same atomic-number convention).
+        atomic_numbers = atomic_numbers.to(dtype=torch.int64, device=device)
+        if atomic_numbers.numel() != n_atoms:
+            raise RuntimeError("MACE requires one atomic number per position")
+        matches = atomic_numbers.reshape(-1, 1) == self.atomic_number_table.reshape(1, -1)
+        if not bool(torch.all(torch.sum(matches, dim=1) == 1)):
+            raise RuntimeError("The selected MACE model does not support one or more elements")
+        nodeAttrs = matches.to(dtype=positions.dtype)
 
         # other inputs
         ptr = torch.tensor([0, n_atoms], dtype=torch.int64, requires_grad=False, device=device)
         batch = torch.zeros(n_atoms, dtype=torch.int64, device=device)
         if pbc is None:
-            pbc = torch.tensor([True, True, True], requires_grad=False, device=device)
+            pbc = torch.tensor([False, False, False], requires_grad=False, device=device)
+        else:
+            pbc = pbc.to(dtype=torch.bool, device=device)
         
         # Prepare the input dict
         input_data = {
@@ -230,22 +248,22 @@ class GmxMACEModel(torch.nn.Module):
 
 class GmxAIMNet2Model(torch.nn.Module):
     """AIMNet2 wrapped for GROMACS; traced rather than scripted."""
-    def __init__(self, device: str, charge: int = 0, mult: int = 1, **kwargs: object) -> None:
+    def __init__(self, device: str, mult: int = 1, **kwargs: object) -> None:
         super().__init__()
-        os.environ.setdefault("WARP_CACHE_PATH", os.path.abspath("./models/warp-cache"))
-        os.environ.setdefault("AIMNET_CACHE_DIR", os.path.abspath("./models/aimnet-cache"))
+        os.environ.setdefault("WARP_CACHE_PATH", str(MODEL_ROOT / "warp-cache"))
+        os.environ.setdefault("AIMNET_CACHE_DIR", str(MODEL_ROOT / "aimnet-cache"))
         from aimnet.calculators.model_registry import get_model_path
         from aimnet.models.base import load_model
 
         model_path = get_model_path("aimnet2")
         self.model, _ = load_model(model_path, device=device)
         self.model = self.model.double()
-        self.register_buffer("charge", torch.tensor([charge], dtype=torch.float64, device=device))
         self.register_buffer("mult", torch.tensor([mult], dtype=torch.int64, device=device))
         self.length_conversion = 10.0       # nm (gmx) --> Å (aimnet)
         self.energy_conversion = 96.4853    # eV (aimnet) --> kJ/mol (gmx)
 
     def forward(self, positions: torch.Tensor, atomic_numbers: torch.Tensor,
+                nnp_charge: torch.Tensor,
                 cell: Optional[torch.Tensor] = None,
                 pbc: Optional[torch.Tensor] = None) -> torch.Tensor:
         """Return the potential energy in kJ/mol for GROMACS coordinates given in nm."""
@@ -260,13 +278,16 @@ class GmxAIMNet2Model(torch.nn.Module):
             pbc = pbc.to(device=positions.device)
         else:
             pbc = torch.tensor([False, False, False], dtype=torch.bool, device=positions.device)
+        if nnp_charge.numel() != 1:
+            raise RuntimeError("AIMNet2 requires one total NNP-region charge")
+        charge = nnp_charge.to(dtype=torch.float64, device=positions.device).reshape(1)
 
         # Prepare input for aimnet model
         input_data = {
             "coord": positions.unsqueeze(0),
             "numbers": atomic_numbers.unsqueeze(0),
             "mol_idx": torch.zeros(atomic_numbers.shape[0], dtype=torch.int64, device=positions.device).unsqueeze(0),
-            "charge": self.charge,
+            "charge": charge,
             "mult": self.mult,
             "cell": cell.unsqueeze(0),
             "pbc": pbc.unsqueeze(0),
@@ -280,29 +301,32 @@ class GmxAIMNet2Model(torch.nn.Module):
 
 class GmxANI2xEMLEModel(torch.nn.Module):
     """ANI-2x with EMLE embedding, wrapped for GROMACS."""
-    def __init__(self, device: str, qm_charge: int = 0, **kwargs: object) -> None:
+    def __init__(self, device: str, **kwargs: object) -> None:
         super().__init__()
         ANI2xEMLE, length_conversion, energy_conversion = load_emle_model_classes()
         kwargs.setdefault("device", torch.device(device))
         self.model = ANI2xEMLE(**kwargs)
         self.is_nnpops = self.model._is_nnpops
-        self.qm_charge = int(qm_charge)
 
         self.length_conversion = length_conversion
         self.energy_conversion = energy_conversion
 
     def forward(self, positions_nn: torch.Tensor, atomic_numbers: torch.Tensor,
-                cell: Optional[torch.Tensor] = None,
-                pbc: Optional[torch.Tensor] = None) -> torch.Tensor:
-        """Return the potential energy in kJ/mol for GROMACS coordinates given in nm."""
+                positions_mm: torch.Tensor, charges_mm: torch.Tensor,
+                nnp_charge: torch.Tensor,
+                cell: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Return energy plus NNP/MM forces for electrostatic EMLE embedding."""
         device = positions_nn.device
         # convert units
         positions_nn = positions_nn * self.length_conversion
+        positions_mm = positions_mm.to(dtype=positions_nn.dtype, device=device) * self.length_conversion
         if cell is not None:
             cell = cell.to(dtype=positions_nn.dtype, device=device) * self.length_conversion
-        positions_mm = torch.zeros((0, 3), dtype=positions_nn.dtype, device=device)
-        charges_mm = torch.zeros((0,), dtype=positions_nn.dtype, device=device)
+        charges_mm = charges_mm.to(dtype=positions_nn.dtype, device=device)
         atomic_numbers = atomic_numbers.to(dtype=torch.int64, device=device)
+        if nnp_charge.numel() != 1:
+            raise RuntimeError("ANI2x-EMLE requires one total NNP-region charge")
+        qm_charge = nnp_charge.to(dtype=positions_nn.dtype, device=device).reshape(1)
 
         if not self.is_nnpops:
             positions_nn = positions_nn.unsqueeze(0)
@@ -310,7 +334,27 @@ class GmxANI2xEMLEModel(torch.nn.Module):
             atomic_numbers = atomic_numbers.unsqueeze(0)
             charges_mm = charges_mm.unsqueeze(0)
 
-        E = self.model(atomic_numbers, charges_mm, positions_nn, positions_mm, cell, self.qm_charge)
+        E = self.model(atomic_numbers, charges_mm, positions_nn, positions_mm, cell, qm_charge)
         E_tot = E.sum() * self.energy_conversion
 
-        return E_tot
+        # Electrostatic embedding depends on both coordinate sets.  GROMACS can
+        # differentiate the first model input itself, but requires explicit MM
+        # forces as additional outputs.
+        gradients = torch.autograd.grad(
+            [E_tot], [positions_nn, positions_mm], allow_unused=True
+        )
+        gradient_nn, gradient_mm = gradients
+        if gradient_nn is None:
+            forces_nn = torch.zeros_like(positions_nn, device=device)
+        else:
+            forces_nn = -gradient_nn * self.length_conversion
+        if gradient_mm is None:
+            forces_mm = torch.zeros_like(positions_mm, device=device)
+        else:
+            forces_mm = -gradient_mm * self.length_conversion
+
+        if not self.is_nnpops:
+            forces_nn = forces_nn.squeeze(0)
+            forces_mm = forces_mm.squeeze(0)
+
+        return E_tot, forces_nn, forces_mm

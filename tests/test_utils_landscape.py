@@ -85,6 +85,22 @@ class FreeEnergyLandscapeTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             utils.compute_free_energy_landscape([], [], bin_count=10)
 
+    def test_invalid_configuration_and_nonfinite_coordinates_are_rejected(self):
+        invalid_calls = (
+            ([0.0], [0.0], 1, 300.0),
+            ([0.0], [0.0], 10.5, 300.0),
+            ([0.0], [0.0], 1001, 300.0),
+            ([0.0], [0.0], 10, 0.0),
+            ([0.0], [0.0], 10, float("inf")),
+            ([0.0, float("nan")], [0.0, 1.0], 10, 300.0),
+            ([0.0], [0.0, 1.0], 10, 300.0),
+        )
+        for x, y, bins, temperature in invalid_calls:
+            with self.subTest(bins=bins, temperature=temperature, size=(len(x), len(y))):
+                with self.assertRaises(ValueError):
+                    utils.compute_free_energy_landscape(
+                        x, y, bin_count=bins, temperature=temperature)
+
 
 class LandscapeFigureTests(unittest.TestCase):
     def test_the_contour_grid_is_transposed_for_matplotlib(self):
@@ -155,6 +171,13 @@ class PcaFigureTests(unittest.TestCase):
         self.assertEqual(axes.get_ylabel(), "PC2")
         self.assertEqual(len(axes.collections), 1)
         np.testing.assert_array_equal(axes.collections[0].get_array(), [0, 1, 2])
+
+    def test_scree_rejects_zero_or_nonfinite_total_variance(self):
+        for eigenvalues in ([0.0, 0.0], [1.0, float("nan")]):
+            with self.subTest(eigenvalues=eigenvalues):
+                frame = pd.DataFrame({"index": [1, 2], "value": eigenvalues})
+                with self.assertRaises(ValueError):
+                    utils.make_scree_figure(frame)
 
 
 if __name__ == "__main__":

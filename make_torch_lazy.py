@@ -1,62 +1,33 @@
-"""One-shot helper: import torch (and friends) inside the functions that need them."""
+"""Verify that optional Torch dependencies remain lazily imported.
 
-path = "utils.py"
-src = open(path, encoding="utf-8").read()
+This was originally a one-shot source rewriter. Keeping a non-idempotent
+rewriter in the repository made a second invocation fail (and risked rewriting
+the wrong ``utils.py`` when run elsewhere), so it is now a safe maintenance
+check.
+"""
 
-replacements = [
-    # is_cached_nnpot_model_usable
-    ('''def is_cached_nnpot_model_usable(model_name: str, modelfile_path: str) -> bool:
-    """Report whether the cached model matches this build, moving it aside if not."""
-    extra_files = {"nnpot_model_config": ""}''',
-     '''def is_cached_nnpot_model_usable(model_name: str, modelfile_path: str) -> bool:
-    """Report whether the cached model matches this build, moving it aside if not."""
-    import torch
+from __future__ import annotations
 
-    extra_files = {"nnpot_model_config": ""}'''),
-    # checkExtensions
-    ('''def checkExtensions() -> dict[str, str]:
-    """Collect loaded Torch extension libraries to embed alongside a saved model."""
-    ext_lib = []''',
-     '''def checkExtensions() -> dict[str, str]:
-    """Collect loaded Torch extension libraries to embed alongside a saved model."""
-    import torch
+from pathlib import Path
 
-    ext_lib = []'''),
-    # trace_aimnet2_model
-    ('''def trace_aimnet2_model(model: torch.nn.Module) -> torch.jit.ScriptModule:
-    """Trace AIMNet2 with representative inputs, since it cannot be scripted."""
-    model.eval()''',
-     '''def trace_aimnet2_model(model: torch.nn.Module) -> torch.jit.ScriptModule:
-    """Trace AIMNet2 with representative inputs, since it cannot be scripted."""
-    import torch
 
-    model.eval()'''),
-    # download_nnpot_model: the heavy imports live here
-    ('''def download_nnpot_model(model_name: str) -> str:
-    """Build or reuse the wrapped neural-network potential and return its file path."""
-    os.makedirs("./models", exist_ok=True)''',
-     '''def download_nnpot_model(model_name: str) -> str:
-    """Build or reuse the wrapped neural-network potential and return its file path."""
-    reason = get_nnpot_unavailable_reason()
-    if reason is not None:
-        raise RuntimeError(reason)
+UTILS_PATH = Path(__file__).resolve().with_name("utils.py")
 
-    import torch
-    from e3nn.util.jit import script
-    from nnpot_models import (
-        GmxAIMNet2Model,
-        GmxANI1xModel,
-        GmxANI2xEMLEModel,
-        GmxANI2xModel,
-        GmxMACEModel,
-    )
 
-    os.makedirs("./models", exist_ok=True)'''),
-]
+def main() -> None:
+    """Fail clearly if heavy optional imports drift back to module scope."""
+    source = UTILS_PATH.read_text(encoding="utf-8")
+    preamble = source.split("def get_missing_nnpot_packages", 1)[0]
+    eager_imports = [
+        statement
+        for statement in ("import torch", "from e3nn", "from nnpot_models")
+        if statement in preamble
+    ]
+    if eager_imports:
+        joined = ", ".join(eager_imports)
+        raise SystemExit(f"utils.py eagerly imports optional dependencies: {joined}")
+    print("utils.py: optional Torch dependencies are imported on demand")
 
-for old, new in replacements:
-    assert old in src, f"not found:\\n{old[:80]}"
-    src = src.replace(old, new, 1)
 
-open(path, "w", encoding="utf-8", newline="\n").write(src)
-print("utils.py: torch/e3nn/nnpot_models now imported on demand")
+if __name__ == "__main__":
+    main()

@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import os
 import unittest
+from unittest import mock
 
 import MDAnalysis as mda
 
@@ -53,6 +54,43 @@ class TrajectoryReductionTests(WorkingDirectoryTestCase):
         self.assertEqual(info["stride"], 3)          # ceil(10 / 4)
         self.assertEqual(info["frames"], 4)          # frames 0, 3, 6, 9
         self.assertLessEqual(info["frames"], 4)
+
+    def test_coordinate_budget_reduces_frames_for_large_selections(self):
+        with mock.patch.object(
+                utils, "MAX_TRAJECTORY_VIEWER_COORDINATES", 40):
+            info = self.reduce(selection="All Atoms", max_frames=10)
+        self.assertEqual(info["n_atoms"], 34)
+        self.assertEqual(info["frames"], 1)
+        self.assertEqual(info["stride"], 10)
+
+    def test_partial_viewer_bundle_is_removed_after_writer_failure(self):
+        class FailingWriter:
+            def __init__(self, path, *_args, **_kwargs):
+                self.path = path
+
+            def __enter__(self):
+                open(self.path, "wb").close()
+                return self
+
+            def write(self, _atoms):
+                raise OSError("disk full")
+
+            def __exit__(self, *_args):
+                return False
+
+        with mock.patch.object(utils.mda, "Writer", FailingWriter), \
+                self.assertRaisesRegex(OSError, "disk full"):
+            self.reduce()
+        pdb, xtc = self.written()
+        self.assertFalse(os.path.exists(pdb))
+        self.assertFalse(os.path.exists(xtc))
+
+    def test_frame_cap_is_strict_and_bounded_before_opening_the_trajectory(self):
+        for value in (True, 0, -1, 1.5, 1001, float("nan"), float("inf"), "ten"):
+            with self.subTest(value=value), self.assertRaisesRegex(
+                    ValueError, "integer from 1 to 1000"):
+                self.reduce(max_frames=value)
+        self.assertEqual(self.reduce(max_frames=10.0)["frames"], 10)
 
     def test_written_frames_are_distinct(self):
         """A viewer showing one repeated frame would look animated but be static."""

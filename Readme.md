@@ -30,7 +30,7 @@ conda activate ./gromacs-env
 
 ```
 python -m pip install gradio parmed nglview==4.0
-conda install -c conda-forge acpype mdanalysis
+conda install -c conda-forge gromacs acpype mdanalysis
 ```
 - To run MD with machine learning potentials:
 
@@ -45,6 +45,20 @@ python -m pip install git+https://github.com/chemle/emle-engine
 python -m pip install mace-torch
 
 ```
+
+The Python packages above export the TorchScript model; GROMACS must separately
+be compiled with its NNPot Torch backend. Check the binary that the WebUI will
+run with `gmx --version`: it must report `Torch support: enabled`. Build GROMACS
+with `-DGMX_NNPOT=TORCH` and a LibTorch release matching the PyTorch version used
+to export the model. The WebUI checks both the selected model's Python packages
+and this GROMACS capability before it starts a model download.
+
+ANI-1x, ANI-2x and MACE-OFF are neutral-system models; the generated wrapper
+will stop with a clear error if their selected NNP group has non-zero charge.
+AIMNet2 and ANI2x-EMLE instead receive the selected group's charge from the
+topology. MACE-OFF uses GROMACS' periodic neighbor pairs at its 0.5 nm cutoff,
+and ANI2x-EMLE uses electrostatic embedding with the surrounding MM atoms.
+
 - To run MM-PBSA / MM-GBSA binding energy calculations:
 
 gmx_MMPBSA pins older numpy, pandas and AmberTools than this application uses, so
@@ -77,10 +91,10 @@ so any of them can be re-run on its own:
 
 | Analysis | Backed by | Notes |
 | --- | --- | --- |
-| RMSD | MDAnalysis | Protein, plus the ligand in the complex tab |
+| RMSD | `gmx rms` | PBC-aware backbone fit; protein, plus ligand motion from the same fit in the complex tab |
 | Minimum distance | MDAnalysis | Complex tab only |
-| Center of mass distance | MDAnalysis | Complex tab only |
-| Cα RMSF | MDAnalysis | Per residue, with the mean marked |
+| Center of mass distance | `gmx distance` | Complex tab only; uses TPR connectivity to make molecules whole across periodic boundaries |
+| Cα RMSF | `gmx trjconv`, MDAnalysis | PBC-clustered, backbone-aligned, streamed in bounded chunks; per residue with the mean marked |
 | SASA | `gmx sasa` | Total over time and averaged per residue |
 | Radius of gyration | `gmx gyrate` | Total plus the three axes |
 | PCA | `gmx covar`, `gmx anaeig` | Scree plot and the PC1/PC2 projection |
@@ -98,9 +112,10 @@ defaults to every 100th frame because a full-length trajectory takes hours
 frame by frame.
 
 The `gmx`-backed analyses need a `.tpr`, chosen with the shared **Run Input File
-Name** dropdown, and write their `.xvg` output into the job directory alongside
-the `.csv` each panel exports. They show the command they are running in their
-status line while it runs, since SASA and PCA over a long trajectory take minutes.
+Name** dropdown. Persistent `.xvg` results are written into the job directory
+alongside the `.csv` each panel exports; RMSD/RMSF scratch output is cleaned once
+the plot is ready. They show the command they are running in their status line
+while it runs, since SASA and PCA over a long trajectory take minutes.
 
 The analyses locate the ligand as `resname LIG`, so the complex tab rewrites the
 ligand's residue name to `LIG` when you upload it. **Ligand Residue Name** only

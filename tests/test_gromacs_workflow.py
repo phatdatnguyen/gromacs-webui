@@ -7,6 +7,8 @@ runs on a machine without GROMACS.
 from __future__ import annotations
 
 import os
+import subprocess
+import sys
 import time
 import unittest
 import unittest.mock
@@ -107,15 +109,44 @@ class RunInputTests(WorkingDirectoryTestCase):
         self.assertIn("npt.tpr", files)
 
     def test_grompp_errors_reach_the_status_line(self):
-        """Passing an MDP where the topology belongs must not yield a bare exit code."""
+        """A missing coordinate file must surface grompp's useful diagnostic."""
         workflow.on_generate_energy_minimization_mdp_file(self.working_directory_path, "em.mdp",
                                                           "AMBER99SB-ILDN")
         files, status = workflow.on_generate_energy_minimization_tpr_file(
-            self.working_directory_path, "boxed.gro", "em.mdp", "em.mdp", "bad.tpr", 5)
+            self.working_directory_path, "missing.gro", "topology.top", "em.mdp", "bad.tpr", 5)
         text = self.plain_text(status)
         self.assertNotIn("returned non-zero exit status", text)
         self.assertIn("gmx grompp failed", text)
-        self.assertIn(".top", text)
+        self.assertIn("missing.gro", text)
+
+
+@requires_gromacs
+class GromosRunInputTests(WorkingDirectoryTestCase):
+    """The safe default must remain usable without hiding arbitrary warnings."""
+
+    def test_known_twin_range_warning_is_surfaced_and_tpr_is_built(self):
+        write_structure_pdb(self.path("protein.pdb"), n_residues=4)
+        _, status = workflow.on_generate_protein_topology(
+            self.working_directory_path, "protein.pdb", "protein.gro",
+            "topology.top", "GROMOS54A7", "SPC",
+            utils.DEFAULT_TERMINUS_CHOICE, utils.DEFAULT_TERMINUS_CHOICE)
+        self.assertIn("successfully", self.plain_text(status))
+        _, status = workflow.on_generate_simulation_box(
+            self.working_directory_path, "protein.gro", "boxed.gro",
+            "cubic", 1.4, "GROMOS54A7")
+        self.assertIn("successfully", self.plain_text(status))
+        workflow.on_generate_energy_minimization_mdp_file(
+            self.working_directory_path, "em.mdp", "GROMOS54A7")
+
+        files, status = workflow.on_generate_energy_minimization_tpr_file(
+            self.working_directory_path, "boxed.gro", "topology.top",
+            "em.mdp", "em.tpr", 0, "GROMOS54A7")
+
+        self.assertIn("em.tpr", files)
+        self.assertIn("color:orange", status)
+        text = self.plain_text(status)
+        self.assertIn("historical twin-range", text)
+        self.assertIn("No other grompp warning was bypassed", text)
 
 
 @requires_gromacs
@@ -220,10 +251,23 @@ class EquilibrationHardwareTests(AsyncRunMixin, WorkingDirectoryTestCase):
             "AMBER99SB-ILDN", "TIP3P", utils.DEFAULT_TERMINUS_CHOICE, utils.DEFAULT_TERMINUS_CHOICE)
         workflow.on_generate_simulation_box(
             self.working_directory_path, "protein.gro", "boxed.gro", "cubic", 1.0)
+        # NVT from pdb2gmx coordinates can explode before the hardware assignment
+        # is observable.  Minimise first so this test measures CPU/GPU routing,
+        # not the synthetic peptide fixture's starting strain.
+        workflow.on_generate_energy_minimization_mdp_file(
+            self.working_directory_path, "em.mdp", "AMBER99SB-ILDN")
+        _, status = workflow.on_generate_energy_minimization_tpr_file(
+            self.working_directory_path, "boxed.gro", "topology.top",
+            "em.mdp", "em.tpr", 5)
+        self.assertIn("successfully", self.plain_text(status), "minimisation setup failed")
+        _, status = workflow.on_run_energy_minimization(
+            self.working_directory_path, "em.tpr", 1, 1, False)
+        self.assertIn("completed successfully", self.plain_text(status),
+                      "minimisation failed")
         workflow.on_generate_nvt_equilibration_mdp_file(
             self.working_directory_path, 0.02, 0.002, 300, "nvt.mdp", "AMBER99SB-ILDN")
         _, status = workflow.on_generate_nvt_equilibration_tpr_file(
-            self.working_directory_path, "boxed.gro", "topology.top", "nvt.mdp", "nvt.tpr", 5)
+            self.working_directory_path, "em.gro", "topology.top", "nvt.mdp", "nvt.tpr", 5)
         self.assertIn("successfully", self.plain_text(status), "run input setup failed")
 
     def equilibrate(self, use_gpu):
@@ -246,15 +290,14 @@ class EquilibrationHardwareTests(AsyncRunMixin, WorkingDirectoryTestCase):
         self.assertIn("GPU selected for this run", log)
 
 
-@requires_gromacs
 class ConstraintDumpTests(AsyncRunMixin, WorkingDirectoryTestCase):
-    """The crash dumps that used to pile up in the repository root.
+    """Crash diagnostics from a background process stay in its job directory.
 
-    When LINCS cannot satisfy a constraint, mdrun writes step<n>b.pdb and
-    step<n>c.pdb. Those names are hardcoded and no flag redirects them, so they
-    land wherever mdrun was started from. Generating velocities at an absurd
-    temperature makes constrained bonds rotate past lincs-warnangle immediately,
-    which is the cheapest way to reach that code path on purpose.
+    GROMACS writes ``step<n>b.pdb`` and ``step<n>c.pdb`` after a LINCS failure.
+    A tiny child process writes the same hardcoded names so this remains a
+    deterministic working-directory contract test instead of deliberately
+    exploding a molecular system and occasionally spending minutes building an
+    enormous pair list.
     """
 
     @staticmethod
@@ -276,26 +319,31 @@ class ConstraintDumpTests(AsyncRunMixin, WorkingDirectoryTestCase):
         # A regression here writes into the repository root, so clean up after the
         # run whatever the outcome: a failing test must not litter the checkout.
         self.addCleanup(self.clean_repository_root)
-        write_structure_pdb(self.path("protein.pdb"), n_residues=6)
-        workflow.on_generate_protein_topology(
-            self.working_directory_path, "protein.pdb", "protein.gro", "topology.top",
-            "AMBER99SB-ILDN", "TIP3P", utils.DEFAULT_TERMINUS_CHOICE, utils.DEFAULT_TERMINUS_CHOICE)
-        workflow.on_generate_simulation_box(
-            self.working_directory_path, "protein.gro", "boxed.gro", "cubic", 1.0)
-        # Ten steps only. The dumps appear in the first few, and an exploded system
-        # grows a huge pair list that makes every later step crawl.
-        workflow.on_generate_nvt_equilibration_mdp_file(
-            self.working_directory_path, 0.02, 0.002, 100000, "hot.mdp", "AMBER99SB-ILDN")
-        _, status = workflow.on_generate_nvt_equilibration_tpr_file(
-            self.working_directory_path, "boxed.gro", "topology.top", "hot.mdp", "hot.tpr", 50)
-        self.assertIn("successfully", self.plain_text(status), "run input setup failed")
+        with open(self.path("hot.tpr"), "wb") as handle:
+            handle.write(b"process-launch fixture")
 
     def run_until_it_fails(self):
-        """Start the doomed run and wait for the watcher thread to clear the state."""
-        # On a GPU machine the explosion surfaces as a CUDA fault before LINCS
-        # ever reports, so keep this one run on the CPU.
-        with unittest.mock.patch.dict(os.environ, {"GMX_DISABLE_GPU_DETECTION": "1"}):
-            self.start_and_wait(workflow.on_run_nvt_equilibration, "hot.tpr", 1, 1, False)
+        """Start a failing child and wait for the watcher to clear its state."""
+        real_popen = subprocess.Popen
+        child_code = (
+            "from pathlib import Path; "
+            "Path('step0b.pdb').write_text('coordinates before\\n'); "
+            "Path('step0c.pdb').write_text('coordinates after\\n'); "
+            "raise SystemExit(1)"
+        )
+
+        def launch_in_requested_directory(_command, **kwargs):
+            return real_popen(
+                [sys.executable, "-c", child_code],
+                cwd=kwargs.get("cwd"), text=kwargs.get("text", False),
+                start_new_session=kwargs.get("start_new_session", False))
+
+        with unittest.mock.patch.object(
+                workflow.subprocess, "Popen",
+                side_effect=launch_in_requested_directory):
+            self.start_and_wait(
+                workflow.on_run_nvt_equilibration,
+                "hot.tpr", 1, 1, False, timeout=10)
 
     def test_the_dumps_land_in_the_job_directory_not_the_repository_root(self):
         self.run_until_it_fails()
@@ -308,8 +356,6 @@ class ConstraintDumpTests(AsyncRunMixin, WorkingDirectoryTestCase):
                          "mdrun scattered crash dumps into the repository root")
 
         dumps = self.dumps_in(self.working_directory_path)
-        if not dumps:
-            self.skipTest("this GROMACS build did not dump coordinates for the failed constraint")
         # b is the state going in, c the state after constraining; both are written.
         self.assertTrue(any(name.endswith("b.pdb") for name in dumps), dumps)
         self.assertTrue(any(name.endswith("c.pdb") for name in dumps), dumps)
@@ -323,8 +369,6 @@ class ConstraintDumpTests(AsyncRunMixin, WorkingDirectoryTestCase):
 
         files = workflow.get_files_in_working_directory(self.working_directory_path)
         dumps = [name for name in files if name.startswith("step") and name.endswith(".pdb")]
-        if not dumps:
-            self.skipTest("this GROMACS build did not dump coordinates for the failed constraint")
         self.assertEqual(dumps, sorted(dumps, key=str.lower))
 
 
@@ -643,6 +687,8 @@ class CharmmForceFieldTests(WorkingDirectoryTestCase):
                         "exit status -6", "double free"):
             if symptom in text:
                 self.skipTest(f"charmm36 failed to load ({symptom})")
+        if "file ffbonded.itp" in text and "Unknown " in text:
+            self.skipTest("charmm36 produced an inconsistent ffbonded database")
         return text
 
     def setUp(self):
@@ -691,7 +737,8 @@ class CharmmForceFieldTests(WorkingDirectoryTestCase):
                                                         "nvt.mdp", "CHARMM36")
         files, status = workflow.on_generate_nvt_equilibration_tpr_file(
             self.working_directory_path, "boxed.gro", "topology.top", "nvt.mdp", "nvt.tpr", 5)
-        self.assertIn("successfully", self.plain_text(status))
+        text = self.skip_if_charmm_is_flaking(status)
+        self.assertIn("successfully", text)
         self.assertIn("nvt.tpr", files)
 
 

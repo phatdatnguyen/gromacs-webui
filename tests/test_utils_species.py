@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import re
 import tempfile
@@ -108,6 +109,20 @@ class RepresentationTests(unittest.TestCase):
     def test_ligand_uses_ball_and_stick(self):
         javascript = utils.get_species_representations_js(self.make_species(hetero=("LIG",)))
         self.assertIn('addRepresentation("ball+stick", { sele: "[LIG]" })', javascript)
+
+    def test_uploaded_residue_names_remain_data_in_javascript_and_html(self):
+        malicious = 'X"];globalThis.pwned=1;//<img onerror=alert(1)>'
+        species = self.make_species(hetero=(malicious,))
+
+        javascript = utils.get_species_representations_js(species)
+        encoded_selection = json.dumps(f"[{malicious}]")
+        self.assertIn(f"sele: {encoded_selection}", javascript)
+        self.assertNotIn('sele: "[X"];globalThis', javascript)
+
+        legend = utils.get_species_legend(species)
+        self.assertNotIn("<img", legend)
+        self.assertIn("&quot;", legend)
+        self.assertIn("&lt;img", legend)
 
     def test_water_only_drawn_when_present(self):
         with_water = utils.get_species_representations_js(self.make_species(water=("SOL",)))

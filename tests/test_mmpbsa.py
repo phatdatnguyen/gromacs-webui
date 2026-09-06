@@ -119,6 +119,39 @@ class MmpbsaInputFileTests(WorkingDirectoryTestCase):
         self.assertIn("interval          = 3", content)
         self.assertIn("temperature       = 310.0", content)
         self.assertIn("saltcon           = 0.2", content)
+        self.assertIn("keep_files        = 0", content)
+
+    def test_topology_driven_run_does_not_invent_tleap_force_fields(self):
+        """The launcher always supplies -cp, so forcefields is unnecessary.
+
+        In particular, an ff14SB default must not be written into a run whose
+        selected GROMACS topology may have been built with another AMBER port.
+        """
+        self.generate()
+        self.assertNotIn("forcefields", self.read())
+
+    def test_explicit_tleap_force_fields_must_be_a_complete_pair(self):
+        with self.assertRaisesRegex(ValueError, "Both protein and ligand"):
+            utils.get_default_mmpbsa_input_file_content(
+                protein_force_field="leaprc.protein.ff14SB"
+            )
+
+    def test_namelist_text_cannot_inject_another_setting(self):
+        with self.assertRaisesRegex(ValueError, "single-line"):
+            utils.get_default_mmpbsa_input_file_content(
+                print_residues='within 6\n/\n&general\nkeep_files=2'
+            )
+
+    def test_invalid_numeric_controls_are_rejected_server_side(self):
+        for arguments in (
+            {"start_frame": 0},
+            {"interval": 0},
+            {"temperature": float("nan")},
+            {"salt_concentration": -0.1},
+            {"decomposition_scheme": 99},
+        ):
+            with self.subTest(arguments=arguments), self.assertRaises(ValueError):
+                utils.get_default_mmpbsa_input_file_content(**arguments)
 
     def test_the_last_frame_is_left_open_when_the_end_is_zero(self):
         """gmx_MMPBSA wants a real frame number, so 0 means omit the key."""
@@ -279,6 +312,19 @@ PER_FRAME_CSV = textwrap.dedent("""\
     3,-0.0,0.0,0.0,-39.27,-12.77,-0.0,-0.0,30.63,-4.77,-52.04,25.86,-26.19
     """)
 
+BOTH_METHODS_PER_FRAME_CSV = PER_FRAME_CSV + textwrap.dedent("""\
+    POISSON BOLTZMANN:
+    Complex Energy Terms
+    Frame #,BOND,VDWAALS,EEL,EPB,ENPOLAR,GGAS,GSOLV,TOTAL
+    1,1531.71,-4406.08,-36258.07,4250.12,20.0,-39132.44,4270.12,-34862.32
+
+    Delta Energy Terms
+    Frame #,BOND,VDWAALS,EEL,EPB,ENPOLAR,GGAS,GSOLV,TOTAL
+    1,0.0,-42.09,-14.69,36.10,-4.20,-56.78,31.90,-24.88
+    2,0.0,-40.84,-7.88,30.15,-4.00,-48.72,26.15,-22.57
+    3,0.0,-39.27,-12.77,33.75,-3.95,-52.04,29.80,-22.24
+    """)
+
 DECOMP_CSV = textwrap.dedent("""\
     Complex:
     Total Decomposition Contribution (TDC)
@@ -298,6 +344,26 @@ DECOMP_CSV = textwrap.dedent("""\
     Sidechain Decomposition Contribution (SDC)
     Frame #,Residue,Internal,van der Waals,Electrostatic,Polar Solvation,Non-Polar Solv.,TOTAL
     1,R:A:TRP:59,0.0,-1.0,-1.0,-1.0,-1.0,-1.0
+    """)
+
+BOTH_METHODS_DECOMP_CSV = textwrap.dedent("""\
+    Generalized Born Decomposition Energies
+    DELTAS:
+    Total Decomposition Contribution (TDC)
+    Frame #,Residue,Internal,van der Waals,Electrostatic,Polar Solvation,Non-Polar Solv.,TOTAL
+    1,R:A:TRP:59,0.0,-3.51,-0.44,1.46,-0.43,-2.92
+    1,L:B:UNK:497,0.0,-21.04,-7.34,8.18,-3.27,-23.47
+    2,R:A:TRP:59,0.0,-2.96,-0.38,1.16,-0.39,-2.58
+    2,L:B:UNK:497,0.0,-19.04,-6.34,7.18,-3.07,-21.27
+
+    Poisson Boltzmann Decomposition Energies
+    DELTAS:
+    Total Decomposition Contribution (TDC)
+    Frame #,Residue,Internal,van der Waals,Electrostatic,Polar Solvation,Non-Polar Solv.,TOTAL
+    1,R:A:TRP:59,0.0,-3.51,-0.44,2.10,-0.45,-2.30
+    1,L:B:UNK:497,0.0,-21.04,-7.34,10.18,-3.30,-21.50
+    2,R:A:TRP:59,0.0,-2.96,-0.38,1.80,-0.41,-1.95
+    2,L:B:UNK:497,0.0,-19.04,-6.34,9.18,-3.10,-19.30
     """)
 
 
@@ -399,6 +465,15 @@ class MmpbsaPerFrameTests(WorkingDirectoryTestCase):
         with self.assertRaises(ValueError):
             self.parse("GENERALIZED BORN:\nComplex Energy Terms\nFrame #,TOTAL\n1,5.0\n")
 
+    def test_both_methods_keep_their_own_per_frame_energies(self):
+        frame = self.parse(BOTH_METHODS_PER_FRAME_CSV)
+
+        self.assertEqual(sorted(frame["Method"].unique()), ["GB", "PB"])
+        self.assertEqual(frame.groupby("Method").size().to_dict(), {"GB": 3, "PB": 3})
+        totals = frame.set_index(["Method", "Frame #"])["TOTAL"]
+        self.assertAlmostEqual(totals.loc[("GB", 1)], -28.94)
+        self.assertAlmostEqual(totals.loc[("PB", 1)], -24.88)
+
     def test_the_histogram_marks_the_mean(self):
         frame = self.parse()
         figure = utils.make_histogram_figure(frame["TOTAL"], bins=5,
@@ -450,6 +525,15 @@ class MmpbsaDecompositionTests(WorkingDirectoryTestCase):
             self.parse("Complex:\nTotal Decomposition Contribution (TDC)\n"
                        "Frame #,Residue,TOTAL\n1,R:A:TRP:59,-1.0\n")
         self.assertIn("DELTAS", str(caught.exception))
+
+    def test_both_methods_keep_separate_residue_contributions(self):
+        frame = self.parse(BOTH_METHODS_DECOMP_CSV)
+
+        self.assertEqual(sorted(frame["Method"].unique()), ["GB", "PB"])
+        self.assertEqual(frame.groupby("Method").size().to_dict(), {"GB": 2, "PB": 2})
+        totals = frame.set_index(["Method", "Residue"])["TOTAL"]
+        self.assertAlmostEqual(totals.loc[("GB", "R:A:TRP:59")], -2.75)
+        self.assertAlmostEqual(totals.loc[("PB", "R:A:TRP:59")], -2.125)
 
 
 class MmpbsaDecompositionInputTests(WorkingDirectoryTestCase):
@@ -607,6 +691,53 @@ class MmpbsaAvailabilityTests(WorkingDirectoryTestCase):
         self.assertTrue(executable.endswith(os.path.join("gmx-mmpbsa-env", "bin", "gmx_MMPBSA")))
         self.assertTrue(os.path.isabs(executable), "the executable path must not be relative")
 
+    def test_configured_executable_is_returned_as_a_canonical_absolute_path(self):
+        executable_path = self.path("gmx_MMPBSA")
+        with open(executable_path, "w") as handle:
+            handle.write("#!/bin/sh\n")
+        os.chmod(executable_path, 0o700)
+        relative_path = os.path.relpath(executable_path)
+
+        with unittest.mock.patch.dict(
+                os.environ,
+                {utils.GMX_MMPBSA_EXECUTABLE_ENVIRONMENT_VARIABLE: relative_path}):
+            executable = utils.get_gmx_mmpbsa_executable()
+
+        self.assertEqual(executable, os.path.realpath(executable_path))
+
+    def test_relative_project_environment_is_canonicalised(self):
+        environment_path = self.path("local-env")
+        executable_path = os.path.join(environment_path, "bin", "gmx_MMPBSA")
+        os.makedirs(os.path.dirname(executable_path))
+        with open(executable_path, "w") as handle:
+            handle.write("#!/bin/sh\n")
+        os.chmod(executable_path, 0o700)
+
+        with unittest.mock.patch.dict(os.environ, {}, clear=False), \
+                unittest.mock.patch.object(utils, "GMX_MMPBSA_ENVIRONMENT_PATH",
+                                           os.path.relpath(environment_path)):
+            os.environ.pop(utils.GMX_MMPBSA_EXECUTABLE_ENVIRONMENT_VARIABLE, None)
+            executable = utils.get_gmx_mmpbsa_executable()
+
+        self.assertEqual(executable, os.path.realpath(executable_path))
+
+    def test_path_discovery_is_returned_as_a_canonical_absolute_path(self):
+        executable_path = os.path.join(self.path("path-bin"), "gmx_MMPBSA")
+        os.makedirs(os.path.dirname(executable_path))
+        with open(executable_path, "w") as handle:
+            handle.write("#!/bin/sh\n")
+        os.chmod(executable_path, 0o700)
+
+        with unittest.mock.patch.dict(os.environ, {}, clear=False), \
+                unittest.mock.patch.object(utils, "GMX_MMPBSA_ENVIRONMENT_PATH",
+                                           self.path("missing-env")), \
+                unittest.mock.patch.object(utils.shutil, "which",
+                                           return_value=os.path.relpath(executable_path)):
+            os.environ.pop(utils.GMX_MMPBSA_EXECUTABLE_ENVIRONMENT_VARIABLE, None)
+            executable = utils.get_gmx_mmpbsa_executable()
+
+        self.assertEqual(executable, os.path.realpath(executable_path))
+
     def test_the_environment_variable_wins_over_path(self):
         with unittest.mock.patch.dict(
                 os.environ, {utils.GMX_MMPBSA_EXECUTABLE_ENVIRONMENT_VARIABLE: "/no/such/binary"}):
@@ -727,6 +858,27 @@ class MmpbsaCommandTests(WorkingDirectoryTestCase):
         self.assertNotIn("mpirun", cmd)
         self.assertNotEqual(cmd[-1], "MPI")
 
+    def test_process_count_must_be_a_strict_positive_integer(self):
+        for processes in (0, -1, True, 1.0, "1"):
+            with self.subTest(processes=processes):
+                call, (_, status, state, button) = self.launch(
+                    processes=processes)
+                self.assertIsNone(call)
+                self.assertIn("MM-PBSA processes", self.plain_text(status))
+                self.assertIn("positive integer", self.plain_text(status))
+                self.assertFalse(state["running"])
+                self.assertEqual(button["value"], "Start")
+
+    def test_process_count_cannot_exceed_the_server_cpu_limit(self):
+        with unittest.mock.patch.object(
+                complex_workflow, "get_default_cpu_count", return_value=2):
+            call, (_, status, state, button) = self.launch(processes=3)
+
+        self.assertIsNone(call)
+        self.assertIn("server's limit of 2", self.plain_text(status))
+        self.assertFalse(state["running"])
+        self.assertEqual(button["value"], "Start")
+
     def test_starting_marks_the_state_running_and_flips_the_button(self):
         _, (_, status, state, button) = self.launch()
 
@@ -749,6 +901,43 @@ class MmpbsaCommandTests(WorkingDirectoryTestCase):
         self.assertIsNone(returned_state["proc"])
         self.assertEqual(button["value"], "Start")
         self.assertIn("stopped", self.plain_text(status))
+
+    def test_a_fresh_browser_state_attaches_instead_of_starting_a_duplicate(self):
+        for name in ("md.tpr", "md.xtc", "topol.top", "mmpbsa.in", "mmpbsa_index.ndx"):
+            with open(self.path(name), "w") as handle:
+                handle.write("x")
+        first_state = utils.ProcessStateDict()
+        refreshed_state = utils.ProcessStateDict()
+        proc = unittest.mock.MagicMock()
+        proc.poll.return_value = None
+        key = utils.get_process_job_key(
+            self.working_directory_path, complex_workflow.MMPBSA_RESULTS_FILE_NAME)
+        self.addCleanup(utils.release_process_job, key, proc)
+
+        with unittest.mock.patch.object(complex_workflow, "get_gmx_mmpbsa_executable",
+                                        return_value="/opt/gmxMMPBSA/bin/gmx_MMPBSA"), \
+                unittest.mock.patch.object(complex_workflow, "_build_mmpbsa_index") as build, \
+                unittest.mock.patch.object(complex_workflow, "subprocess") as fake_subprocess, \
+                unittest.mock.patch.object(complex_workflow, "threading"):
+            fake_subprocess.DEVNULL = subprocess.DEVNULL
+            fake_subprocess.STDOUT = subprocess.STDOUT
+            fake_subprocess.Popen.return_value = proc
+            complex_workflow.on_run_mmpbsa(
+                self.working_directory_path, "md.tpr", "md.xtc", "topol.top", "mmpbsa.in",
+                "mmpbsa_index.ndx", "protein", "resname LIG", 1, first_state)
+            _, status, returned_state, button = complex_workflow.on_run_mmpbsa(
+                self.working_directory_path, "md.tpr", "md.xtc", "topol.top", "mmpbsa.in",
+                "mmpbsa_index.ndx", "protein", "resname LIG", 1, refreshed_state)
+
+        fake_subprocess.Popen.assert_called_once()
+        build.assert_called_once()
+        self.assertIs(returned_state["proc"], proc)
+        self.assertTrue(returned_state["running"])
+        self.assertEqual(button["value"], "Stop")
+        self.assertIn("already running", self.plain_text(status))
+        utils.clear_process_state(first_state)
+        utils.clear_process_state(refreshed_state)
+        utils.release_process_job(key, proc)
 
 
 class MmpbsaMpiEnvironmentTests(WorkingDirectoryTestCase):
@@ -866,6 +1055,28 @@ class MmpbsaResultsLoadingTests(WorkingDirectoryTestCase):
         # Nothing was missing, so nothing is complained about.
         self.assertNotIn("No FINAL", self.plain_text(status))
 
+    def test_both_methods_reach_every_companion_results_panel(self):
+        self.write("FINAL_RESULTS_MMPBSA.dat", BOTH_METHODS_DAT)
+        self.write("FINAL_RESULTS_MMPBSA.csv", BOTH_METHODS_PER_FRAME_CSV)
+        self.write("FINAL_DECOMP_MMPBSA.csv", BOTH_METHODS_DECOMP_CSV)
+
+        _, _, _, series, histogram, decomposition, decomposition_figure, status = self.load()
+
+        self.assertEqual(len(series.axes[0].lines), 2)
+        self.assertEqual(
+            [line.get_label() for line in series.axes[0].lines],
+            ["ΔG binding (GB) (kcal/mol)", "ΔG binding (PB) (kcal/mol)"],
+        )
+        histogram_legend = [text.get_text() for text in histogram.axes[0].get_legend().texts]
+        self.assertTrue(any(label.startswith("GB ") for label in histogram_legend))
+        self.assertTrue(any(label.startswith("PB ") for label in histogram_legend))
+        self.assertEqual(sorted(decomposition["Method"].unique()), ["GB", "PB"])
+        decomposition_labels = [tick.get_text()
+                                for tick in decomposition_figure.axes[0].get_xticklabels()]
+        self.assertTrue(any(label.endswith("(GB)") for label in decomposition_labels))
+        self.assertTrue(any(label.endswith("(PB)") for label in decomposition_labels))
+        self.assertIn("successfully", self.plain_text(status))
+
     def test_a_run_without_decomposition_still_loads_and_says_why(self):
         """The main result must not be withheld because the extras are absent."""
         self.write("FINAL_RESULTS_MMPBSA.dat", RESULTS_DAT)
@@ -954,6 +1165,60 @@ class MmpbsaResultsLoadingTests(WorkingDirectoryTestCase):
         self.assertIn("successfully", self.plain_text(status))
         self.assertAlmostEqual(frame.set_index("Term").loc["ΔTOTAL", "Average (kcal/mol)"],
                                -15.02)
+
+    def test_legacy_migration_restores_all_companions_for_later_loads(self):
+        legacy_directory = self.path("mmpbsa")
+        os.makedirs(legacy_directory, exist_ok=True)
+        legacy_files = {
+            "FINAL_RESULTS_MMPBSA.dat": BOTH_METHODS_DAT,
+            "FINAL_RESULTS_MMPBSA.csv": BOTH_METHODS_PER_FRAME_CSV,
+            "FINAL_DECOMP_MMPBSA.dat": "legacy human-readable decomposition\n",
+            "FINAL_DECOMP_MMPBSA.csv": BOTH_METHODS_DECOMP_CSV,
+            complex_workflow.MMPBSA_LOG_FILE_NAME: "legacy run completed\n",
+        }
+        for file_name, content in legacy_files.items():
+            with open(os.path.join(legacy_directory, file_name), "w") as handle:
+                handle.write(content)
+
+        first = self.load()
+
+        for file_name in legacy_files:
+            self.assertTrue(os.path.isfile(self.path(file_name)), file_name)
+        self.assertIn("Restored 5 legacy", self.plain_text(first[-1]))
+        self.assertIsNotNone(first[3])
+        self.assertIsNotNone(first[4])
+        self.assertIsNotNone(first[5])
+
+        # The second load resolves the now-visible summary in the job directory;
+        # all optional panels must still find the companions migrated with it.
+        second = self.load()
+        self.assertIsNotNone(second[3])
+        self.assertIsNotNone(second[4])
+        self.assertEqual(sorted(second[5]["Method"].unique()), ["GB", "PB"])
+        self.assertNotIn("No FINAL", self.plain_text(second[-1]))
+
+    def test_an_older_summary_only_migration_is_completed(self):
+        """A prior release copied the DAT but stranded its CSV files below it."""
+        legacy_directory = self.path("mmpbsa")
+        os.makedirs(legacy_directory, exist_ok=True)
+        self.write("FINAL_RESULTS_MMPBSA.dat", BOTH_METHODS_DAT)
+        legacy_files = {
+            "FINAL_RESULTS_MMPBSA.dat": BOTH_METHODS_DAT,
+            "FINAL_RESULTS_MMPBSA.csv": BOTH_METHODS_PER_FRAME_CSV,
+            "FINAL_DECOMP_MMPBSA.csv": BOTH_METHODS_DECOMP_CSV,
+        }
+        for file_name, content in legacy_files.items():
+            with open(os.path.join(legacy_directory, file_name), "w") as handle:
+                handle.write(content)
+
+        result = self.load()
+
+        self.assertTrue(os.path.isfile(self.path("FINAL_RESULTS_MMPBSA.csv")))
+        self.assertTrue(os.path.isfile(self.path("FINAL_DECOMP_MMPBSA.csv")))
+        self.assertIsNotNone(result[3])
+        self.assertIsNotNone(result[4])
+        self.assertEqual(sorted(result[5]["Method"].unique()), ["GB", "PB"])
+        self.assertIn("Restored 2 legacy", self.plain_text(result[-1]))
 
     def test_a_missing_results_file_points_at_the_run_log(self):
         _, frame, _, _, _, _, _, status = self.load()
