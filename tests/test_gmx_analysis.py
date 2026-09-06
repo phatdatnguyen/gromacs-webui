@@ -146,12 +146,39 @@ class PcaCommandTests(WorkingDirectoryTestCase):
                                      os.path.abspath(self.working_directory_path))
 
     def test_a_reversed_eigenvector_range_is_refused_before_gmx_runs(self):
+        """Nothing at all should run.
+
+        The range used to be checked between covar and anaeig, so a reversed
+        range still paid for the covariance calculation - minutes on a real
+        trajectory - and overwrote the eigenvector files before complaining.
+        """
         for module in (workflow, complex_workflow):
             with self.subTest(module=module.__name__):
                 commands, _, result = self.capture(module, first=3, second=2)
-                # select and covar have already run; anaeig must not be reached.
-                self.assertEqual([cmd[1] for cmd in commands], ["select", "covar"])
+
+                self.assertEqual(commands, [], "gmx ran despite an impossible range")
                 self.assertIn("must be higher", self.plain_text(result[-1]))
+
+    def test_an_empty_file_dropdown_is_reported_not_raised(self):
+        """A dropdown holds None until the job has a file of that kind, and None
+        in argv raises "expected str instance" out of ' '.join, which the user
+        sees as a raw Gradio error instead of a status."""
+        for module in (workflow, complex_workflow):
+            for handler, arguments in (
+                    ("on_analyze_sasa", (None, "md.xtc", "group Protein", "", 0.14,
+                                         "sasa.xvg", "res.xvg")),
+                    ("on_analyze_gyrate", ("md.tpr", None, "group Protein", "mass", "g.xvg")),
+                    ("on_run_pca", (None, "md.xtc", "group Backbone", 1, 2, "i.ndx",
+                                    "v.trr", "e.xvg", "p.xvg"))):
+                with self.subTest(module=module.__name__, handler=handler):
+                    with unittest.mock.patch.object(module, "run_checked_command") as run:
+                        result = final_result(
+                            getattr(module, handler)(self.working_directory_path, *arguments))
+
+                    run.assert_not_called()
+                    text = self.plain_text(result[-1])
+                    self.assertIn("Select a file for", text)
+                    self.assertIn("File Name", text)
 
 
 MAKE_NDX_LISTING = """\

@@ -896,6 +896,12 @@ nnpot-model-input4    = pbc"""
 
 LIGAND_RESNAME: str = "LIG"
 
+# gmx_MMPBSA runs in the job directory, because a topology's #include lines only
+# resolve beside it, and leaves dozens of these behind. They are working files,
+# not results, so they are hidden the same way GROMACS backups are. Both tabs
+# browse the same directories, so both have to hide them.
+MMPBSA_SCRATCH_PREFIX: str = "_GMXMMPBSA_"
+
 # Columns 18-20 of a PDB ATOM/HETATM/TER record, 1-based and inclusive.
 _PDB_RESNAME_SLICE = slice(17, 20)
 
@@ -1175,6 +1181,18 @@ def get_default_mmpbsa_input_file_content(start_frame: int = 1, end_frame: int =
 MMPBSA_STATISTIC_COLUMNS: tuple[str, ...] = ("Average (kcal/mol)", "SD(Prop.)", "SD",
                                              "SEM(Prop.)", "SEM")
 
+# gmx_MMPBSA repeats the whole report once per method it was asked for, headed by
+# these lines. The first entry doubles as the label for a report with no header
+# at all, which is what a single-method run of an older version writes.
+MMPBSA_METHOD_NAMES: dict[str, str] = {
+    "GENERALIZED BORN": "GB",
+    "POISSON BOLTZMANN": "PB",
+    "GBNSR6": "GBNSR6",
+    "3D-RISM": "RISM",
+    "NMODE": "NMODE",
+    "QUASI-HARMONIC APPROXIMATION": "QH",
+}
+
 def _is_number(text: str) -> bool:
     """Whether a whitespace-separated field parses as a float."""
     try:
@@ -1189,16 +1207,29 @@ def parse_mmpbsa_results(dat_file_path: str) -> pd.DataFrame:
 
     The file is a human-readable report rather than a table: several sections,
     each with a header line then "TERM  average  sd  sd(mean)" rows. Only the
-    delta section matters, so parsing stops once it has been read.
+    delta sections matter.
+
+    A run that asked for both MM-GBSA and MM-PBSA writes the whole report twice,
+    once under "GENERALIZED BORN:" and once under "POISSON BOLTZMANN:", each
+    with its own delta section and the same term names. Every row therefore
+    carries the method it came from, so the two cannot be mistaken for one set
+    of duplicated terms.
     """
     with open(dat_file_path) as handle:
         lines = handle.readlines()
 
     rows: list[dict[str, Any]] = []
     in_delta = False
+    method = next(iter(MMPBSA_METHOD_NAMES.values()))
     for line in lines:
         stripped = line.strip()
         if not stripped:
+            continue
+
+        heading = stripped.rstrip(":").upper()
+        if heading in MMPBSA_METHOD_NAMES:
+            method = MMPBSA_METHOD_NAMES[heading]
+            in_delta = False
             continue
 
         fields = stripped.split()
@@ -1224,7 +1255,8 @@ def parse_mmpbsa_results(dat_file_path: str) -> pd.DataFrame:
         if not numbers or len(numbers) == len(fields):
             continue
 
-        row: dict[str, Any] = {"Term": " ".join(fields[:len(fields) - len(numbers)])}
+        row: dict[str, Any] = {"Term": " ".join(fields[:len(fields) - len(numbers)]),
+                               "Method": method}
         for column, value in zip(MMPBSA_STATISTIC_COLUMNS, numbers):
             row[column] = value
         rows.append(row)

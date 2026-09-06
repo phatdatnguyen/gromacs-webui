@@ -30,13 +30,15 @@ def get_working_directories() -> list[str]:
     return sorted((d for d in os.listdir(base_path) if os.path.isdir(os.path.join(base_path, d))), key=str.lower)
 
 def get_files_in_working_directory(working_directory_path: str | None) -> list[str]:
-    """Visible files in a job directory, hiding GROMACS backups and Zone.Identifier files.
+    """Visible files in a job directory, hiding backups and tool scratch files.
 
     Sorted by name: os.listdir() order is arbitrary, and every file dropdown in
-    the UI is filtered straight out of this list."""
+    the UI is filtered straight out of this list. The MM-PBSA scratch files are
+    hidden here too: a job directory is browsable from either tab, so the two
+    listings have to agree about what is worth showing."""
     if working_directory_path is None or not os.path.isdir(working_directory_path):
         return []
-    files = [f for f in os.listdir(working_directory_path) if not (f.startswith('#') or f.endswith("Zone.Identifier") or os.path.isdir(os.path.join(working_directory_path, f)))]
+    files = [f for f in os.listdir(working_directory_path) if not (f.startswith('#') or f.startswith(MMPBSA_SCRATCH_PREFIX) or f.endswith("Zone.Identifier") or os.path.isdir(os.path.join(working_directory_path, f)))]
     return sorted(files, key=str.lower)
 
 def get_default_cpu_count() -> int:
@@ -1369,6 +1371,17 @@ def _selection_error(exc: Exception, run_input_file_name: str,
     hint = describe_selection_candidates(run_input_file_name, working_directory_path)
     return f"{message}\n\n{hint}" if hint else message
 
+def _require_selected_files(**file_names: Any) -> None:
+    """Fail with the empty dropdown's name rather than a TypeError deep in argv.
+
+    A file dropdown holds None until the job directory contains a file of that
+    kind, and None reaching the command line raises "sequence item 3: expected
+    str instance" from ' '.join, which says nothing useful.
+    """
+    missing = [label for label, value in file_names.items() if not value]
+    if missing:
+        raise Exception("Select a file for: " + ", ".join(missing) + ".")
+
 def on_analyze_sasa(working_directory_path: str, run_input_file_name: str,
                     input_traj_file_name: str, surface_selection: str, output_selection: str,
                     probe_radius: float, sasa_file_name: str,
@@ -1384,6 +1397,14 @@ def on_analyze_sasa(working_directory_path: str, run_input_file_name: str,
     blocking stdin that wedges the worker thread indefinitely (measured: no
     -surface plus a live stdin hangs forever, stdin closed fails in a second).
     """
+    try:
+        _require_selected_files(**{"Run Input File Name": run_input_file_name,
+                                   "Input Trajectory File Name": input_traj_file_name})
+    except Exception as exc:
+        yield get_files_in_working_directory(working_directory_path), None, None, None, None, \
+            "<span style='color:red;'>Error calculating SASA!\n" + str(exc) + "</span>"
+        return
+
     cmd = [
         "gmx", "sasa",
         "-s", run_input_file_name,
@@ -1433,6 +1454,14 @@ def on_analyze_gyrate(working_directory_path: str, run_input_file_name: str,
                       input_traj_file_name: str, gyrate_selection: str, weighting_mode: str,
                       gyrate_file_name: str) -> Any:
     """Radius of gyration over time, total and about each axis."""
+    try:
+        _require_selected_files(**{"Run Input File Name": run_input_file_name,
+                                   "Input Trajectory File Name": input_traj_file_name})
+    except Exception as exc:
+        yield get_files_in_working_directory(working_directory_path), None, None, \
+            "<span style='color:red;'>Error calculating radius of gyration!\n" + str(exc) + "</span>"
+        return
+
     cmd = [
         "gmx", "gyrate",
         "-s", run_input_file_name,
@@ -1485,6 +1514,15 @@ def on_run_pca(working_directory_path: str, run_input_file_name: str, input_traj
     """
     files = get_files_in_working_directory(working_directory_path)
     try:
+        _require_selected_files(**{"Run Input File Name": run_input_file_name,
+                                   "Input Trajectory File Name": input_traj_file_name})
+        # Checked before gmx runs: covar on a production trajectory takes minutes,
+        # and failing afterwards would waste all of it and overwrite the outputs.
+        first = int(first_eigenvector)
+        second = int(second_eigenvector)
+        if second <= first:
+            raise Exception("The second eigenvector must be higher than the first.")
+
         select_cmd = [
             "gmx", "select",
             "-s", run_input_file_name,
@@ -1509,11 +1547,6 @@ def on_run_pca(working_directory_path: str, run_input_file_name: str, input_traj
         print(f"Running command (in {working_directory_path}): {' '.join(covar_cmd)}")
         yield files, None, None, None, None, format_running_status(covar_cmd, "Step 2 of 3")
         run_checked_command(covar_cmd, cwd=working_directory_path, stdin_input="")
-
-        first = int(first_eigenvector)
-        second = int(second_eigenvector)
-        if second <= first:
-            raise Exception("The second eigenvector must be higher than the first.")
 
         anaeig_cmd = [
             "gmx", "anaeig",

@@ -202,7 +202,8 @@ class MmpbsaResultsParsingTests(WorkingDirectoryTestCase):
     def test_all_five_statistics_are_captured(self):
         frame = self.parse().set_index("Term")
 
-        self.assertEqual(list(frame.columns), list(utils.MMPBSA_STATISTIC_COLUMNS))
+        self.assertEqual([c for c in frame.columns if c != "Method"],
+                         list(utils.MMPBSA_STATISTIC_COLUMNS))
         row = frame.loc["ΔVDWAALS"]
         self.assertAlmostEqual(row["Average (kcal/mol)"], -23.57)
         self.assertAlmostEqual(row["SD(Prop.)"], 1.18)
@@ -298,6 +299,78 @@ DECOMP_CSV = textwrap.dedent("""\
     Frame #,Residue,Internal,van der Waals,Electrostatic,Polar Solvation,Non-Polar Solv.,TOTAL
     1,R:A:TRP:59,0.0,-1.0,-1.0,-1.0,-1.0,-1.0
     """)
+
+
+# A run that ticks both MM-GBSA and MM-PBSA gets the whole report twice, under
+# the two headers gmx_MMPBSA writes (output_file.py: 'GENERALIZED BORN:' and
+# 'POISSON BOLTZMANN:'), each with its own delta section and the same term names.
+BOTH_METHODS_DAT = textwrap.dedent("""\
+    | Run on Fri Sep  4 15:07:52 2026
+
+    GENERALIZED BORN:
+
+    Delta (Complex - Receptor - Ligand):
+    Energy Component       Average     SD(Prop.)         SD   SEM(Prop.)        SEM
+    -------------------------------------------------------------------------------
+    ΔVDWAALS                -23.57          1.18       2.83         0.37       0.90
+    ΔEGB                     17.85          0.14       3.04         0.04       0.96
+    ΔTOTAL                  -15.02          1.42       1.69         0.45       0.53
+
+    POISSON BOLTZMANN:
+
+    Delta (Complex - Receptor - Ligand):
+    Energy Component       Average     SD(Prop.)         SD   SEM(Prop.)        SEM
+    -------------------------------------------------------------------------------
+    ΔVDWAALS                -23.57          1.18       2.83         0.37       0.90
+    ΔEPB                     21.40          0.20       3.50         0.06       1.11
+    ΔTOTAL                  -11.11          1.50       1.80         0.47       0.57
+    """)
+
+
+class MmpbsaBothMethodsTests(WorkingDirectoryTestCase):
+    """Both methods can be ticked, and then every term appears twice."""
+
+    def parse(self):
+        with open(self.path("both.dat"), "w") as handle:
+            handle.write(BOTH_METHODS_DAT)
+        return utils.parse_mmpbsa_results(self.path("both.dat"))
+
+    def test_each_row_carries_the_method_that_produced_it(self):
+        """Without this the two ΔTOTALs are indistinguishable: -15.02 and -11.11
+        land in one table as duplicate rows with no way to tell them apart."""
+        frame = self.parse()
+
+        self.assertEqual(sorted(frame["Method"].unique()), ["GB", "PB"])
+        by_method = frame.set_index(["Method", "Term"])["Average (kcal/mol)"]
+        self.assertAlmostEqual(by_method[("GB", "ΔTOTAL")], -15.02)
+        self.assertAlmostEqual(by_method[("PB", "ΔTOTAL")], -11.11)
+
+    def test_both_delta_sections_are_read_in_full(self):
+        frame = self.parse()
+        self.assertEqual(len(frame), 6)
+        self.assertIn("ΔEGB", frame["Term"].tolist())
+        self.assertIn("ΔEPB", frame["Term"].tolist())
+
+    def test_a_single_method_report_still_has_one_method(self):
+        with open(self.path("one.dat"), "w") as handle:
+            handle.write(RESULTS_DAT)
+        frame = utils.parse_mmpbsa_results(self.path("one.dat"))
+
+        self.assertEqual(list(frame["Method"].unique()), ["GB"])
+
+    def test_the_chart_labels_say_which_method_each_bar_is(self):
+        with open(self.path("FINAL_RESULTS_MMPBSA.dat"), "w") as handle:
+            handle.write(BOTH_METHODS_DAT)
+
+        _, frame, figure, _, _, _, _, status = complex_workflow.on_load_mmpbsa_results(
+            self.working_directory_path, "FINAL_RESULTS_MMPBSA.dat", "system.pdb",
+            "traj.xtc", "mmpbsa.in")
+
+        labels = [tick.get_text() for tick in figure.axes[0].get_xticklabels()]
+        self.assertEqual(len(labels), len(set(labels)), f"duplicate bar labels: {labels}")
+        self.assertIn("ΔTOTAL (GB)", labels)
+        self.assertIn("ΔTOTAL (PB)", labels)
+        self.assertIn("GB, PB", figure.axes[0].get_title())
 
 
 class MmpbsaPerFrameTests(WorkingDirectoryTestCase):
@@ -835,6 +908,24 @@ class MmpbsaResultsLoadingTests(WorkingDirectoryTestCase):
         self.assertIsNotNone(series)
         self.assertEqual(series.axes[0].get_xlabel(), "Frame")
         self.assertIn("frame number", self.plain_text(status))
+
+    def test_a_broken_extra_costs_only_its_own_panel(self):
+        """The summary parsed fine; a malformed companion file must not take it,
+        the histogram and the time series down with it."""
+        self.write("FINAL_RESULTS_MMPBSA.dat", RESULTS_DAT)
+        self.write("FINAL_RESULTS_MMPBSA.csv", PER_FRAME_CSV)
+        self.write("FINAL_DECOMP_MMPBSA.csv", "not,a,decomposition\nfile,at,all\n")
+
+        _, frame, figure, series, histogram, decomposition, decomposition_figure, status = \
+            self.load()
+
+        self.assertIsNotNone(frame, "the summary table was discarded")
+        self.assertIsNotNone(figure)
+        self.assertIsNotNone(histogram, "the histogram was discarded")
+        self.assertIsNone(decomposition)
+        text = self.plain_text(status)
+        self.assertIn("successfully", text)
+        self.assertIn("decomposition", text.lower())
 
     def test_the_exported_residue_table_keeps_every_residue(self):
         """The chart shows the strongest few; the CSV is the whole table."""

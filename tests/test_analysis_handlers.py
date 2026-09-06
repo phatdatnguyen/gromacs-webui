@@ -144,6 +144,22 @@ class AnalysisErrorTests(WorkingDirectoryTestCase):
                 self.assertIn("Error", text)
                 self.assertIn("LIG", text)
 
+    def test_both_distance_analyses_name_a_missing_protein(self):
+        """They are siblings and should fail the same way. Only one had the
+        check, so the other returned an all-NaN series under a green status."""
+        write_structure_pdb(self.path("ligand_only.pdb"), n_residues=0, ions={"LIG": 2})
+        write_trajectory(self.path("ligand_only.pdb"), self.path("ligand_only.xtc"), n_frames=3)
+
+        for name in ("on_analyze_min_distance", "on_analyze_com_distance"):
+            with self.subTest(handler=name):
+                frame, figure, status = getattr(complex_workflow, name)(
+                    self.working_directory_path, "ligand_only.pdb", "ligand_only.xtc")
+
+                self.assertIsNone(frame)
+                text = self.plain_text(status)
+                self.assertIn("Error", text)
+                self.assertIn("protein", text.lower())
+
     def test_a_structure_without_a_protein_names_the_problem(self):
         write_structure_pdb(self.path("ions.pdb"), n_residues=0, ions={"NA": 3})
         write_trajectory(self.path("ions.pdb"), self.path("ions.xtc"), n_frames=3)

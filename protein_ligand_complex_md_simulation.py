@@ -29,11 +29,6 @@ def get_working_directories() -> list[str]:
     os.makedirs(base_path, exist_ok=True)
     return sorted((d for d in os.listdir(base_path) if os.path.isdir(os.path.join(base_path, d))), key=str.lower)
 
-# gmx_MMPBSA runs in the job directory, because a topology's #include lines only
-# resolve beside it, and leaves dozens of these behind. They are working files,
-# not results, so they are hidden the same way GROMACS backups are.
-MMPBSA_SCRATCH_PREFIX: str = "_GMXMMPBSA_"
-
 def get_files_in_working_directory(working_directory_path: str | None) -> list[str]:
     """Visible files in a job directory, hiding backups and tool scratch files.
 
@@ -1583,19 +1578,23 @@ def on_analyze_com_distance(working_directory_path: str, structure_file_name: st
         universe = mda.Universe(os.path.join(working_directory_path, structure_file_name),
                                 os.path.join(working_directory_path, input_traj_file_name))
         protein_selector = universe.select_atoms("protein")
+        if protein_selector.n_atoms == 0:
+            raise Exception("No protein atoms found. Is this a protein-ligand complex?")
         ligand_selector = _require_ligand(universe)
 
         # The time axis is built here rather than borrowed from an RMSD result, so
         # this analysis stands on its own now that it has its own button.
+        # Not named "distances": that is the MDAnalysis module this file imports,
+        # and shadowing it would break any later use of distance_array here.
         times_ns = []
-        distances = []
+        com_distances = []
         for timestep in universe.trajectory:
             times_ns.append(timestep.time / 1000)
-            distances.append(float(np.linalg.norm(
+            com_distances.append(float(np.linalg.norm(
                 protein_selector.center_of_mass() - ligand_selector.center_of_mass())))
 
         frame = pd.DataFrame({"Time (ns)": times_ns,
-                              "Center of mass distance (Å)": distances})
+                              "Center of mass distance (Å)": com_distances})
         figure = make_line_figure(frame, "Time (ns)", ylabel="Center of mass distance (Å)",
                                   title="Protein-ligand centre of mass distance")
         status = "Center of mass distance calculated successfully."
@@ -1638,6 +1637,17 @@ def _selection_error(exc: Exception, run_input_file_name: str,
     hint = describe_selection_candidates(run_input_file_name, working_directory_path)
     return f"{message}\n\n{hint}" if hint else message
 
+def _require_selected_files(**file_names: Any) -> None:
+    """Fail with the empty dropdown's name rather than a TypeError deep in argv.
+
+    A file dropdown holds None until the job directory contains a file of that
+    kind, and None reaching the command line raises "sequence item 3: expected
+    str instance" from ' '.join, which says nothing useful.
+    """
+    missing = [label for label, value in file_names.items() if not value]
+    if missing:
+        raise Exception("Select a file for: " + ", ".join(missing) + ".")
+
 def on_analyze_sasa(working_directory_path: str, run_input_file_name: str,
                     input_traj_file_name: str, surface_selection: str, output_selection: str,
                     probe_radius: float, sasa_file_name: str,
@@ -1653,6 +1663,14 @@ def on_analyze_sasa(working_directory_path: str, run_input_file_name: str,
     blocking stdin that wedges the worker thread indefinitely (measured: no
     -surface plus a live stdin hangs forever, stdin closed fails in a second).
     """
+    try:
+        _require_selected_files(**{"Run Input File Name": run_input_file_name,
+                                   "Input Trajectory File Name": input_traj_file_name})
+    except Exception as exc:
+        yield get_files_in_working_directory(working_directory_path), None, None, None, None, \
+            "<span style='color:red;'>Error calculating SASA!\n" + str(exc) + "</span>"
+        return
+
     cmd = [
         "gmx", "sasa",
         "-s", run_input_file_name,
@@ -1702,6 +1720,14 @@ def on_analyze_gyrate(working_directory_path: str, run_input_file_name: str,
                       input_traj_file_name: str, gyrate_selection: str, weighting_mode: str,
                       gyrate_file_name: str) -> Any:
     """Radius of gyration over time, total and about each axis."""
+    try:
+        _require_selected_files(**{"Run Input File Name": run_input_file_name,
+                                   "Input Trajectory File Name": input_traj_file_name})
+    except Exception as exc:
+        yield get_files_in_working_directory(working_directory_path), None, None, \
+            "<span style='color:red;'>Error calculating radius of gyration!\n" + str(exc) + "</span>"
+        return
+
     cmd = [
         "gmx", "gyrate",
         "-s", run_input_file_name,
@@ -1754,6 +1780,15 @@ def on_run_pca(working_directory_path: str, run_input_file_name: str, input_traj
     """
     files = get_files_in_working_directory(working_directory_path)
     try:
+        _require_selected_files(**{"Run Input File Name": run_input_file_name,
+                                   "Input Trajectory File Name": input_traj_file_name})
+        # Checked before gmx runs: covar on a production trajectory takes minutes,
+        # and failing afterwards would waste all of it and overwrite the outputs.
+        first = int(first_eigenvector)
+        second = int(second_eigenvector)
+        if second <= first:
+            raise Exception("The second eigenvector must be higher than the first.")
+
         select_cmd = [
             "gmx", "select",
             "-s", run_input_file_name,
@@ -1778,11 +1813,6 @@ def on_run_pca(working_directory_path: str, run_input_file_name: str, input_traj
         print(f"Running command (in {working_directory_path}): {' '.join(covar_cmd)}")
         yield files, None, None, None, None, format_running_status(covar_cmd, "Step 2 of 3")
         run_checked_command(covar_cmd, cwd=working_directory_path, stdin_input="")
-
-        first = int(first_eigenvector)
-        second = int(second_eigenvector)
-        if second <= first:
-            raise Exception("The second eigenvector must be higher than the first.")
 
         anaeig_cmd = [
             "gmx", "anaeig",
@@ -2086,10 +2116,18 @@ def on_load_mmpbsa_results(working_directory_path: str, mmpbsa_results_file_name
                                 f"finished? {MMPBSA_LOG_FILE_NAME} shows how far it got.")
 
         frame = parse_mmpbsa_results(results_file_path)
+        # A run that asked for both GB and PB reports every term twice. Say which
+        # is which on the axis, rather than drawing pairs of identical labels.
+        label_column, methods = "Term", sorted(frame["Method"].unique())
+        if len(methods) > 1:
+            label_column = "Term (method)"
+            frame = frame.assign(**{label_column: frame["Term"] + " (" + frame["Method"] + ")"})
+
         # Error bars use the plain per-frame SD rather than SD(Prop.): the
         # propagated one describes the components, not the spread of the delta.
-        figure = make_bar_figure(frame, "Term", "Average (kcal/mol)", "SD",
-                                 ylabel="ΔG (kcal/mol)", title="MM-PBSA energy decomposition")
+        figure = make_bar_figure(frame, label_column, "Average (kcal/mol)", "SD",
+                                 ylabel="ΔG (kcal/mol)",
+                                 title="MM-PBSA energy decomposition: " + ", ".join(methods))
 
         # Copy the results out of the scratch directory so they show in the file
         # table and can be opened in the text viewer.
@@ -2100,12 +2138,15 @@ def on_load_mmpbsa_results(working_directory_path: str, mmpbsa_results_file_name
         results_directory_path = os.path.dirname(results_file_path)
         # The per-frame and per-residue files sit beside the summary and are only
         # written when the run asked for them, so each is optional.
-        histogram_figure, missing = _load_binding_energy_histogram(results_directory_path)
-        series_figure, series_note = _load_binding_energy_series(
-            results_directory_path, working_directory_path, structure_file_name,
-            input_traj_file_name, mmpbsa_input_file_name)
-        decomposition, decomposition_figure, decomposition_missing = \
-            _load_residue_decomposition(results_directory_path)
+        # Each extra is loaded on its own: a malformed companion file must cost
+        # only its own panel, not the summary table and chart that already parsed.
+        histogram_figure, missing = _load_panel(
+            _load_binding_energy_histogram, 1, results_directory_path)
+        series_figure, series_note = _load_panel(
+            _load_binding_energy_series, 1, results_directory_path, working_directory_path,
+            structure_file_name, input_traj_file_name, mmpbsa_input_file_name)
+        decomposition, decomposition_figure, decomposition_missing = _load_panel(
+            _load_residue_decomposition, 2, results_directory_path)
 
         status = "MM-PBSA results loaded successfully."
         for note in (missing, series_note, decomposition_missing):
@@ -2119,6 +2160,20 @@ def on_load_mmpbsa_results(working_directory_path: str, mmpbsa_results_file_name
     return get_files_in_working_directory(working_directory_path), frame, figure, \
         series_figure, histogram_figure, decomposition, decomposition_figure, \
         "<span style='color:green;'>" + status + "</span>"
+
+def _load_panel(loader: Any, result_count: int, *arguments: Any) -> tuple[Any, ...]:
+    """Run one optional results panel, turning a failure into a note.
+
+    The panels are independent: the residue decomposition failing to parse should
+    not take the summary table, the histogram and the time series down with it,
+    which is what a single try/except around all of them did.
+    """
+    try:
+        return loader(*arguments)
+    except Exception as exc:
+        return (None,) * result_count + (f"{type(exc).__name__} while reading the "
+                                         f"{loader.__name__.removeprefix('_load_')} "
+                                         f"panel: {exc}",)
 
 def _load_binding_energy_histogram(results_directory_path: str) -> tuple[Any, str]:
     """The spread of the binding energy over the frames, if -eo was written."""
@@ -2143,6 +2198,12 @@ def _load_residue_decomposition(results_directory_path: str) -> tuple[Any, Any, 
                             f"residue contributions.")
 
     decomposition = parse_mmpbsa_decomposition(decomposition_path)
+    if "TOTAL" not in decomposition:
+        # The parser tolerates a file without a TOTAL column, so the chart has to
+        # as well; the table is still worth showing and exporting.
+        return decomposition, None, (f"{MMPBSA_DECOMP_PER_FRAME_FILE_NAME} has no TOTAL "
+                                     f"column, so the contributions are tabulated but "
+                                     f"not charted.")
     # Only the residues that matter: a long tail of near-zero contributions
     # would leave the significant ones unreadable.
     strongest = decomposition.reindex(

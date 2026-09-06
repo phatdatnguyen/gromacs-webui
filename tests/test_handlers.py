@@ -62,6 +62,25 @@ class WorkingDirectoryCallbackTests(WorkingDirectoryTestCase):
         self.assertNotIn("subdir", files)
         self.assertFalse([name for name in files if name.endswith("Zone.Identifier")])
 
+    def test_both_tabs_hide_exactly_the_same_files(self):
+        """A job directory is browsable from either tab, so the two listings have
+        to agree. They drifted once: only the complex tab hid the MM-PBSA scratch
+        files, so the same job showed 109 files in one tab and 80 in the other.
+        """
+        for name in ("protein.gro", "topol.top", "FINAL_RESULTS_MMPBSA.dat",
+                     "_GMXMMPBSA_COM.pdb", "_GMXMMPBSA_LIG.prmtop",
+                     "#backup.gro.1#", "notes.txt:Zone.Identifier"):
+            with open(self.path(name), "w") as handle:
+                handle.write("x")
+
+        listings = {module.__name__: module.get_files_in_working_directory(
+            self.working_directory_path) for module in (workflow, complex_workflow)}
+
+        self.assertEqual(*listings.values(), f"the two tabs disagree: {listings}")
+        shown = next(iter(listings.values()))
+        self.assertIn("FINAL_RESULTS_MMPBSA.dat", shown)
+        self.assertFalse([name for name in shown if name.startswith("_GMXMMPBSA_")], shown)
+
     def test_missing_directory_lists_nothing(self):
         self.assertEqual(workflow.get_files_in_working_directory("data/_unittest_absent"), [])
         self.assertEqual(workflow.get_files_in_working_directory(None), [])
@@ -341,6 +360,94 @@ class FileListChangeTests(WorkingDirectoryTestCase):
             returned = handler.fn(self.working_directory_path, *self.arguments(required - 1))
             self.assertIsInstance(returned, tuple)
             self.assertEqual(len(returned), len(handler.outputs))
+
+
+class WiringTests(unittest.TestCase):
+    """Every handler must return as many values as it is wired to display.
+
+    FileListChangeTests guards on_file_list_change by calling it; this covers the
+    rest statically, including the ones that would need a real GROMACS run or a
+    launched subprocess to reach. A handler wired to one output too many fails at
+    runtime with nothing in the logs to explain it.
+    """
+
+    @staticmethod
+    def return_widths():
+        """{(module, function): number of values returned}, from the source.
+
+        Keyed by module because the two tabs define handlers of the same name
+        with different shapes: on_open_working_directory returns five values in
+        one tab and six in the other.
+        """
+        import ast
+        import pathlib
+
+        widths = {}
+        for name in ("protein_md_simulation.py", "protein_ligand_complex_md_simulation.py"):
+            tree = ast.parse(pathlib.Path(name).read_text(encoding="utf-8"))
+            for node in tree.body:
+                if not isinstance(node, ast.FunctionDef) or not node.name.startswith("on_"):
+                    continue
+                found = set()
+                for sub in ast.walk(node):
+                    if isinstance(sub, ast.Return):
+                        value = sub.value
+                    elif isinstance(sub, ast.Expr) and isinstance(sub.value, ast.Yield):
+                        value = sub.value.value
+                    else:
+                        continue
+                    if isinstance(value, ast.Tuple):
+                        found.add(len(value.elts))
+                    elif value is not None and not isinstance(value, ast.Constant):
+                        found.add(1)
+                # Only handlers whose exits already agree; the next test covers
+                # the ones that do not.
+                if len(found) == 1:
+                    widths[(name[:-3], node.name)] = found.pop()
+        return widths
+
+    def test_every_exit_of_a_handler_returns_the_same_number_of_values(self):
+        """An error path one value short breaks only when something goes wrong."""
+        import ast
+        import pathlib
+
+        for name in ("protein_md_simulation.py", "protein_ligand_complex_md_simulation.py"):
+            tree = ast.parse(pathlib.Path(name).read_text(encoding="utf-8"))
+            for node in tree.body:
+                if not isinstance(node, ast.FunctionDef) or not node.name.startswith("on_"):
+                    continue
+                found = set()
+                for sub in ast.walk(node):
+                    if isinstance(sub, ast.Return):
+                        value = sub.value
+                    elif isinstance(sub, ast.Expr) and isinstance(sub.value, ast.Yield):
+                        value = sub.value.value
+                    else:
+                        continue
+                    if isinstance(value, ast.Tuple):
+                        found.add(len(value.elts))
+                    elif value is not None and not isinstance(value, ast.Constant):
+                        found.add(1)
+                with self.subTest(module=name, handler=node.name):
+                    self.assertLessEqual(len(found), 1,
+                                         f"{node.name} exits with {sorted(found)} values")
+
+    def test_every_handler_matches_the_outputs_it_is_wired_to(self):
+        import webui
+
+        widths = self.return_widths()
+        handlers = (webui.blocks.fns.values() if hasattr(webui.blocks.fns, "values")
+                    else webui.blocks.fns)
+        checked = 0
+        for handler in handlers:
+            key = (getattr(handler.fn, "__module__", ""), getattr(handler.fn, "__name__", ""))
+            if key not in widths or not handler.outputs:
+                continue
+            with self.subTest(module=key[0], handler=key[1]):
+                self.assertEqual(len(handler.outputs), widths[key])
+            checked += 1
+
+        self.assertGreater(checked, 50, "expected to check most of the wired handlers")
 
 
 class LigandUploadTests(WorkingDirectoryTestCase):
