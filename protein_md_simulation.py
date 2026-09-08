@@ -1307,9 +1307,10 @@ def on_add_ions(working_directory_path: str, run_input_file_name: str, output_fi
 
             if process.returncode != 0:
                 raise Exception(stderr)
-            validate_ionized_system_with_grompp(
+            validation_warning = validate_ionized_system_with_grompp(
                 staged_structure, staged_topology, working_directory_path,
-                runner=run_checked_command)
+                runner=run_checked_command,
+                allow_net_charge_warning=not neutralize)
             _publish_staged_files([
                 (staged_structure, os.path.join(working_directory_path, output_file_name)),
                 (staged_topology,
@@ -1317,11 +1318,15 @@ def on_add_ions(working_directory_path: str, run_input_file_name: str, output_fi
             ])
 
         status = "Ions added successfully."
+        color = "green"
+        if validation_warning:
+            status += " " + validation_warning
+            color = "orange"
     except Exception as exc:
         status = "Error adding ions!\n" + str(exc)
         return get_files_in_working_directory(working_directory_path), "<span style='color:red;'>" + status + "</span>"
         
-    return get_files_in_working_directory(working_directory_path), "<span style='color:green;'>" + status + "</span>"
+    return get_files_in_working_directory(working_directory_path), f"<span style='color:{color};'>" + status + "</span>"
 
 def on_generate_energy_minimization_mdp_file(working_directory_path: str, parameter_file_name: str,
                                              force_field: str) -> tuple[list[str], str]:
@@ -2622,11 +2627,12 @@ def protein_md_simulation_tab_content() -> None:
                     with gr.Row():
                         mpi_rank_slider = gr.Slider(label="MPI Ranks", minimum=1, maximum=get_default_cpu_count(), value=1, step=1)
                         omp_threads_slider = gr.Slider(label="OpenMP Threads", minimum=1, maximum=128, value=1, step=1)
-                        max_warns_slider = gr.Slider(label="Max Warnings (expert/dangerous override)", minimum=0, maximum=10, value=0, step=1)
-                        # CPU is the portable default.  Explicit GPU task flags
-                        # make mdrun fail immediately on hosts without a usable
-                        # accelerator, while users with one can opt in here.
-                        use_gpu = gr.Checkbox(label="Use GPU", value=False)
+                        max_warns_slider = gr.Slider(label="Max Warnings (expert/dangerous override)", minimum=0, maximum=10, value=5, step=1)
+                        # Default to acceleration only when this GROMACS build
+                        # and the current process can both see a CUDA device.
+                        use_gpu = gr.Checkbox(
+                            label="Use GPU",
+                            value=is_gromacs_cuda_gpu_available())
                 with gr.Accordion(label="Upload Protein Structure", open=True):
                     with gr.Row():
                         protein_structure_file_name_textbox = gr.Textbox(label="Protein File Name", value="protein.pdb")

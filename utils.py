@@ -14,6 +14,7 @@ import re
 import shutil
 import signal
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -65,6 +66,25 @@ NNPOT_MODEL_PACKAGES: dict[str, tuple[str, ...]] = {
 # every model; model-specific checks happen once a model has been selected.
 NNPOT_REQUIRED_PACKAGES: tuple[str, ...] = ("torch",)
 NNPOT_MODEL_BUILD_LOCK = threading.Lock()
+
+# Hardware discovery runs while the Gradio layout is created.  Keep every
+# external probe short so a broken driver cannot indefinitely delay start-up.
+GPU_DETECTION_TIMEOUT_SECONDS = 5.0
+_CUDA_DRIVER_DEVICE_COUNT_SCRIPT = r"""
+import ctypes
+import ctypes.util
+
+name = ctypes.util.find_library("cuda") or "libcuda.so.1"
+driver = ctypes.CDLL(name)
+driver.cuInit.argtypes = [ctypes.c_uint]
+driver.cuInit.restype = ctypes.c_int
+driver.cuDeviceGetCount.argtypes = [ctypes.POINTER(ctypes.c_int)]
+driver.cuDeviceGetCount.restype = ctypes.c_int
+count = ctypes.c_int()
+if driver.cuInit(0) != 0 or driver.cuDeviceGetCount(ctypes.byref(count)) != 0:
+    raise SystemExit(1)
+print(max(0, count.value))
+"""
 
 
 class IonSpecies(TypedDict):
@@ -203,6 +223,71 @@ def get_nnpot_unavailable_reason(model_name: str | None = None) -> str | None:
     if gromacs_reason is not None:
         reasons.append(gromacs_reason)
     return "\n\n".join(reasons) if reasons else None
+
+
+def _cuda_devices_explicitly_hidden() -> bool:
+    """Whether CUDA visibility was deliberately disabled for this process."""
+    value = os.environ.get("CUDA_VISIBLE_DEVICES")
+    if value is None:
+        return False
+    return value.strip().lower() in {
+        "", "-1", "none", "void", "nodevfiles",
+    }
+
+
+def _cuda_driver_device_count() -> int:
+    """Return the CUDA Driver API's visible device count, or zero on failure.
+
+    Querying the driver itself avoids treating a CUDA-enabled GROMACS build as
+    proof that the host currently exposes a GPU.  This stays lightweight and
+    does not import optional Torch/CuPy packages while constructing the UI.
+    """
+    try:
+        result = subprocess.run(
+            [sys.executable, "-c", _CUDA_DRIVER_DEVICE_COUNT_SCRIPT],
+            text=True, capture_output=True,
+            timeout=GPU_DETECTION_TIMEOUT_SECONDS,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return 0
+    if result.returncode != 0:
+        return 0
+    try:
+        return max(0, int((result.stdout or "").strip()))
+    except ValueError:
+        return 0
+
+
+@lru_cache(maxsize=1)
+def is_gromacs_cuda_gpu_available() -> bool:
+    """Whether the current ``gmx`` can use a visible CUDA GPU.
+
+    A CUDA-capable binary alone is insufficient: the same installation can be
+    launched on a CPU node, inside a container without GPU access, or with CUDA
+    explicitly hidden.  Require both build support and a successful CUDA Driver
+    API device query.  The relatively expensive probes run only once per server
+    process.
+    """
+    if _cuda_devices_explicitly_hidden():
+        return False
+
+    executable = shutil.which("gmx")
+    if executable is None:
+        return False
+    try:
+        result = subprocess.run(
+            [executable, "--version"], text=True, capture_output=True,
+            timeout=GPU_DETECTION_TIMEOUT_SECONDS,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+    output = (result.stdout or "") + "\n" + (result.stderr or "")
+    if result.returncode != 0 or re.search(
+            r"^\s*GPU support:\s*CUDA(?:\s|$)", output,
+            flags=re.MULTILINE | re.IGNORECASE) is None:
+        return False
+    return _cuda_driver_device_count() > 0
 
 
 @lru_cache(maxsize=1)
@@ -2398,16 +2483,74 @@ def validate_ion_species_charges(cation_name: Any, cation_charge: int,
     return normalized_names[0], normalized_names[1]
 
 
+@contextmanager
+def _temporary_topology_at_include_base(
+        topology_file_path: str,
+        working_directory_path: str) -> Iterator[str]:
+    """Expose a private topology copy beside its job-local ``#include`` files.
+
+    Ion addition is staged in a private subdirectory so a failed ``genion``
+    cannot damage the last good GRO/topology pair.  GROMACS resolves quoted
+    topology includes relative to the file containing them, however, so using
+    that staged topology directly makes ordinary sibling includes such as
+    ``ligand_GMX.itp`` disappear.  A short-lived copy at the original include
+    base preserves GROMACS' own preprocessor semantics without attempting to
+    interpret conditional, nested, cyclic, missing, or force-field includes in
+    application code.
+
+    The caller already holds the working-directory maintenance lease.  Keep the
+    temporary file mode created by ``mkstemp`` (rather than copying metadata),
+    and remove it even when the command or subsequent validation raises.
+    """
+    include_base = os.path.realpath(working_directory_path)
+    source_path = os.path.abspath(topology_file_path)
+    resolved_source = os.path.realpath(source_path)
+    try:
+        source_is_local = os.path.commonpath(
+            (include_base, resolved_source)) == include_base
+    except ValueError:
+        source_is_local = False
+    if not source_is_local:
+        raise ValueError(
+            "The staged ion topology must stay inside its working directory.")
+    if os.path.islink(source_path) or not os.path.isfile(source_path):
+        raise ValueError("The staged ion topology must be a regular file.")
+
+    descriptor, temporary_path = tempfile.mkstemp(
+        prefix="#gromacs_webui_validate_ions_",
+        suffix=".top",
+        dir=include_base,
+    )
+    try:
+        # Open the already-created destination first so ``descriptor`` is
+        # closed even if opening or reading the staged source fails.
+        with os.fdopen(descriptor, "wb") as destination, \
+                open(source_path, "rb") as source:
+            shutil.copyfileobj(source, destination)
+            destination.flush()
+            os.fsync(destination.fileno())
+        yield temporary_path
+    finally:
+        try:
+            os.unlink(temporary_path)
+        except FileNotFoundError:
+            pass
+
+
 def validate_ionized_system_with_grompp(
         structure_file_path: str, topology_file_path: str,
-        working_directory_path: str, runner: Any = None) -> None:
+        working_directory_path: str, runner: Any = None, *,
+        allow_net_charge_warning: bool = False) -> str | None:
     """Prove that genion's residue names exist in the selected topology.
 
     ``gmx genion`` accepts arbitrary names and charges and can exit successfully
     even when the force field has no corresponding ``[ moleculetype ]``.  The
     failure then appears only at the next simulation step.  A disposable grompp
     run catches that contract violation before the staged GRO/topology pair is
-    published.
+    published. When the user deliberately disables neutralization, the one
+    expected Ewald net-charge warning can be allowed without hiding any other
+    warning. Returns a user-facing warning only when that warning was actually
+    observed.
     """
     force_field = get_topology_force_field_name(topology_file_path)
     if force_field is None:
@@ -2426,18 +2569,63 @@ def validate_ionized_system_with_grompp(
     with open(validation_mdp, "w", encoding="utf-8") as handle:
         handle.write(get_default_ion_addition_mdp_file_content(force_field))
 
-    command = [
-        "gmx", "grompp",
-        "-f", validation_mdp,
-        "-c", structure_file_path,
-        "-p", topology_file_path,
-        "-o", validation_tpr,
-        "-po", validation_processed_mdp,
-        "-maxwarn", "0",
+    allow_gromos_warning = get_force_field_family(force_field) == "GROMOS"
+    allowed_warning_count = (
+        int(allow_gromos_warning) + int(allow_net_charge_warning)
+    )
+    with _temporary_topology_at_include_base(
+            topology_file_path, working_directory_path) as validation_topology:
+        command = [
+            "gmx", "grompp",
+            "-f", validation_mdp,
+            "-c", structure_file_path,
+            "-p", validation_topology,
+            "-o", validation_tpr,
+            "-po", validation_processed_mdp,
+            "-maxwarn", str(allowed_warning_count),
+        ]
+        process = runner(command, cwd=working_directory_path)
+    stderr = getattr(process, "stderr", "")
+    stdout = getattr(process, "stdout", "")
+    output = ((stderr if isinstance(stderr, str) else "") + "\n"
+              + (stdout if isinstance(stdout, str) else ""))
+    warning_blocks = _extract_gromacs_warning_blocks(output)
+    summary_counts = [
+        int(value) for value in re.findall(
+            r"(?im)^\s*There (?:was|were)\s+(\d+)\s+WARNING(?:S)?\s*$",
+            output)
     ]
-    run_grompp_with_gromos_warning_policy(
-        command, working_directory_path, topology_file_path, 0,
-        runner=runner)
+    if summary_counts and any(
+            count != len(warning_blocks) for count in summary_counts):
+        raise ValueError(
+            "Ion validation could not account for every warning reported by "
+            "grompp. No staged ion files were kept."
+        )
+
+    observed_kinds: set[str] = set()
+    for warning_block in warning_blocks:
+        if (allow_gromos_warning
+                and _is_gromos_single_range_warning(warning_block)):
+            warning_kind = "gromos-single-range"
+        elif (allow_net_charge_warning
+              and _is_ewald_net_charge_warning(warning_block)):
+            warning_kind = "ewald-net-charge"
+        else:
+            raise ValueError(
+                "Ion validation emitted a warning outside its narrow "
+                "compatibility allowance. No staged ion files were kept:\n"
+                + warning_block
+            )
+        if warning_kind in observed_kinds:
+            raise ValueError(
+                "Ion validation emitted the same allowed warning more than "
+                "once. No staged ion files were kept:\n" + warning_block
+            )
+        observed_kinds.add(warning_kind)
+
+    if "ewald-net-charge" in observed_kinds:
+        return IONIZED_SYSTEM_NET_CHARGE_WARNING
+    return None
 
 
 def validate_ion_addition_parameters(
@@ -4464,6 +4652,32 @@ GROMOS_SINGLE_RANGE_WARNING = (
     "for your system. No other grompp warning was bypassed."
 )
 
+IONIZED_SYSTEM_NET_CHARGE_WARNING = (
+    "The ionized system remains net charged because Neutralize System was "
+    "disabled. PME/Ewald will use a uniform background charge; review the "
+    "resulting electrostatics before running MD."
+)
+
+
+def _is_gromos_single_range_warning(warning_block: str) -> bool:
+    """Recognise the one compatibility warning expected for modern GROMOS."""
+    warning_text = " ".join(warning_block.lower().split())
+    return all(fragment in warning_text for fragment in (
+        "the gromos force fields have been parametrized",
+        "twin-range cut-off",
+        "single-range cut-off",
+    ))
+
+
+def _is_ewald_net_charge_warning(warning_block: str) -> bool:
+    """Recognise grompp's warning for PME/Ewald on a charged system."""
+    warning_text = " ".join(warning_block.lower().split())
+    return all(fragment in warning_text for fragment in (
+        "you are using ewald electrostatics in a system with net charge",
+        "uniform background charge",
+        "neutralize your system with counter ions",
+    ))
+
 
 def run_grompp_with_gromos_warning_policy(
         cmd: Sequence[str], cwd: str, topology_file_path: str,
@@ -4536,14 +4750,11 @@ def run_grompp_with_gromos_warning_policy(
         ]
         warning_count = max(summary_counts, default=len(warning_blocks))
 
-        warning_text = "\n".join(warning_blocks).lower()
         allowance_unused = warning_count == 0 and not warning_blocks
         expected = (
             warning_count == 1
             and len(warning_blocks) == 1
-            and "the gromos force fields have been parametrized" in warning_text
-            and "twin-range cut-off" in warning_text
-            and "single-range cut-off" in warning_text
+            and _is_gromos_single_range_warning(warning_blocks[0])
         )
         if not (allowance_unused or expected):
             observed = "\n\n".join(warning_blocks) or (

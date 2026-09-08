@@ -474,6 +474,131 @@ class StopProcessGracefullyTests(unittest.TestCase):
         getpgid.assert_not_called()
 
 
+class GpuDefaultDetectionTests(unittest.TestCase):
+    CUDA_VERSION = "GROMACS version: 2026.3\nGPU support:         CUDA\n"
+
+    def setUp(self):
+        utils.is_gromacs_cuda_gpu_available.cache_clear()
+
+    def tearDown(self):
+        utils.is_gromacs_cuda_gpu_available.cache_clear()
+
+    def test_explicitly_hidden_cuda_devices_disable_the_default(self):
+        for value in ("", "-1", "none", "void", "NoDevFiles"):
+            with self.subTest(value=value), unittest.mock.patch.dict(
+                    utils.os.environ,
+                    {"CUDA_VISIBLE_DEVICES": value}, clear=True), \
+                    unittest.mock.patch.object(utils.shutil, "which") as which, \
+                    unittest.mock.patch.object(utils.subprocess, "run") as run:
+                utils.is_gromacs_cuda_gpu_available.cache_clear()
+                self.assertFalse(utils.is_gromacs_cuda_gpu_available())
+                which.assert_not_called()
+                run.assert_not_called()
+
+    def test_missing_gmx_keeps_the_default_off(self):
+        with unittest.mock.patch.dict(utils.os.environ, {}, clear=True), \
+                unittest.mock.patch.object(
+                    utils.shutil, "which", return_value=None), \
+                unittest.mock.patch.object(utils.subprocess, "run") as run:
+            self.assertFalse(utils.is_gromacs_cuda_gpu_available())
+        run.assert_not_called()
+
+    def test_cpu_only_and_non_cuda_builds_keep_the_default_off(self):
+        for support in ("disabled", "OpenCL", "SYCL"):
+            version = subprocess.CompletedProcess(
+                ["/opt/gromacs/bin/gmx", "--version"], 0,
+                stdout=f"GPU support: {support}\n", stderr="")
+            with self.subTest(support=support), unittest.mock.patch.dict(
+                    utils.os.environ, {}, clear=True), \
+                    unittest.mock.patch.object(
+                        utils.shutil, "which", return_value="/opt/gromacs/bin/gmx"), \
+                    unittest.mock.patch.object(
+                        utils.subprocess, "run", return_value=version), \
+                    unittest.mock.patch.object(
+                        utils, "_cuda_driver_device_count") as device_count:
+                utils.is_gromacs_cuda_gpu_available.cache_clear()
+                self.assertFalse(utils.is_gromacs_cuda_gpu_available())
+                device_count.assert_not_called()
+
+    def test_cuda_build_without_a_visible_device_keeps_the_default_off(self):
+        version = subprocess.CompletedProcess(
+            ["/opt/gromacs/bin/gmx", "--version"], 0,
+            stdout=self.CUDA_VERSION, stderr="")
+        with unittest.mock.patch.dict(utils.os.environ, {}, clear=True), \
+                unittest.mock.patch.object(
+                    utils.shutil, "which", return_value="/opt/gromacs/bin/gmx"), \
+                unittest.mock.patch.object(
+                    utils.subprocess, "run", return_value=version), \
+                unittest.mock.patch.object(
+                    utils, "_cuda_driver_device_count", return_value=0):
+            self.assertFalse(utils.is_gromacs_cuda_gpu_available())
+
+    def test_cuda_build_with_a_visible_device_enables_and_caches_default(self):
+        version = subprocess.CompletedProcess(
+            ["/opt/gromacs/bin/gmx", "--version"], 0,
+            stdout=self.CUDA_VERSION, stderr="")
+        with unittest.mock.patch.dict(utils.os.environ, {}, clear=True), \
+                unittest.mock.patch.object(
+                    utils.shutil, "which", return_value="/opt/gromacs/bin/gmx"), \
+                unittest.mock.patch.object(
+                    utils.subprocess, "run", return_value=version) as run, \
+                unittest.mock.patch.object(
+                    utils, "_cuda_driver_device_count", return_value=2) as count:
+            self.assertTrue(utils.is_gromacs_cuda_gpu_available())
+            self.assertTrue(utils.is_gromacs_cuda_gpu_available())
+        run.assert_called_once()
+        count.assert_called_once()
+
+    def test_failed_or_timed_out_version_probe_keeps_the_default_off(self):
+        failures = (
+            subprocess.CompletedProcess(
+                ["gmx", "--version"], 1, stdout=self.CUDA_VERSION, stderr=""),
+            subprocess.TimeoutExpired(["gmx", "--version"], 5),
+            OSError("cannot execute"),
+        )
+        for failure in failures:
+            kwargs = ({"return_value": failure} if isinstance(
+                failure, subprocess.CompletedProcess) else {"side_effect": failure})
+            with self.subTest(failure=type(failure).__name__), \
+                    unittest.mock.patch.dict(utils.os.environ, {}, clear=True), \
+                    unittest.mock.patch.object(
+                        utils.shutil, "which", return_value="gmx"), \
+                    unittest.mock.patch.object(utils.subprocess, "run", **kwargs), \
+                    unittest.mock.patch.object(
+                        utils, "_cuda_driver_device_count") as device_count:
+                utils.is_gromacs_cuda_gpu_available.cache_clear()
+                self.assertFalse(utils.is_gromacs_cuda_gpu_available())
+                device_count.assert_not_called()
+
+    def test_driver_probe_parses_count_and_fails_closed(self):
+        outcomes = (
+            (subprocess.CompletedProcess([], 0, stdout="2\n", stderr=""), 2),
+            (subprocess.CompletedProcess([], 0, stdout="not-a-count", stderr=""), 0),
+            (subprocess.CompletedProcess([], 1, stdout="2\n", stderr="failed"), 0),
+            (subprocess.TimeoutExpired(["python", "-c"], 5), 0),
+        )
+        for outcome, expected in outcomes:
+            kwargs = ({"return_value": outcome} if isinstance(
+                outcome, subprocess.CompletedProcess) else {"side_effect": outcome})
+            with self.subTest(expected=expected), unittest.mock.patch.object(
+                    utils.subprocess, "run", **kwargs):
+                self.assertEqual(utils._cuda_driver_device_count(), expected)
+
+    def test_both_workflow_checkboxes_use_the_detected_default(self):
+        import gradio as gr
+        import webui
+
+        expected = utils.is_gromacs_cuda_gpu_available()
+        checkboxes = [
+            block for block in webui.blocks.blocks.values()
+            if isinstance(block, gr.Checkbox)
+            and getattr(block, "label", None) == "Use GPU"
+        ]
+        self.assertEqual(len(checkboxes), 2)
+        self.assertEqual([checkbox.value for checkbox in checkboxes],
+                         [expected, expected])
+
+
 class GpuOptionTests(unittest.TestCase):
     def test_gpu_off_names_the_cpu_rather_than_staying_silent(self):
         """Passing nothing leaves every task on "auto", which picks a found GPU."""

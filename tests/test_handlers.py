@@ -432,6 +432,48 @@ class WorkflowSafetyContractTests(WorkingDirectoryTestCase):
                 self.assertIn("Expert override", self.plain_text(status))
                 self.assertIn("2 warning", self.plain_text(status))
 
+    def test_ion_grompp_accepts_the_normal_charge_warning_with_default_value(self):
+        """Ion placement necessarily preprocesses the still-charged system."""
+        with open(self.path("topol.top"), "w") as handle:
+            handle.write('#include "amber99sb-ildn.ff/forcefield.itp"\n')
+        with open(self.path("ions.mdp"), "w") as handle:
+            handle.write(
+                "integrator = steep\ncutoff-scheme = Verlet\n"
+                "rlist = 1.0\nrvdw = 1.0\nrcoulomb = 1.0\n"
+                "coulombtype = PME\nDispCorr = EnerPres\n")
+
+        net_charge_warning = """WARNING 1 [file topol.top, line 10]:
+  You are using Ewald electrostatics in a system with net charge.
+
+There was 1 WARNING
+"""
+        for module in (workflow, complex_workflow):
+            commands = []
+
+            def charged_system_succeeds(command, cwd):
+                commands.append(command)
+                self.assertEqual(
+                    command[command.index("-maxwarn") + 1], "5")
+                with open(command[command.index("-o") + 1], "w") as handle:
+                    handle.write("ion input")
+                with open(command[command.index("-po") + 1], "w") as handle:
+                    handle.write("processed mdp")
+                return subprocess.CompletedProcess(
+                    command, 0, stdout="", stderr=net_charge_warning)
+
+            with self.subTest(module=module.__name__), \
+                    unittest.mock.patch.object(
+                        module, "run_checked_command",
+                        side_effect=charged_system_succeeds):
+                _, status = module.on_generate_ions_tpr_file(
+                    self.working_directory_path, "input.gro", "topol.top",
+                    "ions.mdp", "ions.tpr", 5)
+
+            self.assertEqual(len(commands), 1)
+            self.assertIn("generated successfully", self.plain_text(status))
+            self.assertIn("color:orange", status)
+            self.assertIn("up to 5 warning", self.plain_text(status))
+
     def _write_gromos_grompp_inputs(self):
         with open(self.path("topol.top"), "w") as handle:
             handle.write('#include "gromos54a7.ff/forcefield.itp"\n')
@@ -801,7 +843,7 @@ There was 1 WARNING
 
 
 class ShippedSafetyDefaultsTests(unittest.TestCase):
-    def test_timestep_and_maxwarn_components_ship_with_safe_defaults(self):
+    def test_timestep_and_maxwarn_components_ship_with_configured_defaults(self):
         import gradio as gr
         import webui
 
@@ -818,7 +860,7 @@ class ShippedSafetyDefaultsTests(unittest.TestCase):
                    and str(getattr(block, "label", "")).startswith("Max Warnings")]
         self.assertEqual(len(maxwarn), 2)
         for slider in maxwarn:
-            self.assertEqual(slider.value, 0)
+            self.assertEqual(slider.value, 5)
             self.assertIn("dangerous", slider.label)
 
     def test_force_field_is_wired_into_every_tpr_and_box_handler(self):
@@ -1280,6 +1322,82 @@ class LigandTopologyGenerationTests(WorkingDirectoryTestCase):
             self.assertIn("[ position_restraints ]", handle.read())
 
 
+class IonValidationWarningPolicyTests(WorkingDirectoryTestCase):
+    GROMOS_WARNING = """WARNING 1 [file topol.top, line 2]:
+  The GROMOS force fields have been parametrized with a physically incorrect
+  multiple-time-stepping scheme for a twin-range cut-off. When used with a
+  single-range cut-off, physical properties might differ."""
+    NET_CHARGE_WARNING = """WARNING 2 [file topol.top, line 10]:
+  You are using Ewald electrostatics in a system with net charge. This can lead
+  to artifacts due to the uniform background charge. We suggest to neutralize
+  your system with counter ions."""
+    UNRELATED_WARNING = """WARNING 3 [file topol.top, line 20]:
+  Atom names do not match and require manual inspection."""
+
+    @staticmethod
+    def warning_output(*blocks, reported_count=None):
+        count = len(blocks) if reported_count is None else reported_count
+        verb = "was" if count == 1 else "were"
+        noun = "WARNING" if count == 1 else "WARNINGS"
+        return "\n\n".join(blocks) + f"\n\nThere {verb} {count} {noun}\n"
+
+    def invoke(self, force_field, output, allow_net_charge_warning):
+        with open(self.path("ions.gro"), "w") as handle:
+            handle.write("ions\n0\n1 1 1\n")
+        with open(self.path("ions.top"), "w") as handle:
+            handle.write(f'#include "{force_field}.ff/forcefield.itp"\n')
+        commands = []
+
+        def runner(command, cwd):
+            commands.append(command)
+            return subprocess.CompletedProcess(
+                command, 0, stdout="", stderr=output)
+
+        result = utils.validate_ionized_system_with_grompp(
+            self.path("ions.gro"), self.path("ions.top"),
+            self.working_directory_path, runner=runner,
+            allow_net_charge_warning=allow_net_charge_warning)
+        return result, commands[0]
+
+    def test_expected_net_charge_and_gromos_warnings_are_narrowly_allowed(self):
+        cases = (
+            ("amber99sb-ildn", (self.NET_CHARGE_WARNING,), True, "1", True),
+            ("gromos54a7", (self.GROMOS_WARNING,), False, "1", False),
+            ("gromos54a7",
+             (self.GROMOS_WARNING, self.NET_CHARGE_WARNING), True, "2", True),
+        )
+        for force_field, warnings, allow_charge, maxwarn, reports_charge in cases:
+            with self.subTest(force_field=force_field, warnings=len(warnings)):
+                result, command = self.invoke(
+                    force_field, self.warning_output(*warnings), allow_charge)
+                self.assertEqual(
+                    command[command.index("-maxwarn") + 1], maxwarn)
+                self.assertEqual(result is not None, reports_charge)
+
+    def test_unexpected_or_unrequested_warnings_are_rejected(self):
+        cases = (
+            ("amber99sb-ildn", (self.NET_CHARGE_WARNING,), False),
+            ("amber99sb-ildn", (self.UNRELATED_WARNING,), True),
+            ("gromos54a7",
+             (self.GROMOS_WARNING, self.NET_CHARGE_WARNING), False),
+            ("amber99sb-ildn",
+             (self.NET_CHARGE_WARNING, self.NET_CHARGE_WARNING), True),
+        )
+        for force_field, warnings, allow_charge in cases:
+            with self.subTest(force_field=force_field, warnings=len(warnings)), \
+                    self.assertRaisesRegex(ValueError, "narrow|same allowed"):
+                self.invoke(
+                    force_field, self.warning_output(*warnings), allow_charge)
+
+    def test_warning_summary_must_match_the_parsed_blocks(self):
+        with self.assertRaisesRegex(ValueError, "account for every warning"):
+            self.invoke(
+                "amber99sb-ildn",
+                self.warning_output(
+                    self.NET_CHARGE_WARNING, reported_count=2),
+                True)
+
+
 class IonAdditionContractTests(WorkingDirectoryTestCase):
     class SuccessfulGenion:
         returncode = 0
@@ -1388,6 +1506,33 @@ class IonAdditionContractTests(WorkingDirectoryTestCase):
                     self.assertEqual(command[command.index("-pq") + 1], "3")
                     self.assertEqual(command[command.index("-nq") + 1], "-2")
                     self.assertIn("successfully", self.plain_text(status))
+
+    def test_callers_only_allow_and_surface_intentional_net_charge(self):
+        for module in (workflow, complex_workflow):
+            for neutralize, validation_result, color in (
+                    (True, None, "green"),
+                    (False, utils.IONIZED_SYSTEM_NET_CHARGE_WARNING, "orange")):
+                with self.subTest(module=module.__name__, neutralize=neutralize), \
+                        unittest.mock.patch.object(
+                            module, "_find_sol_group", return_value="13"), \
+                        unittest.mock.patch.object(
+                            module.subprocess, "Popen",
+                            side_effect=self.SuccessfulGenion), \
+                        unittest.mock.patch.object(
+                            module, "validate_ionized_system_with_grompp",
+                            return_value=validation_result) as validate:
+                    _, status = module.on_add_ions(
+                        self.working_directory_path, "ions.tpr", "ions.gro",
+                        "input.top", "ions.top", "NA", "CL",
+                        "Concentration", 150, 1, -1, 0, 0, neutralize)
+
+                self.assertIs(
+                    validate.call_args.kwargs["allow_net_charge_warning"],
+                    not neutralize)
+                self.assertIn(f"color:{color}", status)
+                self.assertEqual(
+                    "uniform background charge" in self.plain_text(status),
+                    not neutralize)
 
     def test_ion_names_are_normalized_and_malformed_values_are_rejected(self):
         for module in (workflow, complex_workflow):
