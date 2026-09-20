@@ -1257,7 +1257,7 @@ def on_add_ions(working_directory_path: str, run_input_file_name: str, output_fi
                 input_topology_file_name: str, output_topology_file_name: str, cation_name: str,
                 anion_name: str, add_ion_method: str, concentration: float, cation_charge: int,
                 anion_charge: int, number_of_cations: int, number_of_anions: int,
-                neutralize: bool) -> tuple[list[str], str]:
+                neutralize: bool, max_warnings: int = 5) -> tuple[list[str], str]:
     """Run genion to neutralise the system and reach the requested ion content."""
     try:
         (add_ion_method, concentration, cation_charge, anion_charge,
@@ -1267,6 +1267,7 @@ def on_add_ions(working_directory_path: str, run_input_file_name: str, output_fi
             number_of_cations, number_of_anions, neutralize)
         cation_name, anion_name = validate_ion_species_charges(
             cation_name, cation_charge, anion_name, anion_charge)
+        max_warnings = _normalise_max_warnings(max_warnings)
         with reserve_working_directory_maintenance(working_directory_path), \
                 tempfile.TemporaryDirectory(
                 prefix=".genion_stage_", dir=working_directory_path) as stage_directory:
@@ -1310,7 +1311,8 @@ def on_add_ions(working_directory_path: str, run_input_file_name: str, output_fi
             validation_warning = validate_ionized_system_with_grompp(
                 staged_structure, staged_topology, working_directory_path,
                 runner=run_checked_command,
-                allow_net_charge_warning=not neutralize)
+                allow_net_charge_warning=not neutralize,
+                max_warnings=max_warnings)
             _publish_staged_files([
                 (staged_structure, os.path.join(working_directory_path, output_file_name)),
                 (staged_topology,
@@ -3060,7 +3062,7 @@ def protein_md_simulation_tab_content() -> None:
     generate_ions_parameter_file_button.click(on_generate_ions_mdp_file, [working_directory_path_state, generate_ions_parameter_file_name_textbox, force_field_dropdown], [working_directory_file_list_state, status_markdown])
     generate_ions_run_input_file_button.click(on_generate_ions_tpr_file, [working_directory_path_state, generate_ions_input_file_name_dropdown, generate_ions_input_topology_file_name_dropdown, generate_ions_parameter_file_dropdown, generate_ions_run_input_file_name_textbox, max_warns_slider, force_field_dropdown], [working_directory_file_list_state, status_markdown])
     add_ion_method_radio.change(on_add_ions_method_change, add_ion_method_radio, [concentration_slider, cation_charge_slider, anion_charge_slider, number_of_cations_slider, number_of_anions_slider])
-    add_ions_button.click(on_add_ions, [working_directory_path_state, generate_ions_run_input_file_dropdown, generate_ions_output_file_name_textbox, generate_ions_input_topology_file_name_dropdown, generate_ions_output_topology_file_name_textbox, cation_name_textbox, anion_name_textbox, add_ion_method_radio, concentration_slider, cation_charge_slider, anion_charge_slider, number_of_cations_slider, number_of_anions_slider, netralize_checkbox], [working_directory_file_list_state, status_markdown])
+    add_ions_button.click(on_add_ions, [working_directory_path_state, generate_ions_run_input_file_dropdown, generate_ions_output_file_name_textbox, generate_ions_input_topology_file_name_dropdown, generate_ions_output_topology_file_name_textbox, cation_name_textbox, anion_name_textbox, add_ion_method_radio, concentration_slider, cation_charge_slider, anion_charge_slider, number_of_cations_slider, number_of_anions_slider, netralize_checkbox, max_warns_slider], [working_directory_file_list_state, status_markdown])
     
     # Energy minimization interaction
     energy_minimization_parameter_file_button.click(on_generate_energy_minimization_mdp_file, [working_directory_path_state, energy_minimization_parameter_file_name_textbox, force_field_dropdown], [working_directory_file_list_state, status_markdown])

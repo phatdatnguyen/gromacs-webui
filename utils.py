@@ -825,6 +825,7 @@ def run_managed_command(cmd: Sequence[str], cwd: str | None = None,
                         pass
         release_process_job(job_key, proc)
 
+    _print_gromacs_warnings_to_terminal(process, cmd)
     return process
 
 
@@ -902,6 +903,9 @@ def run_checked_command(cmd: Sequence[str], cwd: str | None = None,
 _GROMACS_WARNING_HEADER_RE = re.compile(
     r"(?m)^\s*WARNING\s+\d+\b.*$")
 
+_GROMACS_TERMINAL_WARNING_HEADER_RE = re.compile(
+    r"(?m)^\s*WARNING(?:\s+\d+\b.*|\s*:[^\n]*|\s*)$")
+
 
 def _extract_gromacs_warning_blocks(output: str) -> list[str]:
     """Extract numbered GROMACS warning paragraphs from mixed stderr output."""
@@ -912,6 +916,56 @@ def _extract_gromacs_warning_blocks(output: str) -> list[str]:
             paragraph_end = len(output)
         blocks.append(output[match.start():paragraph_end].strip())
     return blocks
+
+
+def _extract_gromacs_terminal_warning_blocks(output: str) -> list[str]:
+    """Extract numbered and ``WARNING:`` GROMACS terminal diagnostics."""
+    blocks: list[str] = []
+    for match in _GROMACS_TERMINAL_WARNING_HEADER_RE.finditer(output):
+        paragraph_end = output.find("\n\n", match.end())
+        if paragraph_end < 0:
+            paragraph_end = len(output)
+        blocks.append(output[match.start():paragraph_end].strip())
+    return blocks
+
+
+def _is_gromacs_driver_command(cmd: Sequence[str]) -> bool:
+    """Whether ``cmd`` launches a standard GROMACS command-line driver."""
+    if not cmd:
+        return False
+    executable = os.path.basename(os.fspath(cmd[0])).lower()
+    if executable.endswith(".exe"):
+        executable = executable[:-4]
+    return executable in {"gmx", "gmx_d", "gmx_mpi", "gmx_mpi_d"}
+
+
+def _print_gromacs_warnings_to_terminal(
+        process: subprocess.CompletedProcess[str],
+        cmd: Sequence[str]) -> None:
+    """Print captured GROMACS warning blocks once, including on success.
+
+    Synchronous commands use captured pipes so their diagnostics cannot flood
+    memory or deadlock a worker. That also used to hide warnings whenever a
+    command succeeded under ``grompp -maxwarn``. Keep the bounded capture, but
+    mirror numbered and unnumbered warnings to the server terminal for review.
+    """
+    if not _is_gromacs_driver_command(cmd):
+        return
+
+    stderr = process.stderr if isinstance(process.stderr, str) else ""
+    stdout = process.stdout if isinstance(process.stdout, str) else ""
+    warning_blocks = _extract_gromacs_terminal_warning_blocks(
+        stderr + "\n" + stdout)
+    if not warning_blocks:
+        return
+
+    command_name = " ".join(str(part) for part in cmd[:2]) or "GROMACS"
+    print(
+        f"GROMACS warning(s) from {command_name}:\n"
+        + "\n\n".join(warning_blocks),
+        file=sys.stderr,
+        flush=True,
+    )
 
 
 _GROMACS_ERROR_HEADER_RE = re.compile(r"(?m)^\s*ERROR\s+\d+\b.*$")
@@ -2540,17 +2594,19 @@ def _temporary_topology_at_include_base(
 def validate_ionized_system_with_grompp(
         structure_file_path: str, topology_file_path: str,
         working_directory_path: str, runner: Any = None, *,
-        allow_net_charge_warning: bool = False) -> str | None:
+        allow_net_charge_warning: bool = False,
+        max_warnings: int = 0) -> str | None:
     """Prove that genion's residue names exist in the selected topology.
 
     ``gmx genion`` accepts arbitrary names and charges and can exit successfully
     even when the force field has no corresponding ``[ moleculetype ]``.  The
     failure then appears only at the next simulation step.  A disposable grompp
     run catches that contract violation before the staged GRO/topology pair is
-    published. When the user deliberately disables neutralization, the one
-    expected Ewald net-charge warning can be allowed without hiding any other
-    warning. Returns a user-facing warning only when that warning was actually
-    observed.
+    published. ``max_warnings`` is the same expert override selected in the UI:
+    a positive value delegates warning acceptance to grompp, while zero retains
+    the narrow automatic allowances required for GROMOS and an intentionally
+    non-neutral system. Returns a user-facing warning only when a warning was
+    actually observed.
     """
     force_field = get_topology_force_field_name(topology_file_path)
     if force_field is None:
@@ -2560,6 +2616,8 @@ def validate_ionized_system_with_grompp(
         )
     if runner is None:
         runner = run_checked_command
+    max_warnings = _exact_integer_in_range(
+        max_warnings, "Max Warnings", 0, 10)
 
     stage_directory = os.path.dirname(os.path.realpath(topology_file_path))
     validation_mdp = os.path.join(stage_directory, ".validate_ions.mdp")
@@ -2570,8 +2628,11 @@ def validate_ionized_system_with_grompp(
         handle.write(get_default_ion_addition_mdp_file_content(force_field))
 
     allow_gromos_warning = get_force_field_family(force_field) == "GROMOS"
-    allowed_warning_count = (
+    automatic_warning_count = (
         int(allow_gromos_warning) + int(allow_net_charge_warning)
+    )
+    allowed_warning_count = (
+        max_warnings if max_warnings > 0 else automatic_warning_count
     )
     with _temporary_topology_at_include_base(
             topology_file_path, working_directory_path) as validation_topology:
@@ -2584,6 +2645,7 @@ def validate_ionized_system_with_grompp(
             "-po", validation_processed_mdp,
             "-maxwarn", str(allowed_warning_count),
         ]
+        print(f"Running command: {' '.join(command)}")
         process = runner(command, cwd=working_directory_path)
     stderr = getattr(process, "stderr", "")
     stdout = getattr(process, "stdout", "")
@@ -2595,6 +2657,30 @@ def validate_ionized_system_with_grompp(
             r"(?im)^\s*There (?:was|were)\s+(\d+)\s+WARNING(?:S)?\s*$",
             output)
     ]
+    warning_count = max([len(warning_blocks), *summary_counts])
+
+    # A positive value is an explicit expert override. grompp itself enforces
+    # the requested ceiling and returns non-zero above it; do not second-guess
+    # accepted warning types after a successful command.
+    if max_warnings > 0:
+        if warning_count > max_warnings:
+            raise ValueError(
+                f"Ion validation reported {warning_count} GROMACS warning(s), "
+                f"exceeding Max Warnings={max_warnings}. No staged ion files "
+                "were kept."
+            )
+        if warning_count == 0 and not warning_blocks:
+            return None
+        notices = [
+            f"Ion validation completed with {warning_count} GROMACS warning(s) "
+            f"allowed by Max Warnings={max_warnings}; review the server "
+            "terminal before continuing."
+        ]
+        if any(_is_ewald_net_charge_warning(block)
+               for block in warning_blocks):
+            notices.append(IONIZED_SYSTEM_NET_CHARGE_WARNING)
+        return " ".join(notices)
+
     if summary_counts and any(
             count != len(warning_blocks) for count in summary_counts):
         raise ValueError(

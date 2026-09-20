@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import contextlib
 import copy
+import io
 import os
 import signal
 import subprocess
@@ -39,10 +41,74 @@ class RunCheckedCommandTests(unittest.TestCase):
     def python(self, source: str) -> list[str]:
         return [sys.executable, "-c", textwrap.dedent(source)]
 
+    def gmx_python(self, source: str) -> list[str]:
+        """Run Python through a disposable executable named like the gmx driver."""
+        directory = tempfile.TemporaryDirectory(prefix="fake_gmx_")
+        self.addCleanup(directory.cleanup)
+        executable = os.path.join(directory.name, "gmx")
+        os.symlink(sys.executable, executable)
+        return [executable, "-c", textwrap.dedent(source)]
+
     def test_returns_completed_process_on_success(self):
         result = utils.run_checked_command(self.python("print('hello')"))
         self.assertEqual(result.returncode, 0)
         self.assertIn("hello", result.stdout)
+
+    @unittest.skipUnless(os.name == "posix", "executable symlink requires POSIX")
+    def test_successful_gromacs_warnings_are_printed_to_terminal_once(self):
+        warnings = """WARNING 1 [file topol.top, line 7]:
+  The accepted warning remains visible to the operator.
+
+There was 1 WARNING
+
+WARNING: An unnumbered GROMACS warning is visible too.
+  Its continuation line remains part of the diagnostic.
+"""
+        terminal = io.StringIO()
+        source = f"import sys; sys.stderr.write({warnings!r})"
+
+        with contextlib.redirect_stderr(terminal):
+            result = utils.run_managed_command(self.gmx_python(source))
+
+        self.assertEqual(result.returncode, 0)
+        output = terminal.getvalue()
+        self.assertIn("GROMACS warning(s) from", output)
+        self.assertEqual(
+            output.count("accepted warning remains visible"), 1)
+        self.assertEqual(output.count("unnumbered GROMACS warning"), 1)
+        self.assertEqual(output.count("continuation line"), 1)
+
+    def test_warning_shaped_output_from_non_gromacs_command_is_not_relabelled(self):
+        warning = """WARNING 1 [file application.txt]:
+  This program is not GROMACS.
+"""
+        terminal = io.StringIO()
+        source = f"import sys; sys.stderr.write({warning!r})"
+
+        with contextlib.redirect_stderr(terminal):
+            result = utils.run_managed_command(self.python(source))
+
+        self.assertEqual(result.returncode, 0)
+        self.assertEqual(terminal.getvalue(), "")
+
+    @unittest.skipUnless(os.name == "posix", "executable symlink requires POSIX")
+    def test_failed_gromacs_warning_is_printed_before_the_error_is_raised(self):
+        stderr = """WARNING: The failing command still exposes this warning.
+
+Fatal error:
+Synthetic failure after the warning.
+"""
+        terminal = io.StringIO()
+        source = (
+            f"import sys; sys.stderr.write({stderr!r}); raise SystemExit(1)")
+
+        with contextlib.redirect_stderr(terminal), \
+                self.assertRaises(Exception) as caught:
+            utils.run_checked_command(self.gmx_python(source))
+
+        self.assertEqual(
+            terminal.getvalue().count("failing command still exposes"), 1)
+        self.assertIn("Synthetic failure after the warning", str(caught.exception))
 
     def test_failure_message_keeps_the_diagnostic_and_drops_the_banner(self):
         with self.assertRaises(Exception) as caught:

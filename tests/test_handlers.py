@@ -885,6 +885,24 @@ class ShippedSafetyDefaultsTests(unittest.TestCase):
                           ("Force Field",))
         self.assertEqual(len(found), len(expected) * 2)
 
+    def test_add_ions_is_wired_to_the_max_warnings_slider(self):
+        import webui
+
+        handlers = (webui.blocks.fns.values() if hasattr(webui.blocks.fns, "values")
+                    else webui.blocks.fns)
+        found = []
+        for handler in handlers:
+            if getattr(handler.fn, "__name__", "") != "on_add_ions":
+                continue
+            found.append(handler.fn.__module__)
+            maxwarn_inputs = [
+                component for component in handler.inputs
+                if str(getattr(component, "label", "")).startswith("Max Warnings")
+            ]
+            self.assertEqual(len(maxwarn_inputs), 1)
+            self.assertEqual(maxwarn_inputs[0].value, 5)
+        self.assertEqual(len(found), 2)
+
     def test_ion_charge_controls_are_visible_in_default_concentration_mode(self):
         import gradio as gr
         import webui
@@ -1333,6 +1351,15 @@ class IonValidationWarningPolicyTests(WorkingDirectoryTestCase):
   your system with counter ions."""
     UNRELATED_WARNING = """WARNING 3 [file topol.top, line 20]:
   Atom names do not match and require manual inspection."""
+    EXCLUDED_DISTANCE_WARNING = """WARNING 1 [file .validate_ions.mdp]:
+  The largest distance between excluded atoms is 2.281 nm between atom
+  10880 and 10886, which is larger than the cut-off distance. This will lead
+  to missing long-range corrections in the forces and energies."""
+
+    @staticmethod
+    def generic_warning(number):
+        return (f"WARNING {number} [file .validate_ions.mdp]:\n"
+                f"  Synthetic accepted warning {number} for boundary testing.")
 
     @staticmethod
     def warning_output(*blocks, reported_count=None):
@@ -1341,7 +1368,8 @@ class IonValidationWarningPolicyTests(WorkingDirectoryTestCase):
         noun = "WARNING" if count == 1 else "WARNINGS"
         return "\n\n".join(blocks) + f"\n\nThere {verb} {count} {noun}\n"
 
-    def invoke(self, force_field, output, allow_net_charge_warning):
+    def invoke(self, force_field, output, allow_net_charge_warning,
+               max_warnings=0):
         with open(self.path("ions.gro"), "w") as handle:
             handle.write("ions\n0\n1 1 1\n")
         with open(self.path("ions.top"), "w") as handle:
@@ -1356,7 +1384,8 @@ class IonValidationWarningPolicyTests(WorkingDirectoryTestCase):
         result = utils.validate_ionized_system_with_grompp(
             self.path("ions.gro"), self.path("ions.top"),
             self.working_directory_path, runner=runner,
-            allow_net_charge_warning=allow_net_charge_warning)
+            allow_net_charge_warning=allow_net_charge_warning,
+            max_warnings=max_warnings)
         return result, commands[0]
 
     def test_expected_net_charge_and_gromos_warnings_are_narrowly_allowed(self):
@@ -1397,6 +1426,44 @@ class IonValidationWarningPolicyTests(WorkingDirectoryTestCase):
                     self.NET_CHARGE_WARNING, reported_count=2),
                 True)
 
+    def test_positive_maxwarn_accepts_other_warnings_and_reports_them(self):
+        result, command = self.invoke(
+            "amber99sb-ildn",
+            self.warning_output(self.EXCLUDED_DISTANCE_WARNING),
+            False,
+            max_warnings=5,
+        )
+
+        self.assertEqual(command[command.index("-maxwarn") + 1], "5")
+        self.assertIn("1 GROMACS warning", result)
+        self.assertIn("Max Warnings=5", result)
+        self.assertIn("server terminal", result)
+
+    def test_positive_maxwarn_with_no_observed_warning_needs_no_notice(self):
+        result, command = self.invoke(
+            "amber99sb-ildn", "", False, max_warnings=5)
+
+        self.assertEqual(command[command.index("-maxwarn") + 1], "5")
+        self.assertIsNone(result)
+
+    def test_positive_maxwarn_accepts_exactly_the_selected_limit(self):
+        warnings = tuple(self.generic_warning(number) for number in range(1, 6))
+        result, command = self.invoke(
+            "amber99sb-ildn", self.warning_output(*warnings), False,
+            max_warnings=5)
+
+        self.assertEqual(command[command.index("-maxwarn") + 1], "5")
+        self.assertIn("5 GROMACS warning", result)
+
+    def test_positive_maxwarn_rejects_a_success_result_above_the_limit(self):
+        warnings = tuple(self.generic_warning(number) for number in range(1, 7))
+
+        with self.assertRaisesRegex(
+                ValueError, "exceeding Max Warnings=5"):
+            self.invoke(
+                "amber99sb-ildn", self.warning_output(*warnings), False,
+                max_warnings=5)
+
 
 class IonAdditionContractTests(WorkingDirectoryTestCase):
     class SuccessfulGenion:
@@ -1418,7 +1485,8 @@ class IonAdditionContractTests(WorkingDirectoryTestCase):
     def run_ions(self, module, mode="Concentration", concentration=150,
                  cation_charge=1, anion_charge=-1,
                  number_of_cations=5, number_of_anions=5,
-                 neutralize=True, cation_name="NA", anion_name="CL"):
+                 neutralize=True, cation_name="NA", anion_name="CL",
+                 max_warnings=5):
         captured = []
 
         def launch(command, **kwargs):
@@ -1432,7 +1500,7 @@ class IonAdditionContractTests(WorkingDirectoryTestCase):
                 self.working_directory_path, "ions.tpr", "ions.gro",
                 "input.top", "ions.top", cation_name, anion_name, mode,
                 concentration, cation_charge, anion_charge, number_of_cations,
-                number_of_anions, neutralize)
+                number_of_anions, neutralize, max_warnings)
         return captured, result
 
     def test_concentration_mode_passes_multivalent_ion_charges(self):
@@ -1449,6 +1517,7 @@ class IonAdditionContractTests(WorkingDirectoryTestCase):
                 self.assertEqual(command[command.index("-conc") + 1], "0.15")
                 self.assertNotIn("-np", command)
                 self.assertNotIn("-nn", command)
+                self.assertNotIn("-maxwarn", command)
 
     def test_number_mode_uses_exact_validated_counts_and_charges(self):
         for module in (workflow, complex_workflow):
@@ -1524,11 +1593,13 @@ class IonAdditionContractTests(WorkingDirectoryTestCase):
                     _, status = module.on_add_ions(
                         self.working_directory_path, "ions.tpr", "ions.gro",
                         "input.top", "ions.top", "NA", "CL",
-                        "Concentration", 150, 1, -1, 0, 0, neutralize)
+                        "Concentration", 150, 1, -1, 0, 0, neutralize, 4)
 
                 self.assertIs(
                     validate.call_args.kwargs["allow_net_charge_warning"],
                     not neutralize)
+                self.assertEqual(
+                    validate.call_args.kwargs["max_warnings"], 4)
                 self.assertIn(f"color:{color}", status)
                 self.assertEqual(
                     "uniform background charge" in self.plain_text(status),
@@ -1576,9 +1647,57 @@ class IonAdditionContractTests(WorkingDirectoryTestCase):
                 self.assertEqual(validate.call_count, 1)
                 validation_command = validate.call_args.args[0]
                 self.assertEqual(validation_command[1], "grompp")
+                self.assertEqual(
+                    validation_command[validation_command.index("-maxwarn") + 1],
+                    "5",
+                )
                 self.assertIn(".genion_stage_", validation_command[
                     validation_command.index("-c") + 1])
                 self.assertIn("No such moleculetype K", self.plain_text(status))
+                with open(self.path("ions.gro")) as handle:
+                    self.assertEqual(handle.read(), "known-good structure")
+                with open(self.path("ions.top")) as handle:
+                    self.assertEqual(handle.read(), "known-good topology")
+
+    def test_warning_count_above_maxwarn_preserves_previous_ion_outputs(self):
+        warnings = tuple(
+            IonValidationWarningPolicyTests.generic_warning(number)
+            for number in range(1, 7)
+        )
+        warning_output = IonValidationWarningPolicyTests.warning_output(*warnings)
+
+        for module in (workflow, complex_workflow):
+            with self.subTest(module=module.__name__):
+                with open(self.path("ions.gro"), "w") as handle:
+                    handle.write("known-good structure")
+                with open(self.path("ions.top"), "w") as handle:
+                    handle.write("known-good topology")
+
+                commands = []
+
+                def grompp_returns_too_many_warnings(command, cwd):
+                    commands.append(command)
+                    return subprocess.CompletedProcess(
+                        command, 0, stdout="", stderr=warning_output)
+
+                with unittest.mock.patch.object(
+                        module, "_find_sol_group", return_value="13"), \
+                        unittest.mock.patch.object(
+                            module.subprocess, "Popen",
+                            side_effect=self.SuccessfulGenion), \
+                        unittest.mock.patch.object(
+                            module, "run_checked_command",
+                            side_effect=grompp_returns_too_many_warnings):
+                    _, status = module.on_add_ions(
+                        self.working_directory_path, "ions.tpr", "ions.gro",
+                        "input.top", "ions.top", "NA", "CL", "Concentration",
+                        150, 1, -1, 0, 0, True, 5)
+
+                self.assertEqual(len(commands), 1)
+                self.assertEqual(
+                    commands[0][commands[0].index("-maxwarn") + 1], "5")
+                self.assertIn(
+                    "exceeding Max Warnings=5", self.plain_text(status))
                 with open(self.path("ions.gro")) as handle:
                     self.assertEqual(handle.read(), "known-good structure")
                 with open(self.path("ions.top")) as handle:
@@ -1595,6 +1714,9 @@ class IonAdditionContractTests(WorkingDirectoryTestCase):
             ({"mode": "Number", "number_of_cations": 2.5}, "Number of cations"),
             ({"mode": "Number", "number_of_anions": -1}, "Number of anions"),
             ({"neutralize": 1}, "Neutralize"),
+            ({"max_warnings": -1}, "Max Warnings"),
+            ({"max_warnings": 1.5}, "Max Warnings"),
+            ({"max_warnings": 11}, "Max Warnings"),
         )
         for module in (workflow, complex_workflow):
             for arguments, expected in cases:
@@ -1610,7 +1732,8 @@ class IonAdditionContractTests(WorkingDirectoryTestCase):
                         arguments.get("anion_charge", -1),
                         arguments.get("number_of_cations", 5),
                         arguments.get("number_of_anions", 5),
-                        arguments.get("neutralize", True))
+                        arguments.get("neutralize", True),
+                        arguments.get("max_warnings", 5))
                 find.assert_not_called()
                 launch.assert_not_called()
                 self.assertIn(expected, self.plain_text(status))
