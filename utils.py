@@ -2788,10 +2788,13 @@ def get_dynamics_constraint_type(force_field: str | None) -> str:
 
 def get_default_nvt_equilibration_mdp_file_content(time_scale_ps: float = 500, time_step_ps: float = 0.002,
                                                    temperature: float = 300, with_ligand: bool = False,
-                                                   force_field: str | None = None) -> str:
+                                                   force_field: str | None = None,
+                                                   random_seed: int = -1) -> str:
     """MDP for restrained NVT equilibration with freshly generated velocities."""
     _, time_step_ps, nsteps = _simulation_step_count(time_scale_ps, time_step_ps)
     temperature = _positive_finite_number(temperature, "Temperature")
+    random_seed = _exact_integer_in_range(
+        random_seed, "NVT random seed", -1, 2_147_483_647)
     restraint_defines = "-DPOSRES -DPOSRES_LIG" if with_ligand else "-DPOSRES"
     constraint_type = get_dynamics_constraint_type(force_field)
     return f"""
@@ -2812,7 +2815,7 @@ constraints = {constraint_type}
 continuation = no
 gen_vel     = yes
 gen_temp    = {temperature}
-gen_seed    = -1
+gen_seed    = {random_seed}
 
 {get_cutoff_mdp_section(force_field)}
 """

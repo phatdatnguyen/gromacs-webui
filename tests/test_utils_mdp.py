@@ -71,6 +71,22 @@ class EquilibrationMdpTests(unittest.TestCase):
         self.assertIn("gen_temp    = 310", content)
         self.assertIn("continuation = no", content)
 
+    def test_nvt_random_seed_defaults_to_gromacs_automatic_seed(self):
+        content = utils.get_default_nvt_equilibration_mdp_file_content()
+        self.assertIn("gen_seed    = -1", content)
+
+    def test_nvt_random_seed_is_configurable(self):
+        content = utils.get_default_nvt_equilibration_mdp_file_content(
+            random_seed=314159)
+        self.assertIn("gen_seed    = 314159", content)
+
+    def test_nvt_random_seed_must_be_an_integer_at_least_minus_one(self):
+        for value in (-2, 2_147_483_648, 1.5, True, float("nan")):
+            with self.subTest(value=value), self.assertRaisesRegex(
+                    ValueError, "[Rr]andom seed"):
+                utils.get_default_nvt_equilibration_mdp_file_content(
+                    random_seed=value)
+
     def test_nvt_and_npt_restrain_the_solute(self):
         self.assertIn("define      = -DPOSRES", utils.get_default_nvt_equilibration_mdp_file_content())
         self.assertIn("define          = -DPOSRES", utils.get_default_npt_equilibration_mdp_file_content())

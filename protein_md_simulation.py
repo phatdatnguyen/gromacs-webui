@@ -1429,13 +1429,15 @@ def on_run_energy_minimization(working_directory_path: str, run_input_file_name:
 
 def on_generate_nvt_equilibration_mdp_file(working_directory_path: str, time_scale: float, time_step: float,
                                            temperature: float, parameter_file_name: str,
-                                           force_field: str) -> tuple[list[str], str]:
+                                           force_field: str,
+                                           random_seed: int = -1) -> tuple[list[str], str]:
     """Write the restrained NVT equilibration MDP."""
     try:
         time_step = _validate_standard_time_step(time_step)
         file_content = get_default_nvt_equilibration_mdp_file_content(
             time_scale_ps=time_scale, time_step_ps=time_step,
-            temperature=temperature, force_field=force_field)
+            temperature=temperature, force_field=force_field,
+            random_seed=random_seed)
         file_path = os.path.join(working_directory_path, parameter_file_name)
         with reserve_working_directory_maintenance(working_directory_path):
             atomic_write_text_file(file_path, file_content)
@@ -2751,6 +2753,11 @@ def protein_md_simulation_tab_content() -> None:
                                     nvt_time_step_slider = gr.Slider(label="Time Step (ps; no HMR)", minimum=0.001, maximum=0.002, value=0.002, step=0.001)
                                     nvt_temperature_slider = gr.Slider(label="Target Temperature (K)", minimum=100, maximum=500, value=300, step=10)
                                 with gr.Column():
+                                    nvt_random_seed_slider = gr.Slider(
+                                        label="Initial Velocity Random Seed (gen-seed)",
+                                        info="Use a different explicit seed for each independent replica; -1 selects an automatic seed. Regenerate the NVT run input after changing it.",
+                                        minimum=-1, maximum=2_147_483_647,
+                                        value=-1, step=1, precision=0)
                                     nvt_equilibration_parameter_file_name_textbox = gr.Textbox(label="Parameter File Name", value="nvt.mdp")
                                     nvt_equilibration_parameter_file_button = gr.Button(value="Generate Parameter File")
                     with gr.Row():
@@ -3070,7 +3077,7 @@ def protein_md_simulation_tab_content() -> None:
     run_energy_minimization_button.click(on_run_energy_minimization, [working_directory_path_state, energy_minimization_run_input_file_dropdown, mpi_rank_slider, omp_threads_slider, use_gpu], [working_directory_file_list_state, status_markdown])
 
     # NVT equilibration interaction
-    nvt_equilibration_parameter_file_button.click(on_generate_nvt_equilibration_mdp_file, [working_directory_path_state, nvt_time_scale_slider, nvt_time_step_slider, nvt_temperature_slider, nvt_equilibration_parameter_file_name_textbox, force_field_dropdown], [working_directory_file_list_state, status_markdown])
+    nvt_equilibration_parameter_file_button.click(on_generate_nvt_equilibration_mdp_file, [working_directory_path_state, nvt_time_scale_slider, nvt_time_step_slider, nvt_temperature_slider, nvt_equilibration_parameter_file_name_textbox, force_field_dropdown, nvt_random_seed_slider], [working_directory_file_list_state, status_markdown])
     nvt_equilibration_run_input_file_button.click(on_generate_nvt_equilibration_tpr_file, [working_directory_path_state, nvt_equilibration_input_file_name_dropdown, nvt_equilibration_input_topology_file_name_dropdown, nvt_equilibration_parameter_file_dropdown, nvt_equilibration_run_input_file_name_textbox, max_warns_slider, force_field_dropdown], [working_directory_file_list_state, status_markdown])
     nvt_run_event = run_nvt_equilibration_button.click(on_run_nvt_equilibration, [working_directory_path_state, nvt_equilibration_run_input_file_dropdown, mpi_rank_slider, omp_threads_slider, use_gpu, nvt_process_state], [working_directory_file_list_state, status_markdown, nvt_process_state, run_nvt_equilibration_button])
     nvt_run_event.then(_process_timer_update, nvt_process_state,

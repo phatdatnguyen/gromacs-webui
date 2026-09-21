@@ -368,6 +368,32 @@ class MdpCallbackTests(WorkingDirectoryTestCase):
         self.assertIn("gen_temp    = 305", content)
         self.assertIn("-DPOSRES", content)
 
+    def test_nvt_mdp_callbacks_forward_explicit_random_seed(self):
+        for index, module in enumerate((workflow, complex_workflow)):
+            file_name = f"nvt_seed_{index}.mdp"
+            with self.subTest(module=module.__name__):
+                files, status = module.on_generate_nvt_equilibration_mdp_file(
+                    self.working_directory_path, 100, 0.002, 305,
+                    file_name, "AMBER99SB-ILDN", 314159)
+
+                self.assertIn(file_name, files)
+                self.assertIn("successfully", self.plain_text(status))
+                with open(self.path(file_name)) as handle:
+                    self.assertIn("gen_seed    = 314159", handle.read())
+
+    def test_nvt_mdp_callbacks_reject_invalid_random_seed_without_writing(self):
+        for module in (workflow, complex_workflow):
+            for value in (-2, 2_147_483_648, 1.5, True, float("nan")):
+                file_name = f"invalid_seed_{module.__name__}.mdp"
+                with self.subTest(module=module.__name__, value=value):
+                    files, status = module.on_generate_nvt_equilibration_mdp_file(
+                        self.working_directory_path, 100, 0.002, 305,
+                        file_name, "AMBER99SB-ILDN", value)
+
+                    self.assertNotIn(file_name, files)
+                    self.assertFalse(os.path.exists(self.path(file_name)))
+                    self.assertIn("random seed", self.plain_text(status).lower())
+
     def test_mdp_generators_reject_timesteps_that_need_hmr(self):
         cases = (
             (workflow, "on_generate_nvt_equilibration_mdp_file",
@@ -902,6 +928,37 @@ class ShippedSafetyDefaultsTests(unittest.TestCase):
             self.assertEqual(len(maxwarn_inputs), 1)
             self.assertEqual(maxwarn_inputs[0].value, 5)
         self.assertEqual(len(found), 2)
+
+    def test_nvt_random_seed_sliders_ship_with_and_forward_minus_one(self):
+        import gradio as gr
+        import webui
+
+        sliders = [
+            block for block in webui.blocks.blocks.values()
+            if isinstance(block, gr.Slider)
+            and "random seed" in str(getattr(block, "label", "")).lower()
+        ]
+        self.assertEqual(len(sliders), 2)
+        for slider in sliders:
+            self.assertEqual(slider.minimum, -1)
+            self.assertEqual(slider.maximum, 2_147_483_647)
+            self.assertEqual(slider.value, -1)
+            self.assertEqual(slider.step, 1)
+            self.assertEqual(slider.precision, 0)
+
+        handlers = (webui.blocks.fns.values() if hasattr(webui.blocks.fns, "values")
+                    else webui.blocks.fns)
+        found = []
+        for handler in handlers:
+            if getattr(handler.fn, "__name__", "") != \
+                    "on_generate_nvt_equilibration_mdp_file":
+                continue
+            found.append(handler.fn.__module__)
+            self.assertTrue(any(handler.inputs[-1] is slider
+                                for slider in sliders))
+            self.assertEqual(handler.inputs[-1].value, -1)
+        self.assertCountEqual(
+            found, [workflow.__name__, complex_workflow.__name__])
 
     def test_ion_charge_controls_are_visible_in_default_concentration_mode(self):
         import gradio as gr
