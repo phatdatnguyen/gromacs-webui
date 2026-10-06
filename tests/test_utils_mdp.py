@@ -167,7 +167,8 @@ class ProductionMdpTests(unittest.TestCase):
 
     def test_neural_potential_block_fixes_the_box(self):
         content = utils.get_default_prod_md_mdp_file_content(
-            nnpot_active=True, nnpot_modelfile_path="models/ani2x.pt", nnpot_input_group="Protein")
+            nnpot_active=True, nnpot_modelfile_path="models/ani2x.pt",
+            nnpot_input_group="Protein", time_step_ps=0.001)
         self.assertIn("nnpot-active          = true", content)
         self.assertIn("nnpot-modelfile       = models/ani2x.pt", content)
         self.assertIn("nnpot-input-group     = Protein", content)
@@ -181,6 +182,7 @@ class ProductionMdpTests(unittest.TestCase):
                 nnpot_active=True,
                 nnpot_input_group="Protein\nnsteps = -1",
                 nnpot_modelfile_path="/models/ani2x.pt",
+                time_step_ps=0.001,
             )
 
 

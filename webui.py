@@ -14,6 +14,8 @@ import uvicorn
 import utils
 from path_security import (
     DATA_ROOT,
+    PROTEIN_LIGAND_COMPLEX_MD_DATA_ROOT,
+    PROTEIN_MD_DATA_ROOT,
     PROJECT_ROOT,
     STATIC_ROOT,
     cleanup_stale_static_assets,
@@ -32,7 +34,9 @@ PROCESS_SHUTDOWN_TIMEOUT_SECONDS = 15.0
 
 # Keep all runtime paths anchored to the repository, even when the server is
 # started from a different current working directory.
-for runtime_root in (DATA_ROOT, STATIC_ROOT):
+for runtime_root in (
+        DATA_ROOT, PROTEIN_MD_DATA_ROOT,
+        PROTEIN_LIGAND_COMPLEX_MD_DATA_ROOT, STATIC_ROOT):
     runtime_root.mkdir(parents=True, exist_ok=True, mode=0o700)
     # mkdir's mode is filtered by umask and does not affect an existing path.
     # Both trees can contain uploaded or generated molecular structures.

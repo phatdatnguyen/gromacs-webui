@@ -32,32 +32,70 @@ conda activate ./gromacs-env
 python -m pip install gradio parmed nglview==4.0
 conda install -c conda-forge gromacs acpype mdanalysis
 ```
-- To run MD with machine learning potentials:
+- To run protein-ligand complex MD with machine learning potentials:
+
+NNPot/MLIP support is intentionally available only in the **Protein-Ligand
+Complex MD Simulation** workflow. The protein-only workflow remains classical
+and rejects both edited NNPot MDP files and NNPot-enabled TPR files.
 
 ```
-python -m pip install torch==2.8 --index-url https://download.pytorch.org/whl/cu129
-python -m pip install cuequivariance cuequivariance-torch
-python -m pip install -v --no-build-isolation --config-settings=--global-option=ext torchani
-ani build-extensions --sm 8.9 # use --sm 8.9 for RTX 40X0, --sm 12.0 for RTX 50X0
-python -m pip install aimnet
-python -m pip install pygit2
-python -m pip install git+https://github.com/chemle/emle-engine
-python -m pip install mace-torch
+# Example exporter stack for a GROMACS build linked to LibTorch 2.8:
+python -m pip install torch==2.8.0 --index-url https://download.pytorch.org/whl/cu128
+python -m pip install torchani==2.9.0
+python -m pip install pygit2==1.20.1
+python -m pip install git+https://github.com/chemle/emle-engine@51881369d315447448bdb4fdfecc618ac7577010
+python -m pip install mace-torch==0.3.16
 
 ```
 
 The Python packages above export the TorchScript model; GROMACS must separately
 be compiled with its NNPot Torch backend. Check the binary that the WebUI will
 run with `gmx --version`: it must report `Torch support: enabled`. Build GROMACS
-with `-DGMX_NNPOT=TORCH` and a LibTorch release matching the PyTorch version used
-to export the model. The WebUI checks both the selected model's Python packages
-and this GROMACS capability before it starts a model download.
+with `-DGMX_NNPOT=TORCH`. Matching the GROMACS LibTorch and model-exporter
+PyTorch major/minor versions is required for CPU NNP runs and strongly
+recommended for GPU runs; the WebUI blocks a CPU mismatch and warns about a GPU
+mismatch. It also checks the selected model's Python packages and GROMACS
+capability before it starts a model download.
 
-ANI-1x, ANI-2x and MACE-OFF are neutral-system models; the generated wrapper
-will stop with a clear error if their selected NNP group has non-zero charge.
-AIMNet2 and ANI2x-EMLE instead receive the selected group's charge from the
-topology. MACE-OFF uses GROMACS' periodic neighbor pairs at its 0.5 nm cutoff,
-and ANI2x-EMLE uses electrostatic embedding with the surrounding MM atoms.
+The ANI wrappers deliberately use TorchANI's pure-PyTorch AEV implementation,
+so its optional compiled extensions are not required and are not embedded into
+the exported model.
+
+All bundled models currently require a neutral NNP region. Stock GROMACS
+2026.4 exposes `nnp-charge` as a model input but does not expose an MDP setting
+for its value or derive it from the selected topology group, so it always sends
+zero. The WebUI measures the original group's topology charge before GROMACS
+modifies it and rejects charged groups, including for ANI2x-EMLE. MACE-OFF uses
+GROMACS' periodic neighbor pairs at its 0.5 nm cutoff, and ANI2x-EMLE uses
+electrostatic embedding with the surrounding MM atoms.
+
+In the complex workflow, define the fixed NNP input group as the intended
+ligand-binding region rather than the whole `Protein` or `System`. Use complete
+residues when a protein binding-site residue is included, and account for the
+link atoms introduced at covalent NNP/MM boundaries. Group membership cannot
+change during a run. Choose the group with the model's supported elements and
+charge limitations in mind:
+
+| Model | Supported elements | Charge requirement |
+| --- | --- | --- |
+| ANI-1x | H, C, N, O | neutral |
+| ANI-2x | H, C, N, O, S, F, Cl | neutral |
+| ANI2x-EMLE | H, C, N, O, S | neutral with stock GROMACS 2026.4 |
+| MACE-OFF | H, C, N, O, F, P, S, Cl, Br, I | neutral |
+
+The WebUI validates the selected group before `mdrun`, including ligand atomic
+numbers, and keeps a hashed, read-only model snapshot with each job so later
+cache rebuilds cannot change an existing simulation. A successful NNP `grompp`
+also writes a hash-bound charge attestation; regenerate older NNP TPR files in
+the WebUI before running them; legacy jobs must regenerate both the production
+MDP and TPR so they receive an immutable model snapshot. All bundled wrappers
+require GROMACS 2026 or newer because they consume the 2026 `nnp-charge` model
+input. MACE requires GROMACS 2026.4 or newer because 2026.0-3 computed incorrect
+NNPot pair shifts in triclinic boxes. NNP production runs use a fixed box
+(`pcoupl = no`), no bond constraints, and a maximum 0.001 ps (1 fs) time step.
+The fixed box is required because these wrappers do not return virial/stress;
+removing constraints avoids altering the learned subsystem's potential-energy
+surface.
 
 - To run MM-PBSA / MM-GBSA binding energy calculations:
 
@@ -131,6 +169,26 @@ conda activate ./gromacs-env
 python webui.py
 ```
 
+The two workflows keep independent job lists and storage roots:
+
+```
+data/protein_md/<job>/
+data/protein_ligand_complex_md/<job>/
+```
+
+This prevents a protein-only job from appearing in the complex workflow (and
+vice versa). Both directories are created automatically when the app starts.
+
+An edited AMBER/OPLS MDP may set `DispCorr = no`. The WebUI permits that expert
+choice and shows the resulting long-range-dispersion warning in both the browser
+status and server terminal instead of blocking `grompp`.
+
+An edited AMBER MDP may likewise set `coulombtype = Cut-off` (GROMACS also
+accepts `cutoff`). The WebUI permits that explicit expert choice but warns that
+electrostatics beyond `rcoulomb` are neglected; omitting `coulombtype` produces
+the same effective GROMACS default and its own warning. Generated AMBER MDPs
+continue to use PME, while unsupported AMBER electrostatics modes remain blocked.
+
 ## Tests
 The suite lives in `tests/` and uses only the standard library's `unittest`, so no
 extra packages are needed. Run it from the repository root:
@@ -144,7 +202,7 @@ Most tests build their own structures and trajectories and run in a few seconds.
 The ones in `tests/test_gromacs_workflow.py` drive the real `gmx` binaries and skip
 themselves when GROMACS is not on `PATH`; the CHARMM tests additionally skip when
 `charmm36` is not installed in the GROMACS tree. Each test works inside a
-throwaway directory under `./data/`, cleaned up afterwards.
+throwaway job directory under `./data/`, cleaned up afterwards.
 
 To run one module or one test:
 

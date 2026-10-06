@@ -131,6 +131,167 @@ class TopologyForceFieldTests(unittest.TestCase):
             utils.validate_mdp_topology_compatibility(mdp, topology), "amber14sb"
         )
 
+    def test_amber_and_opls_allow_dispcorr_no_with_a_warning(self):
+        for force_field, include_name in (
+                ("AMBER99SB-ILDN", "amber99sb-ildn"),
+                ("OPLSAA", "oplsaa")):
+            with self.subTest(force_field=force_field):
+                topology = self.write_named(
+                    force_field + ".top",
+                    f'#include "{include_name}.ff/forcefield.itp"\n',
+                )
+                content = utils.get_default_prod_md_mdp_file_content(
+                    force_field=force_field).replace(
+                        "DispCorr        = EnerPres", "DispCorr        = no")
+                mdp = self.write_named(force_field + ".mdp", content)
+
+                self.assertEqual(
+                    utils.validate_mdp_topology_compatibility(mdp, topology),
+                    include_name,
+                )
+                warning = utils.get_mdp_dispersion_correction_warning(
+                    mdp, topology)
+                self.assertIn("DispCorr=no", warning)
+                self.assertIn(force_field.split("9")[0].replace("AA", ""), warning)
+
+    def test_dispcorr_warning_is_absent_when_correction_is_enabled(self):
+        topology = self.write_named(
+            "amber.top", '#include "amber14sb.ff/forcefield.itp"\n')
+        mdp = self.write_named(
+            "amber.mdp",
+            utils.get_default_prod_md_mdp_file_content(
+                force_field="AMBER99SB-ILDN"),
+        )
+        self.assertIsNone(
+            utils.get_mdp_dispersion_correction_warning(mdp, topology))
+
+    def test_dispcorr_warning_does_not_apply_to_no_correction_families(self):
+        for force_field, include_name in (
+                ("CHARMM36", "charmm36"), ("GROMOS54A7", "gromos54a7")):
+            with self.subTest(force_field=force_field):
+                topology = self.write_named(
+                    force_field + ".top",
+                    f'#include "{include_name}.ff/forcefield.itp"\n',
+                )
+                mdp = self.write_named(
+                    force_field + ".mdp",
+                    utils.get_default_prod_md_mdp_file_content(
+                        force_field=force_field),
+                )
+                self.assertIsNone(
+                    utils.get_mdp_dispersion_correction_warning(mdp, topology))
+
+    def test_amber_cutoff_electrostatics_is_allowed_with_a_warning(self):
+        topology = self.write_named(
+            "amber-cutoff.top",
+            '#include "amber99sb-ildn.ff/forcefield.itp"\n',
+        )
+        base = (
+            "integrator=steep\nrlist=1.0\nrvdw=1.0\nrcoulomb=1.0\n"
+            "cutoff-scheme=Verlet\nDispCorr=EnerPres\n"
+        )
+        for label, electrostatics in (
+                ("explicit", "coulombtype=Cut-off\n"),
+                ("explicit-alias", "coulombtype=cutoff\n"),
+                ("implicit-default", "")):
+            with self.subTest(label=label):
+                mdp = self.write_named(
+                    f"amber-{label}.mdp", base + electrostatics)
+
+                self.assertEqual(
+                    utils.validate_mdp_topology_compatibility(mdp, topology),
+                    "amber99sb-ildn",
+                )
+                warning = utils.get_mdp_electrostatics_warning(mdp, topology)
+                self.assertIsNotNone(warning)
+                self.assertIn("coulombtype=Cut-off", warning)
+                self.assertIn("AMBER", warning)
+                self.assertIn("allowed", warning.lower())
+
+    def test_amber_pme_with_enerpres_keeps_the_warning_free_default(self):
+        topology = self.write_named(
+            "amber-pme.top", '#include "amber14sb.ff/forcefield.itp"\n')
+        mdp = self.write_named(
+            "amber-pme.mdp",
+            "integrator=md\ndt=0.002\nrlist=1.0\nrvdw=1.0\n"
+            "rcoulomb=1.0\ncutoff-scheme=Verlet\n"
+            "coulombtype=PME\nDispCorr=EnerPres\n",
+        )
+
+        self.assertEqual(
+            utils.validate_mdp_topology_compatibility(mdp, topology),
+            "amber14sb",
+        )
+        self.assertIsNone(
+            utils.get_mdp_electrostatics_warning(mdp, topology))
+        self.assertIsNone(
+            utils.get_mdp_dispersion_correction_warning(mdp, topology))
+
+    def test_amber_other_electrostatics_remain_incompatible(self):
+        topology = self.write_named(
+            "amber-rf.top", '#include "amber14sb.ff/forcefield.itp"\n')
+        for label, value in (
+                ("reaction-field", "Reaction-Field"),
+                ("unknown", "not-a-method"),
+                ("empty", "")):
+            with self.subTest(value=value):
+                mdp = self.write_named(
+                    f"amber-{label}.mdp",
+                    "rlist=1.0\nrvdw=1.0\nrcoulomb=1.0\n"
+                    f"cutoff-scheme=Verlet\ncoulombtype={value}\n"
+                    "DispCorr=EnerPres\n",
+                )
+
+                with self.assertRaises(ValueError) as raised:
+                    utils.validate_mdp_topology_compatibility(mdp, topology)
+                message = str(raised.exception)
+                self.assertIn("AMBER", message)
+                self.assertIn(f"coulombtype={value or '<empty>'}", message)
+
+    def test_cutoff_electrostatics_is_not_relaxed_for_opls_or_charmm(self):
+        cases = (
+            (
+                "oplsaa",
+                "rlist=1.0\nrvdw=1.0\nrcoulomb=1.0\n"
+                "cutoff-scheme=Verlet\ncoulombtype=Cut-off\n"
+                "DispCorr=EnerPres\n",
+            ),
+            (
+                "charmm36",
+                "rlist=1.2\nrvdw=1.2\nrvdw-switch=1.0\nrcoulomb=1.2\n"
+                "cutoff-scheme=Verlet\nvdw-modifier=force-switch\n"
+                "coulombtype=Cut-off\nDispCorr=no\n",
+            ),
+        )
+        for force_field, content in cases:
+            with self.subTest(force_field=force_field):
+                topology = self.write_named(
+                    force_field + "-cutoff.top",
+                    f'#include "{force_field}.ff/forcefield.itp"\n',
+                )
+                mdp = self.write_named(force_field + "-cutoff.mdp", content)
+
+                with self.assertRaises(ValueError) as raised:
+                    utils.validate_mdp_topology_compatibility(mdp, topology)
+                message = str(raised.exception)
+                self.assertIn(utils.get_force_field_family(force_field), message)
+                self.assertIn("coulombtype=Cut-off", message)
+
+    def test_amber_still_rejects_unsupported_dispcorr_values(self):
+        topology = self.write_named(
+            "amber.top", '#include "amber14sb.ff/forcefield.itp"\n')
+        base = utils.get_default_prod_md_mdp_file_content(
+            force_field="AMBER99SB-ILDN")
+        for value in ("Ener", "typo"):
+            with self.subTest(value=value):
+                mdp = self.write_named(
+                    value + ".mdp",
+                    base.replace("DispCorr        = EnerPres",
+                                 f"DispCorr        = {value}"),
+                )
+                with self.assertRaisesRegex(ValueError, "DispCorr"):
+                    utils.validate_mdp_topology_compatibility(mdp, topology)
+
     def test_old_generic_cutoffs_are_rejected_for_gromos(self):
         topology = self.write_named(
             "gromos.top", '#include "gromos54a7.ff/forcefield.itp"\n'
@@ -222,19 +383,12 @@ class TopologyForceFieldTests(unittest.TestCase):
                     "gromos54a7",
                 )
 
-    def test_known_families_reject_cutoff_electrostatics_and_nonverlet_scheme(self):
+    def test_amber_rejects_nonverlet_scheme_and_accepts_pme(self):
         topology = self.write_named(
             "amber.top", '#include "amber14sb.ff/forcefield.itp"\n'
         )
         compatible = (
             "rlist=1.0\nrvdw=1.0\nrcoulomb=1.0\nDispCorr=EnerPres\n")
-        cutoff = self.write_named(
-            "cutoff.mdp",
-            compatible + "coulombtype=Cut-off\ncutoff-scheme=Verlet\n",
-        )
-        with self.assertRaisesRegex(ValueError, r"AMBER.*coulombtype=Cut-off.*PME"):
-            utils.validate_mdp_topology_compatibility(cutoff, topology)
-
         group_scheme = self.write_named(
             "group.mdp",
             compatible + "coulombtype=PME\ncutoff-scheme=Group\n",

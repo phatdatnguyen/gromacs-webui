@@ -3,6 +3,7 @@ handling, topology merging and structure/trajectory viewer support."""
 
 from __future__ import annotations
 
+import importlib.metadata
 import importlib.util
 import html
 import inspect
@@ -13,6 +14,7 @@ import os
 import re
 import shutil
 import signal
+import stat
 import subprocess
 import sys
 import tempfile
@@ -51,7 +53,6 @@ SUPPORTED_NNPOT_MODELS: tuple[str, ...] = (
     "mace-small",
     "mace-medium",
     "mace-large",
-    "aimnet2",
 )
 NNPOT_MODEL_PACKAGES: dict[str, tuple[str, ...]] = {
     "ani1x": ("torch", "torchani"),
@@ -60,12 +61,24 @@ NNPOT_MODEL_PACKAGES: dict[str, tuple[str, ...]] = {
     "mace-small": ("torch", "mace", "e3nn"),
     "mace-medium": ("torch", "mace", "e3nn"),
     "mace-large": ("torch", "mace", "e3nn"),
-    "aimnet2": ("torch", "aimnet"),
 }
+# Every bundled wrapper consumes the ``nnp-charge`` model input added by the
+# 2026 NNPot interface.  GROMACS 2025 only exposes positions/numbers/box/PBC,
+# so even the otherwise older ANI wrappers cannot satisfy their signature.
+NNPOT_GROMACS_2026_MODELS: frozenset[str] = frozenset(
+    SUPPORTED_NNPOT_MODELS)
+NNPOT_GROMACS_2026_4_MODELS: frozenset[str] = frozenset((
+    "mace-small",
+    "mace-medium",
+    "mace-large",
+))
 # Kept as a public compatibility alias.  Torch is the only dependency shared by
 # every model; model-specific checks happen once a model has been selected.
 NNPOT_REQUIRED_PACKAGES: tuple[str, ...] = ("torch",)
 NNPOT_MODEL_BUILD_LOCK = threading.Lock()
+MAX_NNPOT_TIME_STEP_PS: float = 0.001
+MIN_NNPOT_TIME_STEP_PS: float = 0.0001
+NNPOT_CHARGE_TOLERANCE_E: float = 1.0e-3
 
 # Hardware discovery runs while the Gradio layout is created.  Keep every
 # external probe short so a broken driver cannot indefinitely delay start-up.
@@ -209,6 +222,12 @@ def get_missing_nnpot_packages(model_name: str | None = None) -> list[str]:
 
 def get_nnpot_unavailable_reason(model_name: str | None = None) -> str | None:
     """A message naming what to install, or None when potentials can be used."""
+    if model_name is not None and model_name not in NNPOT_MODEL_PACKAGES:
+        raise ValueError(
+            f"Unsupported NNPot model {model_name!r}. Choose one of: "
+            + ", ".join(SUPPORTED_NNPOT_MODELS)
+        )
+
     missing = get_missing_nnpot_packages(model_name)
     reasons = []
     if missing:
@@ -219,10 +238,930 @@ def get_nnpot_unavailable_reason(model_name: str | None = None) -> str | None:
         reasons.append(f"{package_reason}: {', '.join(missing)} not installed. "
                        "See the Readme for the optional install steps.")
 
-    gromacs_reason = get_gromacs_nnpot_unavailable_reason()
+    gromacs_reason = get_gromacs_nnpot_unavailable_reason(model_name)
     if gromacs_reason is not None:
         reasons.append(gromacs_reason)
     return "\n\n".join(reasons) if reasons else None
+
+
+def _library_path_loads_nvidia_openmp(entry: str) -> bool:
+    """Whether one loader-search entry supplies NVIDIA's libgomp alias."""
+    candidate = os.path.join(entry, "libgomp.so.1")
+    try:
+        if os.path.lexists(candidate):
+            resolved_name = os.path.basename(os.path.realpath(candidate)).lower()
+            # NVHPC exposes libnvomp through libgomp.so/libgomp.so.1 symlinks.
+            # Prefer this concrete check so a harmless directory is not removed
+            # merely because it happens to have an NVIDIA-looking path.
+            return resolved_name.startswith("libnvomp")
+    except OSError:
+        pass
+
+    # Do not remove a directory just because its name resembles an NVHPC
+    # installation.  An NVHPC-built GROMACS may require other libraries from
+    # that directory; only the concrete libgomp -> libnvomp conflict is safe to
+    # filter from a child process.
+    return False
+
+
+def _preload_entry_loads_nvidia_openmp(entry: str) -> bool:
+    """Whether one explicit ``LD_PRELOAD`` entry names NVIDIA OpenMP."""
+    name = os.path.basename(entry).lower()
+    if name.startswith("libnvomp"):
+        return True
+
+    try:
+        if os.path.lexists(entry):
+            resolved_name = os.path.basename(os.path.realpath(entry)).lower()
+            return resolved_name.startswith("libnvomp")
+    except OSError:
+        pass
+    return False
+
+
+def _split_ld_preload(value: str) -> list[str]:
+    """Split the colon- or whitespace-separated syntax accepted by ld.so."""
+    return [entry for entry in re.split(r"[:\s]+", value.strip()) if entry]
+
+
+def _gromacs_host_compiler_uses_nvhpc() -> bool:
+    """Whether the GROMACS host C/C++ code was built with NVHPC/PGI."""
+    executable = shutil.which("gmx")
+    if executable is None:
+        return False
+    try:
+        result = subprocess.run(
+            [executable, "--version"], capture_output=True, text=True,
+            timeout=GPU_DETECTION_TIMEOUT_SECONDS, check=False)
+    except (OSError, subprocess.SubprocessError):
+        return False
+    if result.returncode != 0:
+        return False
+
+    output = (result.stdout or "") + "\n" + (result.stderr or "")
+    for line in output.splitlines():
+        match = re.match(r"^\s*C(?:\+\+)? compiler:\s*(.*)$", line,
+                         flags=re.IGNORECASE)
+        if match is None:
+            continue
+        compiler = match.group(1)
+        if (re.search(r"\b(?:NVHPC|PGI)\b", compiler, flags=re.IGNORECASE)
+                or re.search(
+                    r"(?:^|[/\s])(?:nvc|nvc\+\+|pgcc|pgc\+\+)(?:\s|$)",
+                    compiler, flags=re.IGNORECASE)):
+            return True
+    return False
+
+
+def _parse_gromacs_release_year(version_output: str) -> int | None:
+    """Extract the calendar-version year from ``gmx --version`` output."""
+    match = re.search(
+        r"^\s*GROMACS version:\s*(\d{4})(?=[.\-\s]|$)",
+        version_output,
+        flags=re.MULTILINE | re.IGNORECASE,
+    )
+    return int(match.group(1)) if match is not None else None
+
+
+def _parse_gromacs_release(version_output: str) -> tuple[int, int] | None:
+    """Extract ``(calendar year, patch release)`` from ``gmx --version``."""
+    match = re.search(
+        r"^\s*GROMACS version:\s*(\d{4})(?:\.(\d+))?(?=[.\-\s]|$)",
+        version_output,
+        flags=re.MULTILINE | re.IGNORECASE,
+    )
+    if match is None:
+        return None
+    return int(match.group(1)), int(match.group(2) or 0)
+
+
+def _parse_gromacs_libtorch_version(version_output: str) -> str | None:
+    """Extract GROMACS' linked LibTorch version, when it reports one."""
+    match = re.search(
+        r"^\s*Torch support:\s*enabled\s*\(version\s+([^)]+)\)",
+        version_output,
+        flags=re.MULTILINE | re.IGNORECASE,
+    )
+    return match.group(1).strip() if match is not None else None
+
+
+def _torch_major_minor(version: str | None) -> tuple[int, int] | None:
+    """Return a Torch release's compatibility-relevant major/minor pair."""
+    if version is None:
+        return None
+    match = re.search(r"(?<!\d)(\d+)\.(\d+)", version)
+    if match is None:
+        return None
+    return int(match.group(1)), int(match.group(2))
+
+
+def get_nnpot_torch_runtime_versions() -> tuple[str | None, str | None]:
+    """Return ``(GROMACS LibTorch, Python PyTorch)`` version strings."""
+    gromacs_torch: str | None = None
+    executable = shutil.which("gmx")
+    if executable is not None:
+        try:
+            result = subprocess.run(
+                [executable, "--version"], capture_output=True, text=True,
+                timeout=GPU_DETECTION_TIMEOUT_SECONDS, check=False)
+        except (OSError, subprocess.SubprocessError):
+            pass
+        else:
+            if result.returncode == 0:
+                output = (result.stdout or "") + "\n" + (result.stderr or "")
+                gromacs_torch = _parse_gromacs_libtorch_version(output)
+
+    python_torch: str | None = None
+    try:
+        python_torch = importlib.metadata.version("torch")
+    except (importlib.metadata.PackageNotFoundError, ValueError, OSError):
+        pass
+    return gromacs_torch, python_torch
+
+
+def get_nnpot_mdrun_environment(
+        use_gpu: bool,
+        exporter_torch_version: str | None = None,
+        check_torch_version: bool = True) -> dict[str, str]:
+    """Return a child environment without a conflicting NVIDIA OpenMP runtime.
+
+    LibTorch ships the GNU OpenMP runtime it was built against.  An inherited
+    NVHPC compiler-library directory can cause ``libgomp.so.1`` to resolve to
+    NVIDIA's incompatible implementation before LibTorch loads, producing the
+    runtime-conflict warning and risking incorrect behavior.  Preserve every
+    unrelated library path, including CUDA and custom GROMACS paths, and remove
+    only entries that concretely expose ``libgomp.so.1`` as ``libnvomp``.
+    Explicit ``LD_PRELOAD`` references to NVIDIA OpenMP are filtered too.
+    """
+    environment = os.environ.copy()
+    environment["GMX_NN_DEVICE"] = "gpu" if use_gpu else "cpu"
+
+    gromacs_torch, python_torch = get_nnpot_torch_runtime_versions()
+    if exporter_torch_version is None:
+        exporter_torch_version = python_torch
+    gromacs_major_minor = _torch_major_minor(gromacs_torch)
+    exporter_major_minor = _torch_major_minor(exporter_torch_version)
+    if (check_torch_version
+            and gromacs_major_minor is not None
+            and exporter_major_minor is not None
+            and gromacs_major_minor != exporter_major_minor):
+        version_detail = (
+            f"GROMACS uses LibTorch {gromacs_torch}, while the selected model "
+            f"was exported with PyTorch {exporter_torch_version}."
+        )
+        if not use_gpu:
+            raise RuntimeError(
+                "CPU NNPot launch is blocked because the LibTorch and "
+                "PyTorch major/minor versions differ. This configuration "
+                "has caused a native crash on CPU. " + version_detail + " "
+                "Install matching versions, rebuild GROMACS against the "
+                "Python environment's PyTorch release, or enable the "
+                "tested GPU NNPot path."
+            )
+        print(
+            "WARNING: " + version_detail + " The GPU NNPot launch will "
+            "continue, but cross-version TorchScript compatibility is not "
+            "guaranteed; use matching releases if the run fails."
+        )
+
+    library_path = environment.get("LD_LIBRARY_PATH")
+    removed_library_paths: list[str] = []
+    removed_relative_library_paths: list[str] = []
+    retained_library_paths: list[str] = []
+    removed_empty_library_path = False
+    if library_path is not None:
+        for entry in library_path.split(os.pathsep):
+            # Empty loader-path components mean the process working directory.
+            # Never propagate that unsafe and non-reproducible search location
+            # into a GROMACS/Torch child process.
+            if not entry:
+                removed_empty_library_path = True
+                continue
+            if not os.path.isabs(entry):
+                # Relative entries would be resolved against the per-job child
+                # cwd rather than the server's startup directory, allowing a
+                # job-local library to be loaded accidentally.
+                removed_relative_library_paths.append(entry)
+                continue
+            if _library_path_loads_nvidia_openmp(entry):
+                removed_library_paths.append(entry)
+            else:
+                retained_library_paths.append(entry)
+
+    preload = environment.get("LD_PRELOAD")
+    removed_preloads: list[str] = []
+    removed_relative_preloads: list[str] = []
+    retained_preloads: list[str] = []
+    if preload is not None:
+        for entry in _split_ld_preload(preload):
+            if os.sep in entry and not os.path.isabs(entry):
+                removed_relative_preloads.append(entry)
+                continue
+            if _preload_entry_loads_nvidia_openmp(entry):
+                removed_preloads.append(entry)
+            else:
+                retained_preloads.append(entry)
+
+    # An NVHPC/PGI host build normally links NVIDIA's OpenMP runtime through
+    # DT_NEEDED/RPATH even when no conflicting path is visible in this Python
+    # process.  LibTorch uses the GNU/LLVM OpenMP ABI, and loading both runtimes
+    # is explicitly unsafe.  Do not make detection depend on whether one
+    # environment entry happened to be removable.
+    if _gromacs_host_compiler_uses_nvhpc():
+        raise RuntimeError(
+            "NNPot launch is blocked because this NVHPC/PGI-built GROMACS host "
+            "code can load NVIDIA's OpenMP runtime, which "
+            "conflicts with LibTorch. Rebuild the GROMACS host C/C++ code with "
+            "GCC or Clang, or configure one compatible OpenMP runtime for both "
+            "GROMACS and LibTorch."
+        )
+    if (removed_library_paths or removed_empty_library_path
+            or removed_relative_library_paths):
+        if retained_library_paths:
+            environment["LD_LIBRARY_PATH"] = os.pathsep.join(
+                retained_library_paths)
+        else:
+            environment.pop("LD_LIBRARY_PATH", None)
+    if removed_preloads or removed_relative_preloads:
+        if retained_preloads:
+            environment["LD_PRELOAD"] = os.pathsep.join(retained_preloads)
+        else:
+            environment.pop("LD_PRELOAD", None)
+    if removed_library_paths:
+        print(
+            "Removed conflicting NVIDIA HPC SDK OpenMP runtime path(s) "
+            "from the Torch NNPot child environment: "
+            + os.pathsep.join(removed_library_paths)
+        )
+    if removed_relative_library_paths:
+        print(
+            "Removed relative library search path(s) from the Torch NNPot "
+            "child environment: "
+            + os.pathsep.join(removed_relative_library_paths)
+        )
+    if removed_preloads:
+        print(
+            "Removed conflicting NVIDIA OpenMP preload(s) from the Torch "
+            "NNPot child environment: "
+            + os.pathsep.join(removed_preloads)
+        )
+    if removed_relative_preloads:
+        print(
+            "Removed relative preload path(s) from the Torch NNPot child "
+            "environment: " + os.pathsep.join(removed_relative_preloads)
+        )
+    return environment
+
+
+def _parse_tpr_nnpot_settings(output: str) -> dict[str, str] | None:
+    """Extract the NNPot input-record section from ``gmx dump`` output."""
+    section_indent: int | None = None
+    values: dict[str, str] = {}
+    for raw_line in output.splitlines():
+        stripped = raw_line.strip()
+        if section_indent is None:
+            if stripped.lower() == "nnpot:":
+                section_indent = len(raw_line) - len(raw_line.lstrip())
+            continue
+
+        if not stripped:
+            continue
+        indentation = len(raw_line) - len(raw_line.lstrip())
+        if indentation <= section_indent:
+            break
+        key, separator, value = stripped.partition("=")
+        if separator:
+            values[key.strip().lower()] = value.strip()
+
+    return values if section_indent is not None else None
+
+
+def _parse_tpr_nnpot_dump(output: str) -> tuple[bool, str | None]:
+    """Extract the NNPot activation flag and model path from ``gmx dump``."""
+    values = _parse_tpr_nnpot_settings(output)
+    # GROMACS versions predating NNPot naturally omit this block.  Such a TPR
+    # cannot encode an NNP model, so ordinary production MD remains runnable.
+    if values is None:
+        return False, None
+    if "active" not in values:
+        raise RuntimeError(
+            "Could not determine the NNPot setting in the selected TPR. "
+            "Regenerate the production TPR with this GROMACS installation."
+        )
+
+    active_value = values["active"].lower()
+    if active_value not in {"true", "false"}:
+        raise RuntimeError(
+            "The selected TPR contains an unrecognized NNPot activation value "
+            f"({values['active']!r}). Regenerate the production TPR."
+        )
+
+    active = active_value == "true"
+    model_file = values.get("modelfile") or None
+    if active and model_file is None:
+        raise RuntimeError(
+            "The selected TPR enables NNPot but does not identify its model file. "
+            "Regenerate the production TPR."
+        )
+    return active, model_file
+
+
+NNPOT_MODEL_INPUT_CONTRACTS: dict[str, tuple[str, ...]] = {
+    "ani1x": ("atom-positions", "atom-numbers", "nnp-charge", "box", "pbc"),
+    "ani2x": ("atom-positions", "atom-numbers", "nnp-charge", "box", "pbc"),
+    "ani2x-emle": (
+        "atom-positions", "atom-numbers", "atom-positions-mm",
+        "atom-charges-mm", "nnp-charge", "box",
+    ),
+    "mace-small": (
+        "atom-positions", "atom-numbers", "nnp-charge", "atom-pairs",
+        "pair-shifts", "box", "pbc",
+    ),
+    "mace-medium": (
+        "atom-positions", "atom-numbers", "nnp-charge", "atom-pairs",
+        "pair-shifts", "box", "pbc",
+    ),
+    "mace-large": (
+        "atom-positions", "atom-numbers", "nnp-charge", "atom-pairs",
+        "pair-shifts", "box", "pbc",
+    ),
+}
+
+NNPOT_MODEL_ATOMIC_NUMBERS: dict[str, frozenset[int]] = {
+    "ani1x": frozenset({1, 6, 7, 8}),
+    "ani2x": frozenset({1, 6, 7, 8, 9, 16, 17}),
+    # EMLE's shipped element-embedding table is narrower than ANI-2x itself.
+    # Its _emle and _emle_base species tables contain H/C/N/O/S only.
+    "ani2x-emle": frozenset({1, 6, 7, 8, 16}),
+    "mace-small": frozenset({1, 6, 7, 8, 9, 15, 16, 17, 35, 53}),
+    "mace-medium": frozenset({1, 6, 7, 8, 9, 15, 16, 17, 35, 53}),
+    "mace-large": frozenset({1, 6, 7, 8, 9, 15, 16, 17, 35, 53}),
+}
+
+_ATOMIC_NUMBER_SYMBOLS = {
+    1: "H", 6: "C", 7: "N", 8: "O", 9: "F", 15: "P", 16: "S",
+    17: "Cl", 35: "Br", 53: "I",
+}
+
+
+def _nnpot_model_name_from_path(model_file: str | None) -> str | None:
+    """Recognise a WebUI model from legacy or content-addressed filenames."""
+    if not model_file:
+        return None
+    file_name = os.path.basename(model_file).lower()
+    # Longest first: ani2x-emle must not be treated as plain ani2x.
+    for model_name in sorted(SUPPORTED_NNPOT_MODELS, key=len, reverse=True):
+        if (file_name == f"{model_name}.pt"
+                or re.fullmatch(
+                    re.escape(model_name) + r"-[0-9a-f]{64}\.pt",
+                    file_name)):
+            return model_name
+    return None
+
+
+def get_nnpot_model_name_from_path(model_file: str | None) -> str | None:
+    """Public wrapper for recognising one of this WebUI's managed models."""
+    return _nnpot_model_name_from_path(model_file)
+
+
+def _validate_tpr_nnpot_contract(output: str) -> str | None:
+    """Fail closed when a recognised WebUI model has a stale TPR contract."""
+    active, model_file = _parse_tpr_nnpot_dump(output)
+    if not active:
+        return None
+
+    settings = _parse_tpr_nnpot_settings(output)
+    assert settings is not None
+    model_name = _nnpot_model_name_from_path(model_file)
+    if model_name is None:
+        # Custom TorchScript models are an expert workflow; their signatures
+        # cannot be inferred from a filename, so only universal fixed-box safety
+        # is enforced below.
+        model_label = os.path.basename(model_file or "custom model")
+    else:
+        model_label = model_name
+
+    pressure_match = re.search(
+        r"^\s*pcoupl\s*=\s*(\S+)", output,
+        flags=re.MULTILINE | re.IGNORECASE)
+    if pressure_match is None:
+        raise RuntimeError(
+            "Could not determine pressure coupling from the selected NNPot TPR. "
+            "Regenerate it with the current WebUI."
+        )
+    pressure_coupling = pressure_match.group(1).lower().replace("_", "-")
+    if pressure_coupling not in {"no", "none", "off"}:
+        raise RuntimeError(
+            f"NNPot TPR uses pressure coupling '{pressure_match.group(1)}'. "
+            "These energy-only models do not provide virial/stress, so production "
+            "must use pcoupl = no. Regenerate the production MDP and TPR."
+        )
+
+    time_step_match = re.search(
+        r"^\s*dt\s*=\s*(\S+)", output,
+        flags=re.MULTILINE | re.IGNORECASE)
+    try:
+        time_step = (float(time_step_match.group(1))
+                     if time_step_match is not None else math.nan)
+    except ValueError:
+        time_step = math.nan
+    if (not math.isfinite(time_step)
+            or time_step <= 0.0
+            or time_step > MAX_NNPOT_TIME_STEP_PS):
+        reported_time_step = (
+            time_step_match.group(1) if time_step_match is not None else "missing")
+        raise RuntimeError(
+            f"NNPot TPR uses dt={reported_time_step}; ML-potential production "
+            f"requires a positive timestep no larger than "
+            f"{MAX_NNPOT_TIME_STEP_PS:g} ps (1 fs). Regenerate the production "
+            "MDP and TPR."
+        )
+
+    if model_name is None:
+        return None
+
+    actual_inputs_list = [
+        settings.get(f"model-input{index}", "")
+        for index in range(1, 10)
+    ]
+    while actual_inputs_list and not actual_inputs_list[-1]:
+        actual_inputs_list.pop()
+    actual_inputs = tuple(actual_inputs_list)
+    expected_inputs = NNPOT_MODEL_INPUT_CONTRACTS[model_name]
+    if actual_inputs != expected_inputs:
+        raise RuntimeError(
+            f"NNPot TPR for {model_label} has stale model inputs "
+            f"({', '.join(actual_inputs) or 'none'}); expected "
+            f"{', '.join(expected_inputs)}. Regenerate the production MDP and TPR."
+        )
+
+    embedding = settings.get("embedding", "").lower().replace("_", "-")
+    if model_name == "ani2x-emle" and embedding != "electrostatic-model":
+        raise RuntimeError(
+            "ANI2x-EMLE requires nnpot-embedding = electrostatic-model and the "
+            "surrounding MM coordinates/charges. Regenerate the MDP and TPR."
+        )
+    if model_name != "ani2x-emle" and embedding != "mechanical":
+        raise RuntimeError(
+            f"{model_label} requires nnpot-embedding = mechanical. Its wrapper "
+            "does not receive the MM coordinates and charges required for "
+            "electrostatic embedding. Regenerate the production MDP and TPR."
+        )
+
+    try:
+        nnp_charge = float(settings.get("nnp-charge", ""))
+    except ValueError:
+        nnp_charge = math.nan
+    if not math.isfinite(nnp_charge):
+        raise RuntimeError(
+            f"NNPot TPR for {model_label} has no valid nnp-charge. Regenerate "
+            "the production MDP and TPR."
+        )
+    if abs(nnp_charge) > 1.0e-4:
+        raise RuntimeError(
+            f"All bundled models currently require neutral NNP regions, but "
+            f"the {model_label} TPR "
+            f"contains nnp-charge={nnp_charge:g}. Select a neutral input group "
+            "and regenerate the production TPR."
+        )
+
+    if model_name.startswith("mace-"):
+        try:
+            pair_cutoff = float(settings.get("pair-cutoff", ""))
+        except ValueError:
+            pair_cutoff = math.nan
+        if not math.isclose(
+                pair_cutoff, MACE_OFF_PAIR_CUTOFF_NM,
+                rel_tol=0.0, abs_tol=1.0e-9):
+            raise RuntimeError(
+                f"{model_label} TPR uses nnpot-pair-cutoff={settings.get('pair-cutoff')!r}; "
+                f"MACE-OFF requires {MACE_OFF_PAIR_CUTOFF_NM:g} nm. Regenerate "
+                "the production MDP and TPR."
+            )
+    return model_name
+
+
+def inspect_tpr_nnpot_configuration(
+        working_directory_path: str,
+        run_input_file_name: str | None) -> tuple[bool, str | None]:
+    """Read the authoritative NNPot configuration encoded in a production TPR.
+
+    The UI checkbox describes the MDP the user intended to generate, but it can
+    become stale after a page reload or when an older TPR is selected.  Inspect
+    the actual run input before launching so NNP-specific safety settings cannot
+    be bypassed accidentally.
+    """
+    working_directory_path = validate_working_directory(working_directory_path)
+    tpr_path = validate_local_file_path(
+        working_directory_path, run_input_file_name, "production run input file")
+    if os.path.splitext(tpr_path)[1].lower() != ".tpr":
+        raise ValueError("Production MD requires a .tpr run input file.")
+    if not os.path.isfile(tpr_path):
+        raise ValueError(
+            f"Run input file {run_input_file_name!r} does not exist."
+        )
+
+    process = run_checked_command(
+        ["gmx", "dump", "-s", tpr_path], cwd=working_directory_path)
+    dump_output = (process.stdout or "") + "\n" + (process.stderr or "")
+    active, model_file = _parse_tpr_nnpot_dump(dump_output)
+    _validate_tpr_nnpot_contract(dump_output)
+    if active:
+        settings = _parse_tpr_nnpot_settings(dump_output)
+        input_group = settings.get("input-group", "").strip() \
+            if settings is not None else ""
+        verify_nnpot_tpr_charge_attestation(
+            working_directory_path, run_input_file_name, input_group)
+    if active:
+        require_nnpot_model_snapshot_for_bundled_model(
+            working_directory_path, model_file)
+
+    return active, model_file
+
+
+def require_classical_tpr(
+        working_directory_path: str,
+        run_input_file_name: str | None,
+        workflow_name: str) -> None:
+    """Reject an NNP-active TPR in a workflow that supports classical MD only."""
+    working_directory_path = validate_working_directory(working_directory_path)
+    tpr_path = validate_local_file_path(
+        working_directory_path, run_input_file_name, "production run input file")
+    if os.path.splitext(tpr_path)[1].lower() != ".tpr":
+        raise ValueError("Production MD requires a .tpr run input file.")
+    if not os.path.isfile(tpr_path):
+        raise ValueError(
+            f"Run input file {run_input_file_name!r} does not exist."
+        )
+
+    process = run_checked_command(
+        ["gmx", "dump", "-s", tpr_path], cwd=working_directory_path)
+    dump_output = (process.stdout or "") + "\n" + (process.stderr or "")
+    active, _ = _parse_tpr_nnpot_dump(dump_output)
+    if active:
+        raise RuntimeError(
+            f"Machine-learning potentials are not supported in {workflow_name}. "
+            "Use the Protein-Ligand Complex workflow for an NNP/MM simulation."
+        )
+
+
+def _gmx_group_selection_expression(group_name: str) -> str:
+    """Return a literal gmx-select expression for one TPR group name/index."""
+    group_name = group_name.strip()
+    if re.fullmatch(r"\d+", group_name):
+        return f"group {int(group_name)}"
+    escaped = group_name.replace("\\", "\\\\").replace('"', '\\"')
+    return f'group "{escaped}"'
+
+
+def _read_ndx_atom_indices(index_file_path: str) -> set[int]:
+    """Read one generated NDX group and return zero-based global atom indices."""
+    indices: set[int] = set()
+    with open(index_file_path, encoding="utf-8", errors="replace") as handle:
+        for line in handle:
+            content = line.strip()
+            if not content or content.startswith("["):
+                continue
+            for token in content.split():
+                try:
+                    one_based_index = int(token)
+                except ValueError as exc:
+                    raise RuntimeError(
+                        f"GROMACS wrote an invalid atom index {token!r} while "
+                        "validating the NNPot input group."
+                    ) from exc
+                if one_based_index <= 0:
+                    raise RuntimeError(
+                        "GROMACS wrote a non-positive atom index while validating "
+                        "the NNPot input group."
+                    )
+                indices.add(one_based_index - 1)
+    if not indices:
+        raise RuntimeError("The selected NNPot input group contains no atoms.")
+    return indices
+
+
+_TPR_ATOMIC_NUMBER_RE = re.compile(
+    r"^\s*atom\[\s*(\d+)\s*\]=\{.*\batomnumber=\s*(-?\d+)\s*}")
+_TPR_ATOM_CHARGE_RE = re.compile(
+    r"^\s*atom\[\s*(\d+)\s*\]=\{.*?\bq=\s*"
+    r"([-+]?(?:\d+(?:\.\d*)?|\.\d+)(?:[Ee][-+]?\d+)?)")
+_TPR_CONSTRAINT_INTERACTION_RE = re.compile(
+    r"^\s*\d+\s+type=\d+\s+\((?:CONSTR(?:NC)?|SETTLE)\)\s+"
+    r"((?:\d+\s*)+)$",
+    flags=re.IGNORECASE,
+)
+
+
+def _constraint_atom_indices_from_tpr_dump_line(
+        line: str) -> tuple[int, ...] | None:
+    """Return global atoms for one expanded CONSTR/SETTLE dump record."""
+    match = _TPR_CONSTRAINT_INTERACTION_RE.match(line)
+    if match is None:
+        return None
+    return tuple(int(token) for token in match.group(1).split())
+
+
+def _stream_tpr_nnpot_group_data(
+        tpr_path: str, working_directory_path: str,
+        selected_indices: set[int]) -> tuple[dict[int, int], int]:
+    """Stream expanded TPR elements and constraints for the selected atoms.
+
+    A solvated system dump can be hundreds of megabytes.  Streaming avoids the
+    bounded command capture truncating atoms in a large protein and avoids
+    retaining solvent records that are outside the NNP region.  ``-sys`` also
+    expands molecule-local interaction indices to global atom indices, so a
+    constraint is rejected even when only one of its atoms lies in the learned
+    region (a subset conversion would silently drop that boundary interaction).
+    """
+    command = ["gmx", "dump", "-s", tpr_path, "-sys"]
+    print(f"Running command: {' '.join(command)}")
+    process = subprocess.Popen(
+        command, cwd=working_directory_path, stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT, text=True, encoding="utf-8",
+        errors="replace", start_new_session=(os.name == "posix"))
+    atomic_numbers: dict[int, int] = {}
+    touching_constraints = 0
+    output_tail: list[str] = []
+    try:
+        assert process.stdout is not None
+        for line in process.stdout:
+            output_tail.append(line)
+            if len(output_tail) > 40:
+                del output_tail[0]
+            atom_match = _TPR_ATOMIC_NUMBER_RE.match(line)
+            if atom_match is not None:
+                atom_index = int(atom_match.group(1))
+                if atom_index in selected_indices:
+                    atomic_numbers[atom_index] = int(atom_match.group(2))
+                continue
+            constraint_indices = _constraint_atom_indices_from_tpr_dump_line(
+                line)
+            if (constraint_indices is not None
+                    and any(index in selected_indices
+                            for index in constraint_indices)):
+                touching_constraints += 1
+        return_code = process.wait()
+    except BaseException:
+        if process.poll() is None:
+            stop_process_gracefully(process)
+        raise
+    finally:
+        if process.stdout is not None:
+            process.stdout.close()
+
+    if return_code != 0:
+        raise RuntimeError(
+            f"gmx dump failed while checking NNPot elements (exit status "
+            f"{return_code}):\n{''.join(output_tail).strip()}"
+        )
+    missing_indices = selected_indices - set(atomic_numbers)
+    if missing_indices:
+        examples = ", ".join(str(index + 1) for index in sorted(missing_indices)[:8])
+        raise RuntimeError(
+            "Could not read atomic numbers for every atom in the selected NNPot "
+            f"group (missing global atom indices: {examples}). Regenerate the TPR."
+        )
+    return atomic_numbers, touching_constraints
+
+
+def _stream_tpr_charges(
+        tpr_path: str, working_directory_path: str,
+        selected_indices: set[int]) -> dict[int, float]:
+    """Stream ``gmx dump -sys`` and retain charges for selected atoms."""
+    command = ["gmx", "dump", "-s", tpr_path, "-sys"]
+    print(f"Running command: {' '.join(command)}")
+    process = subprocess.Popen(
+        command, cwd=working_directory_path, stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT, text=True, encoding="utf-8",
+        errors="replace", start_new_session=(os.name == "posix"))
+    charges: dict[int, float] = {}
+    output_tail: list[str] = []
+    try:
+        assert process.stdout is not None
+        for line in process.stdout:
+            output_tail.append(line)
+            if len(output_tail) > 40:
+                del output_tail[0]
+            match = _TPR_ATOM_CHARGE_RE.match(line)
+            if match is None:
+                continue
+            atom_index = int(match.group(1))
+            if atom_index in selected_indices:
+                charges[atom_index] = float(match.group(2))
+        return_code = process.wait()
+    except BaseException:
+        if process.poll() is None:
+            stop_process_gracefully(process)
+        raise
+    finally:
+        if process.stdout is not None:
+            process.stdout.close()
+
+    if return_code != 0:
+        raise RuntimeError(
+            f"gmx dump failed while checking NNPot charge (exit status "
+            f"{return_code}):\n{''.join(output_tail).strip()}"
+        )
+    missing_indices = selected_indices - set(charges)
+    if missing_indices:
+        examples = ", ".join(
+            str(index + 1) for index in sorted(missing_indices)[:8])
+        raise RuntimeError(
+            "Could not read charges for every atom in the selected NNPot group "
+            f"(missing global atom indices: {examples})."
+        )
+    return charges
+
+
+def validate_nnpot_input_group_charge(
+        working_directory_path: str,
+        parameter_file_path: str,
+        input_structure_path: str,
+        topology_file_path: str,
+        checkpoint_path: str | None,
+        max_warnings: int) -> float:
+    """Require a neutral pre-NNP group using an unmodified probe topology.
+
+    Stock GROMACS 2026.4 serializes ``nnp-charge`` internally but exposes no
+    MDP option for setting it and does not derive it from topology.  It always
+    passes zero to TorchScript.  Build a temporary classical TPR so charge is
+    measured before electrostatic embedding removes the selected atoms' MM
+    charges, then reject a scientifically invalid charged region.
+    """
+    working_directory_path = validate_working_directory(working_directory_path)
+    input_group = read_mdp_option(parameter_file_path, "nnpot-input-group")
+    if not input_group:
+        raise ValueError(
+            "The NNPot parameter file has no non-empty nnpot-input-group."
+        )
+    model_file = read_mdp_option(parameter_file_path, "nnpot-modelfile")
+    model_name = get_nnpot_model_name_from_path(model_file) or "selected model"
+
+    with open(parameter_file_path, encoding="utf-8", errors="replace") as handle:
+        mdp_content = handle.read()
+    disabled_content, replacement_count = re.subn(
+        r"(?im)^(\s*nnpot[-_]active\s*=\s*)\S+",
+        r"\g<1>false",
+        mdp_content,
+    )
+    if replacement_count != 1:
+        raise ValueError(
+            "The NNPot parameter file must contain exactly one nnpot-active "
+            "assignment before its group charge can be validated."
+        )
+
+    with tempfile.TemporaryDirectory(
+            prefix=".nnpot_charge_probe_",
+            dir=working_directory_path) as stage:
+        probe_mdp_path = os.path.join(stage, "classical_probe.mdp")
+        probe_tpr_path = os.path.join(stage, "classical_probe.tpr")
+        probe_output_mdp_path = os.path.join(stage, "classical_probe_out.mdp")
+        atomic_write_text_file(probe_mdp_path, disabled_content)
+        command = [
+            "gmx", "grompp",
+            "-f", probe_mdp_path,
+            "-c", input_structure_path,
+            "-p", topology_file_path,
+            "-o", probe_tpr_path,
+            "-maxwarn", str(max_warnings),
+            "-po", probe_output_mdp_path,
+        ]
+        if checkpoint_path is not None:
+            command.extend(["-t", checkpoint_path])
+        run_checked_command(command, cwd=working_directory_path)
+
+        index_path = os.path.join(stage, "nnp_group.ndx")
+        run_checked_command([
+            "gmx", "select", "-s", probe_tpr_path,
+            "-select", _gmx_group_selection_expression(input_group),
+            "-on", index_path,
+        ], cwd=working_directory_path)
+        selected_indices = _read_ndx_atom_indices(index_path)
+        charges = _stream_tpr_charges(
+            probe_tpr_path, working_directory_path, selected_indices)
+
+    total_charge = math.fsum(charges.values())
+    if abs(total_charge) > NNPOT_CHARGE_TOLERANCE_E:
+        raise RuntimeError(
+            f"NNPot input group '{input_group}' has total topology charge "
+            f"{total_charge:+.5f} e. Stock GROMACS 2026.4 always passes "
+            "nnp-charge = 0 to TorchScript, so all bundled models (including "
+            f"ANI2x-EMLE) currently require a neutral input group. Choose a "
+            f"neutral group before using {model_name}."
+        )
+    return total_charge
+
+
+def _atomic_number_label(atomic_number: int) -> str:
+    """Format a Z value with an element symbol when the periodic table knows it."""
+    try:
+        from parmed.periodic_table import Element
+        if 0 < atomic_number < len(Element):
+            return f"{Element[atomic_number]} (Z={atomic_number})"
+    except (ImportError, TypeError):
+        pass
+    symbol = _ATOMIC_NUMBER_SYMBOLS.get(atomic_number)
+    return (f"{symbol} (Z={atomic_number})" if symbol
+            else f"Z={atomic_number}")
+
+
+def validate_tpr_nnpot_elements(
+        working_directory_path: str, run_input_file_name: str | None,
+        model_file: str | None) -> None:
+    """Validate the actual TPR input group before launching an NNP model."""
+    model_name = _nnpot_model_name_from_path(model_file)
+
+    working_directory_path = validate_working_directory(working_directory_path)
+    tpr_path = validate_local_file_path(
+        working_directory_path, run_input_file_name, "production run input file")
+    process = run_checked_command(
+        ["gmx", "dump", "-s", tpr_path], cwd=working_directory_path)
+    dump_output = (process.stdout or "") + "\n" + (process.stderr or "")
+    settings = _parse_tpr_nnpot_settings(dump_output)
+    input_group = settings.get("input-group", "").strip() if settings else ""
+    if not input_group:
+        raise RuntimeError(
+            "The selected NNPot TPR does not identify a non-empty input group. "
+            "Regenerate the production MDP and TPR."
+        )
+
+    with tempfile.TemporaryDirectory(prefix="gromacs_webui_nnp_group_") as stage:
+        index_path = os.path.join(stage, "nnp_group.ndx")
+        run_checked_command([
+            "gmx", "select", "-s", tpr_path,
+            "-select", _gmx_group_selection_expression(input_group),
+            "-on", index_path,
+        ], cwd=working_directory_path)
+        selected_indices = _read_ndx_atom_indices(index_path)
+
+    atomic_numbers, touching_constraints = _stream_tpr_nnpot_group_data(
+        tpr_path, working_directory_path, selected_indices)
+    if touching_constraints:
+        raise RuntimeError(
+            f"NNPot input group '{input_group}' has {touching_constraints} "
+            "constraint interaction(s) touching its atoms in the selected "
+            "TPR. ML-potential production requires constraints = none for "
+            "every atom in the learned region, including bonds crossing the "
+            "NNP/MM boundary. Regenerate the production MDP and TPR."
+        )
+
+    if model_name is None:
+        return
+
+    missing_z = sorted(
+        index + 1 for index, atomic_number in atomic_numbers.items()
+        if atomic_number <= 0)
+    if missing_z:
+        examples = ", ".join(str(index) for index in missing_z[:8])
+        raise RuntimeError(
+            f"NNPot input group '{input_group}' contains {len(missing_z)} atom(s) "
+            "without valid atomic numbers in the TPR "
+            f"(global atom indices: {examples}). ACPYPE ligand atom types from "
+            "older WebUI versions commonly cause this. Regenerate or re-merge "
+            "the ligand topology, then regenerate the production TPR."
+        )
+
+    supported = NNPOT_MODEL_ATOMIC_NUMBERS[model_name]
+    unsupported = sorted(set(atomic_numbers.values()) - supported)
+    if unsupported:
+        labels = ", ".join(_atomic_number_label(value) for value in unsupported)
+        raise RuntimeError(
+            f"NNPot input group '{input_group}' contains element(s) unsupported "
+            f"by {model_name}: {labels}. Choose a compatible model or exclude "
+            "those atoms from the NNPot input group."
+        )
+
+
+def resolve_nnpot_launch_state(
+        working_directory_path: str,
+        run_input_file_name: str | None,
+        ui_nnpot_active: bool,
+        launch_metadata: dict[str, str | None] | None = None) -> bool:
+    """Return the TPR's NNPot state, overriding a stale UI checkbox safely."""
+    active, model_file = inspect_tpr_nnpot_configuration(
+        working_directory_path, run_input_file_name)
+    if active != bool(ui_nnpot_active):
+        print(
+            "The selected TPR's NNPot setting overrides the stale UI checkbox "
+            f"(TPR: {'enabled' if active else 'disabled'})."
+        )
+    if active:
+        model_name = _nnpot_model_name_from_path(model_file)
+        unavailable_reason = get_gromacs_nnpot_unavailable_reason(model_name)
+        if unavailable_reason is not None:
+            raise RuntimeError(unavailable_reason)
+        validate_tpr_nnpot_elements(
+            working_directory_path, run_input_file_name, model_file)
+        if launch_metadata is not None:
+            exporter_version = get_nnpot_model_exporter_torch_version(
+                working_directory_path, model_file)
+            # Unknown/custom archives do not carry authoritative exporter
+            # provenance.  Leaving the mapping empty tells the launch path not
+            # to compare them against the unrelated active Python environment.
+            if exporter_version is not None:
+                launch_metadata["exporter_torch_version"] = exporter_version
+    return active
 
 
 def _cuda_devices_explicitly_hidden() -> bool:
@@ -290,9 +1229,14 @@ def is_gromacs_cuda_gpu_available() -> bool:
     return _cuda_driver_device_count() > 0
 
 
-@lru_cache(maxsize=1)
-def get_gromacs_nnpot_unavailable_reason() -> str | None:
-    """Explain why the ``gmx`` on PATH cannot execute TorchScript potentials."""
+def get_gromacs_nnpot_unavailable_reason(
+        model_name: str | None = None) -> str | None:
+    """Explain why the current ``gmx`` cannot execute TorchScript potentials.
+
+    Do not cache this probe: users may replace GROMACS while the WebUI server is
+    running, and checking ``gmx --version`` is inexpensive compared with any MD
+    operation.
+    """
     executable = shutil.which("gmx")
     if executable is None:
         return "Machine learning potentials are disabled: gmx was not found on PATH."
@@ -308,12 +1252,42 @@ def get_gromacs_nnpot_unavailable_reason() -> str | None:
     if result.returncode != 0:
         return ("Machine learning potentials are disabled: gmx --version failed "
                 f"with exit status {result.returncode}.")
-    if re.search(r"^Torch support:\s*enabled\s*$", version_output, flags=re.MULTILINE | re.IGNORECASE):
+    torch_support = re.search(
+        r"^\s*Torch support:\s*(enabled|disabled)(?=\s|$)",
+        version_output,
+        flags=re.MULTILINE | re.IGNORECASE,
+    )
+    if torch_support is not None and torch_support.group(1).lower() == "enabled":
+        if model_name in NNPOT_GROMACS_2026_MODELS:
+            release = _parse_gromacs_release(version_output)
+            if release is None:
+                return (
+                    f"The {model_name} model is disabled: it requires GROMACS "
+                    "2026 or newer, but the GROMACS release could not be "
+                    "determined from gmx --version."
+                )
+            if release[0] < 2026:
+                return (
+                    f"The {model_name} model is disabled: it requires GROMACS "
+                    "2026 or newer for its NNPot input interface; this gmx is "
+                    f"from GROMACS {release[0]}.{release[1]}."
+                )
+            if (model_name in NNPOT_GROMACS_2026_4_MODELS
+                    and release < (2026, 4)):
+                return (
+                    f"The {model_name} model is disabled: it requires GROMACS "
+                    "2026.4 or newer. Earlier 2026 releases can compute wrong "
+                    "NNPot pair shifts, energies, and forces for triclinic "
+                    f"boxes; this gmx is GROMACS {release[0]}.{release[1]}."
+                )
         return None
+    if torch_support is not None:
+        return ("Machine learning potentials are disabled: this GROMACS build reports "
+                "'Torch support: disabled'. Rebuild GROMACS with GMX_NNPOT=TORCH and a "
+                "LibTorch version matching the Python PyTorch used to export the model.")
 
-    return ("Machine learning potentials are disabled: this GROMACS build reports "
-            "'Torch support: disabled'. Rebuild GROMACS with GMX_NNPOT=TORCH and a "
-            "LibTorch version matching the Python PyTorch used to export the model.")
+    return ("Machine learning potentials are disabled: unable to determine Torch "
+            "support from gmx --version output.")
 
 
 GMX_MMPBSA_EXECUTABLE_ENVIRONMENT_VARIABLE: str = "GMX_MMPBSA_EXECUTABLE"
@@ -429,8 +1403,7 @@ def get_torchani_install_error_message(exc: Exception) -> str | None:
         "Repair the conda environment, then try generating the MDP again:\n"
         "  python -m pip uninstall -y torchani\n"
         "  python -m pip uninstall -y torchani\n"
-        "  python -m pip install torchani\n"
-        "  ani build-extensions\n\n"
+        "  python -m pip install torchani\n\n"
         f"Original import error: {message}"
     )
 
@@ -477,14 +1450,22 @@ def get_nnpot_model_load_error_message(exc: Exception) -> str | None:
 def get_expected_nnpot_model_config(model_name: str) -> str:
     """Return the config fingerprint a cached model file must carry to be reusable."""
     if model_name in ["ani1x", "ani2x"]:
-        return f"{model_name}|torchani|pyaev|adaptive|neutral-charge-check|nonmutating-box-v3"
+        return f"{model_name}|torchani|pyaev|adaptive|neutral-charge-check|element-check|nonmutating-box-v4"
     if model_name == "ani2x-emle":
-        return f"{model_name}|emle|electrostatic-mm-forces|runtime-charge|pyaev-v4"
+        return f"{model_name}|emle|electrostatic-mm-forces|neutral-gromacs-charge|element-check|runtime-device|pyaev-v8"
     if model_name.startswith("mace-"):
         return f"{model_name}|mace|gromacs-pairs-0.5nm|neutral-charge-check|energy-only-v6"
-    if model_name == "aimnet2":
-        return f"{model_name}|aimnet|traced-runtime-charge-box-pbc-device-float64-v6"
     return model_name
+
+
+def get_expected_nnpot_model_package_versions(model_name: str) -> str:
+    """Return stable exporter-package provenance embedded in a model archive."""
+    return json.dumps(
+        _nnpot_installed_package_versions(model_name),
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=True,
+    )
 
 def is_cached_nnpot_model_usable(model_name: str, modelfile_path: str) -> bool:
     """Report whether the cached model matches this build, moving it aside if not."""
@@ -496,7 +1477,10 @@ def is_cached_nnpot_model_usable(model_name: str, modelfile_path: str) -> bool:
         print(f"Moved {reason} cached NNPot model to {backup_path}.")
         return False
 
-    extra_files = {"nnpot_model_config": ""}
+    extra_files = {
+        "nnpot_model_config": "",
+        "nnpot_package_versions": "",
+    }
     try:
         torch.jit.load(modelfile_path, map_location="cpu", _extra_files=extra_files)
         cached_config = extra_files["nnpot_model_config"]
@@ -504,6 +1488,12 @@ def is_cached_nnpot_model_usable(model_name: str, modelfile_path: str) -> bool:
             cached_config = cached_config.decode()
         if cached_config != get_expected_nnpot_model_config(model_name):
             return quarantine("outdated")
+        cached_versions = extra_files["nnpot_package_versions"]
+        if isinstance(cached_versions, bytes):
+            cached_versions = cached_versions.decode()
+        if cached_versions != get_expected_nnpot_model_package_versions(
+                model_name):
+            return quarantine("outdated-package")
         return True
     except RuntimeError as exc:
         if get_nnpot_model_load_error_message(exc) is not None:
@@ -527,46 +1517,6 @@ def is_cached_nnpot_model_usable(model_name: str, modelfile_path: str) -> bool:
             return quarantine("corrupt")
         raise
 
-def checkExtensions() -> dict[str, str]:
-    """Collect loaded Torch extension libraries to embed alongside a saved model."""
-    import torch
-
-    ext_lib = []
-    for lib in torch.ops.loaded_libraries:
-        if lib:
-            ext_lib.append(lib)
-    ext_lib = ":".join(ext_lib)
-    print("Loaded extension libraries: ", ext_lib)
-    extra_files = {}
-    if ext_lib:
-        extra_files['extension_libs'] = ext_lib
-    return extra_files
-
-def trace_aimnet2_model(model: torch.nn.Module) -> torch.jit.ScriptModule:
-    """Trace AIMNet2 with representative inputs, since it cannot be scripted."""
-    import torch
-
-    model.eval()
-    try:
-        device = next(model.parameters()).device
-    except StopIteration:
-        device = torch.device("cpu")
-    positions = torch.tensor(
-        [[0.0, 0.0, 0.0], [0.09572, 0.0, 0.0], [-0.02399, 0.0927, 0.0]],
-        dtype=torch.float32,
-        device=device,
-    )
-    atomic_numbers = torch.tensor([8, 1, 1], dtype=torch.int64, device=device)
-    nnp_charge = torch.tensor(0.0, dtype=torch.float64, device=device)
-    cell = torch.eye(3, dtype=torch.float32, device=device)
-    pbc = torch.tensor([True, True, True], device=device)
-    return torch.jit.trace(
-        model,
-        (positions, atomic_numbers, nnp_charge, cell, pbc),
-        strict=False,
-        check_trace=False,
-    )
-
 def download_nnpot_model(model_name: str) -> str:
     """Build or reuse a selected neural-network potential and return its path.
 
@@ -587,7 +1537,6 @@ def _download_nnpot_model_locked(model_name: str) -> str:
 
     import torch
     from nnpot_models import (
-        GmxAIMNet2Model,
         GmxANI1xModel,
         GmxANI2xEMLEModel,
         GmxANI2xModel,
@@ -595,14 +1544,12 @@ def _download_nnpot_model_locked(model_name: str) -> str:
     )
 
     MODEL_ROOT.mkdir(parents=True, exist_ok=True)
-    os.environ.setdefault("WARP_CACHE_PATH", str(MODEL_ROOT / "warp-cache"))
-    os.environ.setdefault("AIMNET_CACHE_DIR", str(MODEL_ROOT / "aimnet-cache"))
     # Absolute: this path is written into the MDP as nnpot-modelfile and resolved
     # by mdrun, which runs from the job directory rather than the repository root.
     modelfile_path = str(MODEL_ROOT / f"{model_name}.pt")
     is_ani_model = model_name in ["ani1x", "ani2x"]
     is_emle_model = model_name == "ani2x-emle"
-    
+
     if os.path.exists(modelfile_path):
         if not is_cached_nnpot_model_usable(model_name, modelfile_path):
             print(f"Rebuilding {model_name}.")
@@ -617,12 +1564,11 @@ def _download_nnpot_model_locked(model_name: str) -> str:
     try:
         if is_ani_model or model_name == "ani2x-emle":
             os.environ["TORCHANI_DISABLE_EXTENSIONS"] = "1"
+            os.environ["TORCHANI_NO_WARN_EXTENSIONS"] = "1"
         if model_name=="ani1x":
             model = GmxANI1xModel(device)
         elif model_name=="ani2x":
             model = GmxANI2xModel(device)
-        elif model_name=="aimnet2":
-            model = GmxAIMNet2Model(device)
         elif model_name=="ani2x-emle":
             model = GmxANI2xEMLEModel(device)
         else:
@@ -636,13 +1582,18 @@ def _download_nnpot_model_locked(model_name: str) -> str:
         if emle_message is not None:
             raise RuntimeError(emle_message) from exc
         raise
-    
+
     # Save the model
-    extensions = checkExtensions()
-    extensions["nnpot_model_config"] = get_expected_nnpot_model_config(model_name)
-    if model_name == "aimnet2":
-        scripted_model = trace_aimnet2_model(model)
-    elif is_emle_model or not model_name.startswith("mace-"):
+    # These wrappers are deliberately self-contained.  Persisting every
+    # process-global custom operator path would make one model depend on
+    # unrelated extensions loaded while another model was built, and can also
+    # reintroduce ABI/OpenMP conflicts when GROMACS loads the archive.
+    extensions = {
+        "nnpot_model_config": get_expected_nnpot_model_config(model_name),
+        "nnpot_package_versions":
+            get_expected_nnpot_model_package_versions(model_name),
+    }
+    if is_emle_model or not model_name.startswith("mace-"):
         scripted_model = torch.jit.script(model)
     else:
         # MACE uses e3nn's scripting adapter; other models do not require e3nn.
@@ -658,8 +1609,691 @@ def _download_nnpot_model_locked(model_name: str) -> str:
         if os.path.exists(temporary_path):
             os.unlink(temporary_path)
     print(f"Saved wrapped model to {modelfile_path}.")
-    
+
     return modelfile_path
+
+
+NNPOT_SNAPSHOT_DIRECTORY = ".nnpot_models"
+NNPOT_SNAPSHOT_SCHEMA_VERSION = 1
+NNPOT_TPR_ATTESTATION_DIRECTORY = ".nnpot_tpr_attestations"
+NNPOT_TPR_ATTESTATION_SCHEMA_VERSION = 1
+_NNPOT_SNAPSHOT_PUBLISH_LOCK = threading.Lock()
+
+
+def _sha256_file(file_path: str) -> str:
+    """Return the lowercase SHA-256 digest of a file without loading it whole."""
+    import hashlib
+
+    digest = hashlib.sha256()
+    with open(file_path, "rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _nnpot_installed_package_versions(model_name: str) -> dict[str, str | None]:
+    """Return deterministic distribution versions relevant to one exported model."""
+    from importlib import metadata as importlib_metadata
+
+    # Import-package and distribution names differ for MACE and EMLE.  Ask the
+    # active environment first, retaining explicit fallbacks for stripped-down
+    # environments where top-level package metadata is unavailable.
+    distribution_fallbacks = {
+        "torch": ("torch",),
+        "torchani": ("torchani",),
+        "emle": ("emle-engine", "emle"),
+        "mace": ("mace-torch", "mace"),
+        "e3nn": ("e3nn",),
+    }
+    try:
+        package_distributions = importlib_metadata.packages_distributions()
+    except Exception:
+        package_distributions = {}
+
+    versions: dict[str, str | None] = {}
+    for import_name in NNPOT_MODEL_PACKAGES[model_name]:
+        candidates = package_distributions.get(import_name)
+        if not candidates:
+            candidates = distribution_fallbacks.get(import_name, (import_name,))
+        found = False
+        for distribution_name in sorted(set(candidates)):
+            try:
+                versions[distribution_name] = importlib_metadata.version(
+                    distribution_name)
+                found = True
+            except importlib_metadata.PackageNotFoundError:
+                continue
+            except Exception:
+                versions[distribution_name] = None
+                found = True
+        if not found:
+            # Availability was checked before export, but preserving an explicit
+            # unknown value is more useful than silently omitting provenance.
+            fallback_name = distribution_fallbacks.get(
+                import_name, (import_name,))[0]
+            versions[fallback_name] = None
+    return dict(sorted(versions.items()))
+
+
+def _gromacs_provenance_versions() -> tuple[str | None, str | None]:
+    """Return the GROMACS and linked-LibTorch versions reported by ``gmx``."""
+    executable = shutil.which("gmx")
+    if executable is None:
+        return None, None
+    try:
+        result = subprocess.run(
+            [executable, "--version"], text=True, capture_output=True,
+            timeout=10, check=False)
+    except (OSError, subprocess.SubprocessError):
+        return None, None
+    if result.returncode != 0:
+        return None, None
+
+    output = (result.stdout or "") + "\n" + (result.stderr or "")
+    gromacs_match = re.search(
+        r"^\s*GROMACS version:\s*(.*?)\s*$", output,
+        flags=re.MULTILINE | re.IGNORECASE)
+    torch_line = re.search(
+        r"^\s*Torch support:\s*enabled(?P<details>.*?)$", output,
+        flags=re.MULTILINE | re.IGNORECASE)
+    torch_version = None
+    if torch_line is not None:
+        version_match = re.search(
+            r"\bversion\s*:?[ \t]*([^\s)]+)",
+            torch_line.group("details"), flags=re.IGNORECASE)
+        if version_match is not None:
+            torch_version = version_match.group(1)
+    return (
+        gromacs_match.group(1).strip() if gromacs_match is not None else None,
+        torch_version,
+    )
+
+
+def _read_nnpot_archive_provenance(
+        model_name: str, model_path: str) -> tuple[str, dict[str, str | None]]:
+    """Read exporter metadata from the exact TorchScript bytes being copied."""
+    import torch
+
+    extra_files = {
+        "nnpot_model_config": "",
+        "nnpot_package_versions": "",
+    }
+    try:
+        torch.jit.load(model_path, map_location="cpu", _extra_files=extra_files)
+        model_config = extra_files["nnpot_model_config"]
+        package_versions_text = extra_files["nnpot_package_versions"]
+        if isinstance(model_config, bytes):
+            model_config = model_config.decode("utf-8")
+        if isinstance(package_versions_text, bytes):
+            package_versions_text = package_versions_text.decode("utf-8")
+        package_versions = json.loads(package_versions_text)
+    except (RuntimeError, UnicodeError, json.JSONDecodeError) as exc:
+        raise RuntimeError(
+            f"NNPot model {model_path!r} has no valid embedded exporter "
+            f"provenance: {exc}"
+        ) from exc
+
+    if model_config != get_expected_nnpot_model_config(model_name):
+        raise RuntimeError(
+            f"NNPot model {model_path!r} has a stale wrapper configuration. "
+            "Rebuild the model before generating the production MDP."
+        )
+    if (not isinstance(package_versions, dict)
+            or not all(isinstance(key, str)
+                       and (value is None or isinstance(value, str))
+                       for key, value in package_versions.items())
+            or not isinstance(package_versions.get("torch"), str)):
+        raise RuntimeError(
+            f"NNPot model {model_path!r} has invalid embedded package versions. "
+            "Rebuild the model before generating the production MDP."
+        )
+    return model_config, dict(sorted(package_versions.items()))
+
+
+def _nnpot_snapshot_metadata(
+        model_name: str, snapshot_file_name: str, model_sha256: str,
+        model_config: str,
+        package_versions: dict[str, str | None]) -> dict[str, Any]:
+    """Build stable, timestamp-free provenance for a job-local model snapshot."""
+    gromacs_version, gromacs_torch_version = _gromacs_provenance_versions()
+    return {
+        "schema_version": NNPOT_SNAPSHOT_SCHEMA_VERSION,
+        "model_name": model_name,
+        "model_file": snapshot_file_name,
+        "model_sha256": model_sha256,
+        "model_config": model_config,
+        "package_versions": package_versions,
+        "python_torch_version": package_versions.get("torch"),
+        "gromacs_version": gromacs_version,
+        "gromacs_torch_version": gromacs_torch_version,
+    }
+
+
+def _validate_existing_nnpot_snapshot(
+        snapshot_path: str, expected_sha256: str) -> None:
+    """Require an existing content-addressed snapshot to match its name."""
+    if os.path.islink(snapshot_path) or not os.path.isfile(snapshot_path):
+        raise RuntimeError(
+            f"NNPot snapshot {snapshot_path!r} is not a regular file. "
+            "Restore it or generate the parameter file in a new job directory."
+        )
+    actual_sha256 = _sha256_file(snapshot_path)
+    if actual_sha256 != expected_sha256:
+        raise RuntimeError(
+            f"NNPot snapshot {snapshot_path!r} was modified: expected SHA-256 "
+            f"{expected_sha256}, found {actual_sha256}. Existing snapshots are "
+            "never overwritten; restore the file or use a new job directory."
+        )
+
+
+def _validate_existing_nnpot_manifest(
+        manifest_path: str, model_name: str, snapshot_file_name: str,
+        expected_sha256: str) -> dict[str, Any]:
+    """Validate identity and provenance fields and return the metadata."""
+    if os.path.islink(manifest_path) or not os.path.isfile(manifest_path):
+        raise RuntimeError(
+            f"NNPot provenance manifest {manifest_path!r} is not a regular file."
+        )
+    try:
+        with open(manifest_path, encoding="utf-8") as handle:
+            metadata = json.load(handle)
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise RuntimeError(
+            f"NNPot provenance manifest {manifest_path!r} is invalid: {exc}"
+        ) from exc
+    expected_identity = {
+        "schema_version": NNPOT_SNAPSHOT_SCHEMA_VERSION,
+        "model_name": model_name,
+        "model_file": snapshot_file_name,
+        "model_sha256": expected_sha256,
+        "model_config": get_expected_nnpot_model_config(model_name),
+    }
+    if (not isinstance(metadata, dict)
+            or any(metadata.get(key) != value
+                   for key, value in expected_identity.items())):
+        raise RuntimeError(
+            f"NNPot provenance manifest {manifest_path!r} does not match "
+            "the content-addressed model snapshot."
+        )
+    package_versions = metadata.get("package_versions")
+    python_torch_version = metadata.get("python_torch_version")
+    manifest_torch_version = (
+        package_versions.get("torch")
+        if isinstance(package_versions, dict) else None)
+    if (not isinstance(package_versions, dict)
+            or not all(isinstance(key, str)
+                       and (value is None or isinstance(value, str))
+                       for key, value in package_versions.items())
+            or not isinstance(manifest_torch_version, str)
+            or not manifest_torch_version.strip()
+            or python_torch_version != manifest_torch_version
+            or not all(metadata.get(key) is None
+                       or isinstance(metadata.get(key), str)
+                       for key in ("gromacs_version",
+                                   "gromacs_torch_version"))):
+        raise RuntimeError(
+            f"NNPot provenance manifest {manifest_path!r} contains invalid "
+            "or inconsistent version metadata."
+        )
+    return metadata
+
+
+def _publish_nnpot_artifact_without_replacement(
+        temporary_path: str, destination_path: str,
+        validate_existing: Callable[[], None]) -> None:
+    """Atomically publish a file, leaving an existing destination untouched."""
+    import errno
+
+    try:
+        os.link(temporary_path, destination_path)
+        return
+    except FileExistsError:
+        validate_existing()
+        return
+    except OSError as exc:
+        unsupported_link_errors = {
+            errno.EACCES, errno.EPERM, errno.EXDEV,
+            getattr(errno, "ENOTSUP", errno.EPERM),
+            getattr(errno, "EOPNOTSUPP", errno.EPERM),
+        }
+        if exc.errno not in unsupported_link_errors:
+            raise
+
+    # Hard links can be unavailable on some mounted filesystems.  Serializing
+    # the existence check keeps the atomic rename fallback from replacing an
+    # artifact created by another WebUI thread.  Cooperating processes normally
+    # take the hard-link path above, whose no-replace behavior is filesystem
+    # atomic.
+    with _NNPOT_SNAPSHOT_PUBLISH_LOCK:
+        if os.path.lexists(destination_path):
+            validate_existing()
+        else:
+            os.rename(temporary_path, destination_path)
+
+
+def _copy_nnpot_snapshot_candidate(
+        shared_model_path: str, candidate_path: str) -> None:
+    """Copy the cache into a distinct, fully flushed regular-file inode."""
+    descriptor = os.open(
+        candidate_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    source_flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    source_descriptor = -1
+    try:
+        source_descriptor = os.open(shared_model_path, source_flags)
+        if not stat.S_ISREG(os.fstat(source_descriptor).st_mode):
+            raise RuntimeError(
+                f"Shared NNPot model {shared_model_path!r} is not a regular file."
+            )
+        with os.fdopen(source_descriptor, "rb") as source, \
+                os.fdopen(descriptor, "wb") as destination:
+            source_descriptor = -1
+            descriptor = -1
+            shutil.copyfileobj(source, destination, length=1024 * 1024)
+            destination.flush()
+            os.fsync(destination.fileno())
+    finally:
+        if source_descriptor >= 0:
+            os.close(source_descriptor)
+        if descriptor >= 0:
+            os.close(descriptor)
+
+
+def snapshot_nnpot_model_for_job(
+        working_directory_path: str, model_name: str,
+        shared_model_path: str) -> str:
+    """Create an immutable job-local model snapshot and return its MDP path.
+
+    The shared cache remains untouched.  Snapshot and manifest filenames are
+    content-addressed, so rebuilding the cache adds a new job artifact instead
+    of changing any model referenced by an existing TPR.
+    """
+    if model_name not in NNPOT_MODEL_PACKAGES:
+        raise ValueError(
+            f"Unsupported NNPot model {model_name!r}. Choose one of: "
+            + ", ".join(SUPPORTED_NNPOT_MODELS))
+    working_directory_path = validate_working_directory(working_directory_path)
+    shared_model_path = os.path.abspath(shared_model_path)
+    if os.path.islink(shared_model_path) or not os.path.isfile(shared_model_path):
+        raise RuntimeError(
+            f"Shared NNPot model {shared_model_path!r} is not a regular file."
+        )
+
+    snapshot_directory = os.path.join(
+        working_directory_path, NNPOT_SNAPSHOT_DIRECTORY)
+    try:
+        os.mkdir(snapshot_directory, mode=0o700)
+    except FileExistsError:
+        pass
+    if (os.path.islink(snapshot_directory)
+            or not os.path.isdir(snapshot_directory)
+            or os.path.dirname(os.path.realpath(snapshot_directory))
+            != working_directory_path):
+        raise RuntimeError(
+            f"{NNPOT_SNAPSHOT_DIRECTORY} must be a real directory inside the job."
+        )
+
+    candidate_path = os.path.join(
+        snapshot_directory,
+        f".{model_name}.{uuid.uuid4().hex}.pt.tmp")
+    _copy_nnpot_snapshot_candidate(shared_model_path, candidate_path)
+    try:
+        model_config, package_versions = _read_nnpot_archive_provenance(
+            model_name, candidate_path)
+        model_sha256 = _sha256_file(candidate_path)
+        os.chmod(candidate_path, 0o400)
+        snapshot_file_name = f"{model_name}-{model_sha256}.pt"
+        snapshot_path = os.path.join(snapshot_directory, snapshot_file_name)
+        _publish_nnpot_artifact_without_replacement(
+            candidate_path, snapshot_path,
+            lambda: _validate_existing_nnpot_snapshot(
+                snapshot_path, model_sha256))
+
+        metadata = _nnpot_snapshot_metadata(
+            model_name, snapshot_file_name, model_sha256,
+            model_config, package_versions)
+        metadata_text = json.dumps(
+            metadata, indent=2, sort_keys=True, ensure_ascii=True) + "\n"
+        manifest_path = os.path.splitext(snapshot_path)[0] + ".json"
+        manifest_temporary_path = os.path.join(
+            snapshot_directory,
+            f".{model_name}.{uuid.uuid4().hex}.json.tmp")
+        descriptor = os.open(
+            manifest_temporary_path,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        try:
+            with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+                descriptor = -1
+                handle.write(metadata_text)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.chmod(manifest_temporary_path, 0o400)
+            _publish_nnpot_artifact_without_replacement(
+                manifest_temporary_path, manifest_path,
+                lambda: _validate_existing_nnpot_manifest(
+                    manifest_path, model_name, snapshot_file_name,
+                    model_sha256))
+        finally:
+            if descriptor >= 0:
+                os.close(descriptor)
+            try:
+                os.unlink(manifest_temporary_path)
+            except FileNotFoundError:
+                pass
+    finally:
+        try:
+            os.unlink(candidate_path)
+        except FileNotFoundError:
+            pass
+
+    return f"{NNPOT_SNAPSHOT_DIRECTORY}/{snapshot_file_name}"
+
+
+def _parse_nnpot_snapshot_file_name(file_name: str) -> tuple[str, str]:
+    """Return model name and digest encoded by a managed snapshot filename."""
+    for model_name in sorted(SUPPORTED_NNPOT_MODELS, key=len, reverse=True):
+        prefix = f"{model_name}-"
+        if not file_name.startswith(prefix) or not file_name.endswith(".pt"):
+            continue
+        model_sha256 = file_name[len(prefix):-3]
+        if re.fullmatch(r"[0-9a-f]{64}", model_sha256):
+            return model_name, model_sha256
+    raise RuntimeError(
+        f"NNPot snapshot filename {file_name!r} is not content-addressed with "
+        "a supported model name and full SHA-256 digest."
+    )
+
+
+def verify_nnpot_model_snapshot(
+        working_directory_path: str, relative_model_path: str) -> str:
+    """Verify a managed job-local model and return its absolute path."""
+    working_directory_path = validate_working_directory(working_directory_path)
+    if (not isinstance(relative_model_path, str)
+            or os.path.isabs(relative_model_path)):
+        raise RuntimeError("A managed NNPot snapshot path must be job-relative.")
+    normalized_path = os.path.normpath(relative_model_path.replace("\\", "/"))
+    path_parts = normalized_path.split("/")
+    if (len(path_parts) != 2
+            or path_parts[0] != NNPOT_SNAPSHOT_DIRECTORY):
+        raise RuntimeError(
+            "A managed NNPot snapshot must be directly inside "
+            f"{NNPOT_SNAPSHOT_DIRECTORY}/."
+        )
+
+    snapshot_file_name = path_parts[1]
+    model_name, expected_sha256 = _parse_nnpot_snapshot_file_name(
+        snapshot_file_name)
+    snapshot_path = os.path.join(
+        working_directory_path, NNPOT_SNAPSHOT_DIRECTORY,
+        snapshot_file_name)
+    snapshot_directory = os.path.dirname(snapshot_path)
+    if (os.path.islink(snapshot_directory)
+            or os.path.realpath(snapshot_directory)
+            != os.path.join(working_directory_path, NNPOT_SNAPSHOT_DIRECTORY)):
+        raise RuntimeError("The managed NNPot snapshot directory is unsafe.")
+    _validate_existing_nnpot_snapshot(snapshot_path, expected_sha256)
+
+    manifest_path = os.path.splitext(snapshot_path)[0] + ".json"
+    if not os.path.lexists(manifest_path):
+        raise RuntimeError(
+            f"NNPot provenance manifest {manifest_path!r} is missing. "
+            "Regenerate the production MDP and TPR."
+        )
+    _validate_existing_nnpot_manifest(
+        manifest_path, model_name, snapshot_file_name, expected_sha256)
+    return snapshot_path
+
+
+def _managed_nnpot_snapshot_reference(
+        working_directory_path: str,
+        model_file: str | None) -> str | None:
+    """Normalize a relative or canonicalized job-snapshot reference."""
+    if not model_file:
+        return None
+    if os.path.isabs(model_file):
+        expected_directory = os.path.join(
+            working_directory_path, NNPOT_SNAPSHOT_DIRECTORY)
+        if os.path.dirname(os.path.normpath(model_file)) != expected_directory:
+            return None
+        return f"{NNPOT_SNAPSHOT_DIRECTORY}/{os.path.basename(model_file)}"
+
+    portable_path = model_file.replace("\\", "/")
+    normalized_path = os.path.normpath(portable_path).replace("\\", "/")
+    if (portable_path.startswith(f"{NNPOT_SNAPSHOT_DIRECTORY}/")
+            or portable_path.startswith(f"./{NNPOT_SNAPSHOT_DIRECTORY}/")
+            or normalized_path.startswith(f"{NNPOT_SNAPSHOT_DIRECTORY}/")):
+        return normalized_path
+    return None
+
+
+def _is_managed_nnpot_snapshot_reference(model_file: str | None) -> bool:
+    """Whether a model string claims a relative managed snapshot path."""
+    if not model_file or os.path.isabs(model_file):
+        return False
+    portable_path = model_file.replace("\\", "/")
+    normalized_path = os.path.normpath(portable_path).replace("\\", "/")
+    return (portable_path.startswith(f"{NNPOT_SNAPSHOT_DIRECTORY}/")
+            or portable_path.startswith(f"./{NNPOT_SNAPSHOT_DIRECTORY}/")
+            or normalized_path.startswith(f"{NNPOT_SNAPSHOT_DIRECTORY}/"))
+
+
+def require_nnpot_model_snapshot_for_bundled_model(
+        working_directory_path: str,
+        model_file: str | None) -> str | None:
+    """Verify bundled model provenance, while leaving custom models alone.
+
+    Legacy WebUI MDPs point directly at the mutable shared model cache. A TPR
+    generated from one of those paths could silently change behavior after a
+    package upgrade rebuilt the cache. Every recognized bundled model must
+    therefore use the content-addressed snapshot created with its job. Unknown
+    custom TorchScript paths remain an explicit expert workflow.
+    """
+    working_directory_path = validate_working_directory(working_directory_path)
+    managed_reference = _managed_nnpot_snapshot_reference(
+        working_directory_path, model_file)
+    model_name = _nnpot_model_name_from_path(model_file)
+    if managed_reference is None:
+        if model_name is not None:
+            raise RuntimeError(
+                f"Bundled NNPot model '{model_name}' is referenced through a "
+                "mutable legacy cache path. Regenerate the production MDP and "
+                "TPR with the current WebUI so the job uses a hashed, read-only "
+                "model snapshot."
+            )
+        return None
+    verify_nnpot_model_snapshot(
+        working_directory_path, managed_reference)
+    return managed_reference
+
+
+def get_nnpot_model_exporter_torch_version(
+        working_directory_path: str,
+        model_file: str | None) -> str | None:
+    """Return snapshot exporter PyTorch provenance when it is authoritative."""
+    managed_reference = require_nnpot_model_snapshot_for_bundled_model(
+        working_directory_path, model_file)
+    if managed_reference is None:
+        return None
+    snapshot_path = verify_nnpot_model_snapshot(
+        working_directory_path, managed_reference)
+    model_name, expected_sha256 = _parse_nnpot_snapshot_file_name(
+        os.path.basename(snapshot_path))
+    manifest_path = os.path.splitext(snapshot_path)[0] + ".json"
+    metadata = _validate_existing_nnpot_manifest(
+        manifest_path, model_name, os.path.basename(snapshot_path),
+        expected_sha256)
+    exporter_version = metadata.get("python_torch_version")
+    return exporter_version if isinstance(exporter_version, str) else None
+
+
+def _nnpot_tpr_attestation_directory(
+        working_directory_path: str, *, create: bool) -> str:
+    """Return a real job-local directory for charge attestations."""
+    directory = os.path.join(
+        working_directory_path, NNPOT_TPR_ATTESTATION_DIRECTORY)
+    if create:
+        try:
+            os.mkdir(directory, mode=0o700)
+        except FileExistsError:
+            pass
+    if (os.path.islink(directory)
+            or not os.path.isdir(directory)
+            or os.path.realpath(directory) != directory):
+        raise RuntimeError(
+            f"{NNPOT_TPR_ATTESTATION_DIRECTORY} must be a real directory "
+            "inside the job."
+        )
+    return directory
+
+
+def _validate_nnpot_tpr_charge_attestation(
+        manifest_path: str, tpr_sha256: str,
+        input_group: str) -> dict[str, Any]:
+    """Validate a TPR-bound record of the original NNP group's charge."""
+    if os.path.islink(manifest_path) or not os.path.isfile(manifest_path):
+        raise RuntimeError(
+            f"NNPot charge attestation {manifest_path!r} is not a regular file."
+        )
+    try:
+        with open(manifest_path, encoding="utf-8") as handle:
+            metadata = json.load(handle)
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise RuntimeError(
+            f"NNPot charge attestation {manifest_path!r} is invalid: {exc}"
+        ) from exc
+
+    if (not isinstance(metadata, dict)
+            or metadata.get("schema_version")
+            != NNPOT_TPR_ATTESTATION_SCHEMA_VERSION
+            or metadata.get("tpr_sha256") != tpr_sha256
+            or not isinstance(metadata.get("input_group"), str)
+            or not metadata.get("input_group", "").strip()
+            or not isinstance(input_group, str)
+            or metadata.get("input_group", "").strip() != input_group.strip()
+            or metadata.get("neutrality_tolerance_e")
+            != NNPOT_CHARGE_TOLERANCE_E):
+        raise RuntimeError(
+            f"NNPot charge attestation {manifest_path!r} does not match the "
+            "selected production TPR. Regenerate the production TPR."
+        )
+
+    charge = metadata.get("original_group_charge_e")
+    if (isinstance(charge, bool)
+            or not isinstance(charge, (int, float))
+            or not math.isfinite(float(charge))
+            or abs(float(charge)) > NNPOT_CHARGE_TOLERANCE_E):
+        raise RuntimeError(
+            f"NNPot charge attestation {manifest_path!r} does not prove that "
+            "the original topology group was neutral. Regenerate the production "
+            "TPR from a neutral NNP input group."
+        )
+    return metadata
+
+
+def record_nnpot_tpr_charge_attestation(
+        working_directory_path: str, run_input_file_name: str,
+        parameter_file_path: str, original_group_charge: float) -> str:
+    """Bind a successful neutral-group preflight to the generated NNP TPR.
+
+    Electrostatic embedding removes the NNP atoms' original classical charges
+    from the final TPR.  A hash-bound sidecar is therefore required so a later
+    launch cannot mistake stock GROMACS' hard-coded ``nnp-charge = 0`` for proof
+    that the source topology group was neutral.
+    """
+    working_directory_path = validate_working_directory(working_directory_path)
+    tpr_path = validate_local_file_path(
+        working_directory_path, run_input_file_name,
+        "production run input file")
+    if os.path.splitext(tpr_path)[1].lower() != ".tpr" \
+            or not os.path.isfile(tpr_path):
+        raise RuntimeError(
+            "The generated production TPR is missing; its NNPot charge "
+            "preflight cannot be recorded."
+        )
+
+    charge = float(original_group_charge)
+    if (not math.isfinite(charge)
+            or abs(charge) > NNPOT_CHARGE_TOLERANCE_E):
+        raise RuntimeError(
+            "A neutral original NNP input group is required before recording "
+            "the production TPR."
+        )
+    input_group = read_mdp_option(parameter_file_path, "nnpot-input-group")
+    if not input_group:
+        raise RuntimeError(
+            "The NNPot parameter file has no input group to record."
+        )
+
+    tpr_sha256 = _sha256_file(tpr_path)
+    metadata = {
+        "schema_version": NNPOT_TPR_ATTESTATION_SCHEMA_VERSION,
+        "tpr_sha256": tpr_sha256,
+        "input_group": input_group,
+        "original_group_charge_e": charge,
+        "neutrality_tolerance_e": NNPOT_CHARGE_TOLERANCE_E,
+    }
+    directory = _nnpot_tpr_attestation_directory(
+        working_directory_path, create=True)
+    manifest_path = os.path.join(directory, f"{tpr_sha256}.json")
+    descriptor, temporary_path = tempfile.mkstemp(
+        prefix=".charge.", suffix=".json.tmp", dir=directory)
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+            descriptor = -1
+            json.dump(metadata, handle, indent=2, sort_keys=True,
+                      ensure_ascii=True)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.chmod(temporary_path, 0o400)
+        _publish_nnpot_artifact_without_replacement(
+            temporary_path, manifest_path,
+            lambda: _validate_nnpot_tpr_charge_attestation(
+                manifest_path, tpr_sha256, input_group))
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+        try:
+            os.unlink(temporary_path)
+        except FileNotFoundError:
+            pass
+    return manifest_path
+
+
+def verify_nnpot_tpr_charge_attestation(
+        working_directory_path: str,
+        run_input_file_name: str | None,
+        input_group: str) -> float:
+    """Require neutral-charge provenance for an NNP-active production TPR."""
+    working_directory_path = validate_working_directory(working_directory_path)
+    if not input_group:
+        raise RuntimeError(
+            "The selected NNPot TPR has no input group. Regenerate it with the "
+            "current WebUI."
+        )
+    tpr_path = validate_local_file_path(
+        working_directory_path, run_input_file_name,
+        "production run input file")
+    tpr_sha256 = _sha256_file(tpr_path)
+    try:
+        directory = _nnpot_tpr_attestation_directory(
+            working_directory_path, create=False)
+    except RuntimeError as exc:
+        raise RuntimeError(
+            "The selected NNPot TPR has no trusted record of the original "
+            "topology group's charge. Regenerate the production TPR with the "
+            "current WebUI before launching it."
+        ) from exc
+    manifest_path = os.path.join(directory, f"{tpr_sha256}.json")
+    if not os.path.lexists(manifest_path):
+        raise RuntimeError(
+            "The selected NNPot TPR has no trusted record of the original "
+            "topology group's charge. Stock GROMACS stores nnp-charge = 0 even "
+            "for charged source groups, so regenerate the production TPR with "
+            "the current WebUI before launching it."
+        )
+    metadata = _validate_nnpot_tpr_charge_attestation(
+        manifest_path, tpr_sha256, input_group)
+    return float(metadata["original_group_charge_e"])
 
 MAX_CAPTURED_COMMAND_OUTPUT_BYTES = 2 * 1024 * 1024
 _COMMAND_OUTPUT_TRUNCATION_MARKER = (
@@ -729,7 +2363,8 @@ def _read_bounded_command_output(handle: Any) -> str:
 
 
 def run_managed_command(cmd: Sequence[str], cwd: str | None = None,
-                        stdin_input: str | None = None) -> subprocess.CompletedProcess[str]:
+                        stdin_input: str | None = None,
+                        env: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
     """Run a registered child with bounded output, regardless of its exit code."""
     execution_directory = os.path.realpath(cwd or os.getcwd())
     job_key = get_process_job_key(
@@ -747,6 +2382,7 @@ def run_managed_command(cmd: Sequence[str], cwd: str | None = None,
             list(cmd), cwd=cwd, stdin=subprocess.PIPE,
             stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             text=True, encoding="utf-8", errors="replace",
+            env=env,
             start_new_session=(os.name == "posix"))
         if os.name == "posix":
             # start_new_session makes this invariant true even if the
@@ -831,13 +2467,15 @@ def run_managed_command(cmd: Sequence[str], cwd: str | None = None,
 
 def run_checked_command(cmd: Sequence[str], cwd: str | None = None,
                         stdin_input: str | None = None,
-                        error_lines: int = 25) -> subprocess.CompletedProcess[str]:
+                        error_lines: int = 25,
+                        env: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
     """Run a command to completion, raising an Exception that carries its stderr.
 
     GROMACS writes its diagnostics ("Fatal error", missing atoms, mismatched
     coordinate counts) to stderr. Without capturing it, a failure surfaces in the
     UI as nothing more than 'returned non-zero exit status 1'."""
-    process = run_managed_command(cmd, cwd=cwd, stdin_input=stdin_input)
+    process = run_managed_command(
+        cmd, cwd=cwd, stdin_input=stdin_input, env=env)
     if process.returncode != 0:
         stderr_output = process.stderr or ""
         output = stderr_output + "\n" + (process.stdout or "")
@@ -2782,6 +4420,36 @@ def _single_line_configuration_value(value: Any, label: str) -> str:
     return text
 
 
+def read_mdp_option(file_path: str, option_name: str) -> str | None:
+    """Return the last uncommented value assigned to an MDP option."""
+    normalized_name = option_name.strip().lower().replace("_", "-")
+    value: str | None = None
+    with open(file_path, encoding="utf-8", errors="replace") as handle:
+        for raw_line in handle:
+            content = raw_line.split(";", 1)[0]
+            key, separator, candidate = content.partition("=")
+            if not separator:
+                continue
+            if key.strip().lower().replace("_", "-") == normalized_name:
+                value = candidate.strip()
+    return value
+
+
+def mdp_uses_nnpot(file_path: str) -> bool:
+    """Whether an MDP explicitly enables GROMACS' NNPot module."""
+    value = read_mdp_option(file_path, "nnpot-active")
+    if value is None:
+        return False
+    normalized = value.lower()
+    if normalized in {"yes", "true", "on", "1"}:
+        return True
+    if normalized in {"no", "false", "off", "0"}:
+        return False
+    raise ValueError(
+        f"Invalid nnpot-active value {value!r} in '{os.path.basename(file_path)}'."
+    )
+
+
 def get_dynamics_constraint_type(force_field: str | None) -> str:
     """Return the bond-constraint policy required at the workflow's 2 fs step."""
     return "all-bonds" if get_force_field_family(force_field) == "GROMOS" else "h-bonds"
@@ -2881,12 +4549,12 @@ def get_nnpot_model_input_mdp_section(model_name: str) -> str:
             f"Unsupported NNPot model {model_name!r}. Choose one of: "
             + ", ".join(SUPPORTED_NNPOT_MODELS)
         )
-
     if model_name.startswith("mace-"):
-        # All MACE-OFF small/medium/large foundation models have r_max=5 Å.
-        # Let GROMACS build the neighbour list: its pair shifts correctly cover
-        # triclinic boxes, partial PBC and periodic images without an O(N^2)
-        # all-pairs allocation in the TorchScript wrapper.
+        # The bundled MACE-OFF models use cutoffs no larger than 5 Å (the
+        # small model uses 4.5 Å). Use one conservative 0.5 nm pair list for
+        # every size. GROMACS' pair shifts correctly cover triclinic boxes,
+        # partial PBC and periodic images without an O(N^2) all-pairs allocation
+        # in the TorchScript wrapper.
         return f"""nnpot-model-input1    = atom-positions
 nnpot-model-input2    = atom-numbers
 nnpot-model-input3    = nnp-charge
@@ -2894,7 +4562,7 @@ nnpot-model-input4    = atom-pairs
 nnpot-model-input5    = pair-shifts
 nnpot-model-input6    = box
 nnpot-model-input7    = pbc
-pair-cutoff            = {MACE_OFF_PAIR_CUTOFF_NM}"""
+nnpot-pair-cutoff      = {MACE_OFF_PAIR_CUTOFF_NM}"""
 
     if model_name == "ani2x-emle":
         # EMLE is an electrostatic embedding model, not merely an ANI alias.  It
@@ -2906,15 +4574,6 @@ nnpot-model-input3    = atom-positions-mm
 nnpot-model-input4    = atom-charges-mm
 nnpot-model-input5    = nnp-charge
 nnpot-model-input6    = box"""
-
-    if model_name == "aimnet2":
-        # Charge comes from the selected topology group rather than a baked-in
-        # neutral default in the cached model.
-        return """nnpot-model-input1    = atom-positions
-nnpot-model-input2    = atom-numbers
-nnpot-model-input3    = nnp-charge
-nnpot-model-input4    = box
-nnpot-model-input5    = pbc"""
 
     return """nnpot-model-input1    = atom-positions
 nnpot-model-input2    = atom-numbers
@@ -2933,9 +4592,22 @@ def get_default_prod_md_mdp_file_content(time_scale_ps: float = 1000, time_step_
                                          force_field: str | None = None) -> str:
     """MDP for unrestrained production MD, optionally driven by a neural potential."""
     _, time_step_ps, nsteps = _simulation_step_count(time_scale_ps, time_step_ps)
+    if (nnpot_active
+            and time_step_ps > MAX_NNPOT_TIME_STEP_PS + 1.0e-12):
+        raise ValueError(
+            "NNPot production uses unconstrained learned-region bonds and "
+            f"therefore requires a time step no larger than "
+            f"{MAX_NNPOT_TIME_STEP_PS:g} ps (1 fs)."
+        )
     temperature = _positive_finite_number(temperature, "Temperature")
     pressure = _positive_finite_number(pressure, "Pressure")
-    constraint_type = get_dynamics_constraint_type(force_field)
+    # GROMACS removes the classical bonded potentials inside the learned
+    # subsystem. Retaining force-field-derived H-bond constraints there changes
+    # the model's Hamiltonian and grompp explicitly warns that this can create
+    # artifacts. Keep NNP-region bonds unconstrained and compensate with the
+    # conservative 1 fs limit above.
+    constraint_type = (
+        "none" if nnpot_active else get_dynamics_constraint_type(force_field))
     content = f"""
 integrator      = md
 dt              = {time_step_ps}
@@ -4557,6 +6229,249 @@ def _read_ligand_itp_atoms(
     return atoms
 
 
+_GROMACS_PARTICLE_TYPES = {"A", "S", "V", "D"}
+_ATOMIC_MASS_ELEMENT_TOLERANCE = 0.25
+
+
+def _atomic_number_from_topology_mass(
+        mass: float, atom_type: str, display_name: str) -> int:
+    """Infer an element from an ACPYPE per-atom mass without guessing loosely.
+
+    ACPYPE writes the real mass in ``[ atoms ]`` but historically omitted the
+    optional atomic-number column from its custom ``[ atomtypes ]`` entries.
+    GROMACS consequently stores ``atomnumber=-1`` in the TPR, which is fatal for
+    every NNPot model because ``atom-numbers`` is one of their inputs.
+
+    ParmEd is already a required application dependency and supplies the same
+    periodic-table data used by its topology converters.  Keep a tight mass
+    tolerance so hydrogen-mass repartitioning, virtual sites, or an unusual
+    isotope is rejected for manual review instead of being assigned the wrong
+    element silently.
+    """
+    if not math.isfinite(mass) or mass <= 0:
+        raise ValueError(
+            f"Ligand topology '{display_name}' has invalid mass {mass!r} for "
+            f"atom type '{atom_type}', so its atomic number cannot be inferred."
+        )
+
+    from parmed.periodic_table import AtomicNum, Mass, element_by_mass
+
+    element = element_by_mass(mass)
+    reference_mass = Mass.get(element)
+    atomic_number = AtomicNum.get(element)
+    if (reference_mass is None or atomic_number is None
+            or abs(float(reference_mass) - mass) > _ATOMIC_MASS_ELEMENT_TOLERANCE):
+        raise ValueError(
+            f"Ligand topology '{display_name}' uses mass {mass:g} for atom type "
+            f"'{atom_type}', which cannot be mapped safely to an element. Add an "
+            "explicit atomic number to that [ atomtypes ] entry."
+        )
+    return int(atomic_number)
+
+
+def _integer_token(value: str) -> int | None:
+    """Return an integer token, rejecting floating-point lookalikes."""
+    try:
+        return int(value)
+    except ValueError:
+        return None
+
+
+def ensure_ligand_atomtypes_have_atomic_numbers(
+        ligand_topology_file_path: str) -> int:
+    """Add missing atomic numbers to custom ligand ``[ atomtypes ]`` entries.
+
+    GROMACS accepts several atom-type layouts.  ACPYPE's common layout is
+    ``name bond_type mass charge ptype sigma epsilon``; the repaired form is
+    ``name bond_type atomic_number mass charge ptype sigma epsilon``.  Existing
+    explicit atomic numbers are checked against the atoms that use the type,
+    and the write is atomic and idempotent.
+
+    Returns the number of repaired atom-type entries.  Topologies without a
+    local ``[ atomtypes ]`` section are left alone because their element data
+    belongs to an included force field rather than this ligand file.
+    """
+    display_name = os.path.basename(ligand_topology_file_path)
+    with open(ligand_topology_file_path, encoding="utf-8", errors="replace") as handle:
+        lines = handle.readlines()
+
+    atom_masses: dict[str, list[float]] = {}
+    section: str | None = None
+    has_atomtypes = False
+    for line in lines:
+        section_name = _gromacs_section_name(line)
+        if section_name is not None:
+            section = section_name
+            has_atomtypes = has_atomtypes or section == "atomtypes"
+            continue
+        if section != "atoms":
+            continue
+        content = line.split(";", 1)[0].strip()
+        if not content or content.startswith("#"):
+            continue
+        tokens = content.split()
+        if len(tokens) < 8:
+            raise ValueError(
+                f"Ligand topology '{display_name}' has an [ atoms ] entry "
+                f"without a per-atom mass: '{content}'. Atomic numbers cannot "
+                "be added safely."
+            )
+        try:
+            mass = float(tokens[7])
+        except ValueError as exc:
+            raise ValueError(
+                f"Ligand topology '{display_name}' has invalid mass "
+                f"'{tokens[7]}' for atom type '{tokens[1]}'."
+            ) from exc
+        atom_masses.setdefault(tokens[1], []).append(mass)
+
+    if not has_atomtypes:
+        return 0
+
+    inferred_numbers: dict[str, int] = {}
+    for atom_type, masses in atom_masses.items():
+        numbers = {
+            _atomic_number_from_topology_mass(mass, atom_type, display_name)
+            for mass in masses
+        }
+        if len(numbers) != 1:
+            raise ValueError(
+                f"Ligand topology '{display_name}' uses atom type '{atom_type}' "
+                "for atoms with different elements. Split them into distinct "
+                "atom types before using NNPot."
+            )
+        inferred_numbers[atom_type] = numbers.pop()
+
+    repaired = 0
+    declared_types: set[str] = set()
+    updated_lines = list(lines)
+    section = None
+    for line_index, line in enumerate(lines):
+        section_name = _gromacs_section_name(line)
+        if section_name is not None:
+            section = section_name
+            continue
+        if section != "atomtypes":
+            continue
+
+        raw_content, separator, comment = line.partition(";")
+        content = raw_content.strip()
+        if not content or content.startswith("#"):
+            continue
+        tokens = content.split()
+        atom_type = tokens[0]
+        declared_types.add(atom_type)
+        expected_number = inferred_numbers.get(atom_type)
+        # An unused local atom type cannot affect the current ligand molecule,
+        # and has no per-atom mass from which a defensible element can be found.
+        if expected_number is None:
+            continue
+
+        # ``ptype`` is always followed by sigma and epsilon.  Do not scan the
+        # complete row for A/S/V/D: valid GAFF atom and bond types include
+        # lower-case ``s``, which would otherwise be mistaken for ptype S.
+        particle_index = len(tokens) - 3
+        if (particle_index < 3
+                or tokens[particle_index].upper()
+                not in _GROMACS_PARTICLE_TYPES):
+            raise ValueError(
+                f"Ligand topology '{display_name}' has an unrecognized "
+                f"[ atomtypes ] entry for '{atom_type}': '{content}'."
+            )
+
+        atomic_number_index: int | None = None
+        insertion_index: int | None = None
+        if particle_index == 3:
+            # name mass charge ptype ...
+            insertion_index = 1
+        elif particle_index == 4:
+            if _integer_token(tokens[1]) is not None:
+                # name atomic_number mass charge ptype ...
+                atomic_number_index = 1
+            else:
+                # name bond_type mass charge ptype ... (ACPYPE)
+                insertion_index = 2
+        elif particle_index == 5:
+            # name bond_type atomic_number mass charge ptype ...
+            atomic_number_index = 2
+        else:
+            raise ValueError(
+                f"Ligand topology '{display_name}' has an unsupported "
+                f"[ atomtypes ] layout for '{atom_type}': '{content}'. Add its "
+                "atomic number explicitly before using NNPot."
+            )
+
+        token_matches = list(re.finditer(r"\S+", raw_content))
+        if atomic_number_index is not None:
+            existing_number = _integer_token(tokens[atomic_number_index])
+            if existing_number is None or existing_number <= 0:
+                match = token_matches[atomic_number_index]
+                raw_content = (
+                    raw_content[:match.start()] + str(expected_number)
+                    + raw_content[match.end():]
+                )
+                repaired += 1
+            elif existing_number != expected_number:
+                raise ValueError(
+                    f"Ligand topology '{display_name}' assigns atomic number "
+                    f"{existing_number} to atom type '{atom_type}', but its "
+                    f"per-atom mass identifies atomic number {expected_number}."
+                )
+        else:
+            assert insertion_index is not None
+            match = token_matches[insertion_index]
+            raw_content = (
+                raw_content[:match.start()] + f"{expected_number}  "
+                + raw_content[match.start():]
+            )
+            repaired += 1
+
+        updated_lines[line_index] = raw_content + (separator + comment if separator else "")
+
+    missing_definitions = sorted(set(inferred_numbers) - declared_types)
+    if missing_definitions:
+        raise ValueError(
+            f"Ligand topology '{display_name}' uses atom type(s) without local "
+            f"[ atomtypes ] definitions: {', '.join(missing_definitions)}."
+        )
+
+    if repaired:
+        atomic_write_text_file(ligand_topology_file_path, "".join(updated_lines))
+    return repaired
+
+
+def repair_ligand_atomic_numbers_best_effort(
+        ligand_topology_file_path: str) -> int:
+    """Repair ordinary ACPYPE output without blocking a classical workflow.
+
+    Unusual but valid classical topologies can contain virtual sites, isotope
+    masses or HMR masses that cannot be mapped safely to an element.  Leave
+    such files untouched and let the NNPot-specific TPR preflight fail closed
+    only if the user later selects a ligand-containing MLIP group.
+    """
+    try:
+        return ensure_ligand_atomtypes_have_atomic_numbers(
+            ligand_topology_file_path)
+    except ValueError as exc:
+        print(
+            "WARNING: ligand atomic numbers could not be added automatically; "
+            "classical MD remains available, but a ligand-containing NNPot "
+            f"group will be rejected: {exc}"
+        )
+        return 0
+
+
+def ligand_itp_uses_acpype_gaff(ligand_topology_file_path: str) -> bool:
+    """Recognise ACPYPE/GAFF provenance without classifying custom ligand ITPs."""
+    with open(
+            ligand_topology_file_path, encoding="utf-8",
+            errors="replace") as handle:
+        header = handle.read(16384)
+    return re.search(
+        r"\b(?:ACPYPE|GAFF2?|General\s+Amber\s+Force\s+Field)\b",
+        header, flags=re.IGNORECASE) is not None
+
+
 def _acpype_pair_stem(file_path: str, extension: str) -> str | None:
     """Return the stem from an ACPYPE ``<stem>_GMX.<ext>`` output name."""
     file_name = os.path.basename(file_path)
@@ -4770,7 +6685,8 @@ def _is_ewald_net_charge_warning(warning_block: str) -> bool:
 
 def run_grompp_with_gromos_warning_policy(
         cmd: Sequence[str], cwd: str, topology_file_path: str,
-        max_warnings: int, runner: Any = None) -> str | None:
+        max_warnings: int, runner: Any = None,
+        environment: dict[str, str] | None = None) -> str | None:
     """Run grompp, narrowly allowing its unavoidable modern GROMOS warning.
 
     Current GROMACS releases emit one warning for bundled GROMOS force fields
@@ -4790,8 +6706,11 @@ def run_grompp_with_gromos_warning_policy(
         max_warnings == 0
         and get_topology_force_field_family(topology_file_path) == "GROMOS"
     )
+    runner_kwargs: dict[str, Any] = {"cwd": cwd}
+    if environment is not None:
+        runner_kwargs["env"] = environment
     if not automatic_allowance:
-        runner(effective_cmd, cwd=cwd)
+        runner(effective_cmd, **runner_kwargs)
         return None
 
     try:
@@ -4826,7 +6745,7 @@ def run_grompp_with_gromos_warning_policy(
                 stage, os.path.basename(final_processed_path))
             effective_cmd[processed_index] = staged_processed_path
 
-        process = runner(effective_cmd, cwd=cwd)
+        process = runner(effective_cmd, **runner_kwargs)
         stderr = getattr(process, "stderr", "")
         stdout = getattr(process, "stdout", "")
         output = ((stderr if isinstance(stderr, str) else "") + "\n"
@@ -4925,6 +6844,73 @@ def _read_mdp_settings(mdp_file_path: str) -> dict[str, str]:
     return settings
 
 
+def get_mdp_electrostatics_warning(
+        mdp_file_path: str, topology_file_path: str) -> str | None:
+    """Warn when an AMBER job uses finite-range cut-off electrostatics.
+
+    GROMACS defaults an omitted ``coulombtype`` to ``Cut-off``.  AMBER users
+    may also select that mode explicitly, but the generated WebUI defaults use
+    PME.  Return a non-blocking warning for either effective cut-off case while
+    leaving PME and non-AMBER policies to the compatibility validator.
+    """
+    force_field = get_topology_force_field_name(topology_file_path)
+    if force_field is None or get_force_field_family(force_field) != "AMBER":
+        return None
+
+    settings = _read_mdp_settings(mdp_file_path)
+    raw_coulomb = settings.get("coulombtype")
+    coulomb_tokens = (raw_coulomb or "").split()
+    coulomb = coulomb_tokens[0] if coulomb_tokens else (
+        "cut-off" if raw_coulomb is None else "<empty>")
+    normalized_coulomb = coulomb.lower().replace("_", "-")
+    if normalized_coulomb not in {"cut-off", "cutoff"}:
+        return None
+
+    if raw_coulomb is None:
+        return (
+            "coulombtype=Cut-off is the effective GROMACS default because this "
+            "AMBER MDP omits coulombtype. This cut-off mode is allowed, but it "
+            "neglects electrostatic interactions beyond rcoulomb; set "
+            "coulombtype=PME to restore the WebUI-generated default."
+        )
+    return (
+        "coulombtype=Cut-off selects finite-range electrostatics for AMBER. "
+        "This is allowed by explicit user choice, but it neglects electrostatic "
+        "interactions beyond rcoulomb; use PME unless the cut-off model is "
+        "intentional."
+    )
+
+
+def get_mdp_dispersion_correction_warning(
+        mdp_file_path: str, topology_file_path: str) -> str | None:
+    """Warn when an AMBER/OPLS job intentionally disables its LJ tail correction.
+
+    ``DispCorr = no`` is a valid GROMACS expert choice, including for energy
+    minimisation, so it must not be treated like a malformed or incompatible
+    MDP.  It does change the reported energy and virial, however, and can affect
+    pressure and density during dynamics.  Return text for the UI/terminal while
+    leaving the user's setting intact.
+    """
+    force_field = get_topology_force_field_name(topology_file_path)
+    if force_field is None or get_force_field_family(force_field) not in {
+            "AMBER", "OPLS"}:
+        return None
+
+    settings = _read_mdp_settings(mdp_file_path)
+    tokens = settings.get("dispcorr", "no").split()
+    dispersion = tokens[0].lower() if tokens else "<empty>"
+    if dispersion != "no":
+        return None
+    return (
+        f"DispCorr=no disables the long-range Lennard-Jones "
+        f"dispersion correction normally used with {get_force_field_family(force_field)}. "
+        "This is allowed by explicit user choice, but reported energies and "
+        "virial will differ and pressure/density can change during dynamics. "
+        "Use a consistent setting when comparing runs and consider restoring "
+        "EnerPres for equilibration or production."
+    )
+
+
 def validate_mdp_topology_compatibility(mdp_file_path: str,
                                         topology_file_path: str) -> str:
     """Validate family-sensitive MDP cutoffs against the actual topology.
@@ -5004,7 +6990,14 @@ def validate_mdp_topology_compatibility(mdp_file_path: str,
     coulomb_tokens = settings.get("coulombtype", "cut-off").split()
     coulomb = coulomb_tokens[0] if coulomb_tokens else "<empty>"
     normalized_coulomb = coulomb.lower().replace("_", "-")
-    if family in ("AMBER", "CHARMM", "OPLS"):
+    if family == "AMBER":
+        permitted = (normalized_coulomb.startswith("pme")
+                     or normalized_coulomb in {"cut-off", "cutoff"})
+        if not permitted:
+            problems.append(
+                f"coulombtype={coulomb} is incompatible with {family}; use PME "
+                "or Cut-off")
+    elif family in ("CHARMM", "OPLS"):
         if not normalized_coulomb.startswith("pme"):
             problems.append(
                 f"coulombtype={coulomb} is incompatible with {family}; use PME")
@@ -5021,7 +7014,10 @@ def validate_mdp_topology_compatibility(mdp_file_path: str,
     dispersion_tokens = settings.get("dispcorr", "no").split()
     dispersion = dispersion_tokens[0].lower() if dispersion_tokens else "<empty>"
     if family in ("AMBER", "OPLS"):
-        if dispersion not in ("enerpres", "allenerpres"):
+        # ``no`` is a supported expert override and is surfaced separately as
+        # a non-blocking warning.  Continue to reject misspellings and the
+        # energy-only variants because those are not the requested policy.
+        if dispersion not in ("no", "enerpres", "allenerpres"):
             problems.append(
                 f"DispCorr={dispersion} does not include energy/pressure correction")
     elif dispersion != "no":
@@ -5327,6 +7323,11 @@ def merge_protein_ligand_topologies(protein_topology_file_path: str,
 
     # Publish only the fully constructed topology so a disk/write failure never
     # leaves a truncated replacement behind.
+    # Repair legacy ACPYPE atom types immediately before publishing the include.
+    # Without the explicit Z column GROMACS stores ligand atomnumber=-1 in every
+    # downstream TPR, so NNPot cannot consume a group containing the ligand.
+    if ligand_itp_uses_acpype_gaff(ligand_topology_file_path):
+        repair_ligand_atomic_numbers_best_effort(ligand_topology_file_path)
     atomic_write_text_file(output_topology_file_path, "".join(merged_lines))
 WATER_RESNAMES: list[str] = ["SOL", "WAT", "HOH", "H2O", "W", "DOD", "D3O", "TIP3", "TIP3P", "TIP4", "TIP4P", "SPC", "SPCE"]
 

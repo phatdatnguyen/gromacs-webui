@@ -25,7 +25,7 @@ from typing import Any
 # What gr.update() hands back to Gradio.
 GradioUpdate = dict[str, Any]
 from path_security import (
-    DATA_ROOT,
+    PROTEIN_MD_DATA_ROOT,
     STATIC_ROOT,
     atomic_replace_editable_text_file,
     cleanup_stale_static_assets,
@@ -237,7 +237,9 @@ def _grompp_success(message: str, max_warnings: int,
     if continuation_warning:
         warnings.append(continuation_warning)
     if warnings:
-        return message + " " + " ".join(warnings), "orange"
+        warning_text = " ".join(warnings)
+        print("WARNING: " + warning_text)
+        return message + " " + warning_text, "orange"
     return message, "green"
 
 
@@ -256,20 +258,40 @@ def _validate_grompp_inputs(working_directory_path: str,
     return parameter_path, topology_path
 
 
-def _custom_force_field_warning(topology_path: str) -> str | None:
-    """Explain the policy boundary when a job-local custom family is used."""
+def _mdp_compatibility_warning(parameter_path: str,
+                               topology_path: str) -> str | None:
+    """Collect non-blocking force-field/MDP compatibility warnings."""
+    warnings = []
     try:
         force_field = get_topology_force_field_name(topology_path)
     except (OSError, ValueError):
         # Some callback unit tests replace the validator with a fixture tuple.
         # A real successful validation always leaves a readable topology here.
-        return None
+        force_field = None
     if force_field and get_force_field_family(force_field) is None:
-        return (
+        warnings.append(
             f"Custom force field '{force_field}' detected: automatic "
             "family-specific cutoff compatibility checks are unavailable; "
             "you are responsible for verifying the MDP against that force field.")
-    return None
+    try:
+        electrostatics_warning = get_mdp_electrostatics_warning(
+            parameter_path, topology_path)
+    except (OSError, ValueError):
+        # Input validation has already completed for real callbacks.  Keep this
+        # best-effort warning collector tolerant of isolated callback fixtures.
+        electrostatics_warning = None
+    if electrostatics_warning:
+        warnings.append(electrostatics_warning)
+    try:
+        dispersion_warning = get_mdp_dispersion_correction_warning(
+            parameter_path, topology_path)
+    except (OSError, ValueError):
+        # Input validation has already completed for real callbacks.  Keep this
+        # best-effort warning collector tolerant of isolated callback fixtures.
+        dispersion_warning = None
+    if dispersion_warning:
+        warnings.append(dispersion_warning)
+    return " ".join(warnings) or None
 
 
 def _publish_staged_files_unlocked(staged_files: Sequence[tuple[str, str]],
@@ -368,17 +390,20 @@ def _publish_staged_files(staged_files: Sequence[tuple[str, str]],
 
 
 def get_working_directories() -> list[str]:
-    """Names of the job directories that already exist under ./data, sorted by name."""
-    DATA_ROOT.mkdir(parents=True, exist_ok=True)
-    return sorted((entry.name for entry in DATA_ROOT.iterdir() if entry.is_dir()), key=str.lower)
+    """Return protein-only job names, sorted independently of complex jobs."""
+    PROTEIN_MD_DATA_ROOT.mkdir(parents=True, exist_ok=True)
+    return sorted(
+        (entry.name for entry in PROTEIN_MD_DATA_ROOT.iterdir()
+         if entry.is_dir()),
+        key=str.lower,
+    )
 
 def get_files_in_working_directory(working_directory_path: str | None) -> list[str]:
     """Visible files in a job directory, hiding backups and tool scratch files.
 
     Sorted by name: os.listdir() order is arbitrary, and every file dropdown in
-    the UI is filtered straight out of this list. The MM-PBSA scratch files are
-    hidden here too: a job directory is browsable from either tab, so the two
-    listings have to agree about what is worth showing."""
+    the UI is filtered straight out of this list. Legacy MM-PBSA scratch files
+    remain hidden if a formerly shared job was migrated into this workflow."""
     if working_directory_path is None or not os.path.isdir(working_directory_path):
         return []
     files = [f for f in os.listdir(working_directory_path) if not (f.startswith('#') or f.startswith(MMPBSA_SCRATCH_PREFIX) or f.endswith("Zone.Identifier") or os.path.isdir(os.path.join(working_directory_path, f)))]
@@ -421,17 +446,20 @@ def _validate_mdrun_resources(mpi_rank: int,
     return mpi_rank, omp_threads
 
 def on_open_working_directory(working_directory: str | None) -> tuple[Any, ...]:
-    """Create or open a job directory under ./data and enable the file actions."""
+    """Create or open a job under ``data/protein_md``."""
     if working_directory is None or working_directory.strip() == "":
         gr.Warning("Please specify a working directory.")
         return None, None, None, None, None
 
     try:
         validate_file_name(working_directory, "working directory")
-        working_directory_path = str((DATA_ROOT / working_directory).resolve())
-        if DATA_ROOT not in Path(working_directory_path).parents:
+        PROTEIN_MD_DATA_ROOT.mkdir(parents=True, exist_ok=True)
+        working_directory_path = str(
+            (PROTEIN_MD_DATA_ROOT / working_directory).resolve())
+        if PROTEIN_MD_DATA_ROOT not in Path(working_directory_path).parents:
             raise ValueError(
-                "Invalid working directory: path must stay inside ./data/")
+                "Invalid working directory: path must stay inside "
+                "./data/protein_md/")
         os.makedirs(working_directory_path, exist_ok=True)
         files = get_files_in_working_directory(working_directory_path)
     except (OSError, ValueError) as exc:
@@ -1191,7 +1219,8 @@ def on_generate_ions_tpr_file(working_directory_path: str, input_file_name: str,
         parameter_path, topology_path = _validate_grompp_inputs(
             working_directory_path, parameter_file_name,
             input_topology_file_name, force_field)
-        compatibility_warning = _custom_force_field_warning(topology_path)
+        compatibility_warning = _mdp_compatibility_warning(
+            parameter_path, topology_path)
         cmd = [
             "gmx", "grompp",
             "-f", parameter_path,
@@ -1355,7 +1384,8 @@ def on_generate_energy_minimization_tpr_file(working_directory_path: str, input_
         parameter_path, topology_path = _validate_grompp_inputs(
             working_directory_path, parameter_file_name,
             input_topology_file_name, force_field)
-        compatibility_warning = _custom_force_field_warning(topology_path)
+        compatibility_warning = _mdp_compatibility_warning(
+            parameter_path, topology_path)
         cmd = [
             "gmx", "grompp",
             "-f", parameter_path,
@@ -1458,7 +1488,8 @@ def on_generate_nvt_equilibration_tpr_file(working_directory_path: str, input_fi
         parameter_path, topology_path = _validate_grompp_inputs(
             working_directory_path, parameter_file_name,
             input_topology_file_name, force_field)
-        compatibility_warning = _custom_force_field_warning(topology_path)
+        compatibility_warning = _mdp_compatibility_warning(
+            parameter_path, topology_path)
         cmd = [
             "gmx", "grompp",
             "-f", parameter_path,
@@ -1694,7 +1725,8 @@ def on_generate_npt_equilibration_tpr_file(working_directory_path: str, input_fi
         parameter_path, topology_path = _validate_grompp_inputs(
             working_directory_path, parameter_file_name,
             input_topology_file_name, force_field)
-        compatibility_warning = _custom_force_field_warning(topology_path)
+        compatibility_warning = _mdp_compatibility_warning(
+            parameter_path, topology_path)
         cmd = [
             "gmx", "grompp",
             "-f", parameter_path,
@@ -1804,17 +1836,6 @@ def on_run_npt_equilibration(working_directory_path: str, run_input_file_name: s
 
         return get_files_in_working_directory(working_directory_path), f"<span style='color:red;'>{status}</span>", process_state, gr.update(value="Start", variant="primary")
 
-def on_toggle_nnpot(nnpot_active: bool, nnpot_model_name: str = "ani2x") -> str:
-    """Acknowledge the neural-network potential choice in the status line."""
-    if not nnpot_active:
-        return ""
-    unavailable_reason = get_nnpot_unavailable_reason(nnpot_model_name)
-    if unavailable_reason is not None:
-        safe_reason = html.escape(unavailable_reason).replace("\n", "<br>")
-        return f"<span style='color:red;'>{safe_reason}</span>"
-    return ("<span style='color:green;'>Machine learning potential enabled. "
-            "The selected model will be built when you generate the production MD parameter file.</span>")
-
 def on_change_mdp_type(prod_md_mdp_type_radio: str) -> tuple[GradioUpdate, str]:
     """Switch the production MDP between an initial run and a continuation."""
     if prod_md_mdp_type_radio=="Initial":
@@ -1824,9 +1845,9 @@ def on_change_mdp_type(prod_md_mdp_type_radio: str) -> tuple[GradioUpdate, str]:
 
 def on_generate_prod_md_mdp_file(working_directory_path: str, time_scale: float, time_step: float,
                                  temperature: float, pressure: float, mdp_type: str, random_seed: int,
-                                 parameter_file_name: str, nnpot_active: bool, nnpot_model_name: str,
-                                 nnpot_input_group: str, force_field: str) -> tuple[list[str], str]:
-    """Write the production MD MDP, building the neural potential if requested."""
+                                 parameter_file_name: str,
+                                 force_field: str) -> tuple[list[str], str]:
+    """Write a classical production MD MDP for the protein-only workflow."""
     try:
         time_step = _validate_standard_time_step(time_step)
     except Exception as exc:
@@ -1836,20 +1857,18 @@ def on_generate_prod_md_mdp_file(working_directory_path: str, time_scale: float,
     if parameter_file_name is None or str(parameter_file_name).strip() == "":
         parameter_file_name = "md_initial.mdp" if mdp_type == "Initial" else "md_continue.mdp"
 
-    # Build (or reuse) the requested NNPot model via the universal wrapper and
-    # collect the matching nnpot-model-input* keywords before writing the MDP.
-    nnpot_modelfile_path = None
-    if nnpot_active:
-        try:
-            nnpot_modelfile_path = download_nnpot_model(nnpot_model_name)
-        except Exception as exc:
-            status = "Error downloading NNPot model!\n" + str(exc)
-            return get_files_in_working_directory(working_directory_path), "<span style='color:red;'>" + status + "</span>"
-
     try:
-        file_content = get_default_prod_md_mdp_file_content(time_scale_ps=time_scale*1000, time_step_ps=time_step, temperature=temperature, pressure=pressure, mdp_type=mdp_type, random_seed=random_seed, nnpot_active=nnpot_active, nnpot_modelfile_path=nnpot_modelfile_path, nnpot_input_group=nnpot_input_group, nnpot_model_name=nnpot_model_name, force_field=force_field)
         file_path = os.path.join(working_directory_path, parameter_file_name)
         with reserve_working_directory_maintenance(working_directory_path):
+            file_content = get_default_prod_md_mdp_file_content(
+                time_scale_ps=time_scale * 1000,
+                time_step_ps=time_step,
+                temperature=temperature,
+                pressure=pressure,
+                mdp_type=mdp_type,
+                random_seed=random_seed,
+                force_field=force_field,
+            )
             atomic_write_text_file(file_path, file_content)
         status = "Production MD parameter file generated successfully."
     except Exception as exc:
@@ -1858,17 +1877,25 @@ def on_generate_prod_md_mdp_file(working_directory_path: str, time_scale: float,
     
     return get_files_in_working_directory(working_directory_path), "<span style='color:green;'>" + status + "</span>"
 
-def on_generate_prod_md_tpr_file(working_directory_path: str, input_file_name: str, input_topology_file_name: str,
-                                 parameter_file_name: str, run_input_file_name: str,
-                                 max_warnings: int,
-                                 force_field: str | None = None) -> tuple[list[str], str]:
-    """Run grompp to build the production MD run input file."""
+def _on_generate_prod_md_tpr_file_reserved(
+        working_directory_path: str, input_file_name: str,
+        input_topology_file_name: str, parameter_file_name: str,
+        run_input_file_name: str, max_warnings: int,
+        force_field: str | None = None) -> tuple[list[str], str]:
+    """Run grompp to build a classical protein production run input file."""
     try:
         max_warnings = _normalise_max_warnings(max_warnings)
         parameter_path, topology_path = _validate_grompp_inputs(
             working_directory_path, parameter_file_name,
             input_topology_file_name, force_field)
-        compatibility_warning = _custom_force_field_warning(topology_path)
+        if mdp_uses_nnpot(parameter_path):
+            raise ValueError(
+                "Machine-learning potentials are available only in the "
+                "Protein-Ligand Complex workflow. Use a classical MDP for the "
+                "protein-only workflow."
+            )
+        compatibility_warning = _mdp_compatibility_warning(
+            parameter_path, topology_path)
         cmd = [
             "gmx", "grompp",
             "-f", parameter_path,
@@ -1910,8 +1937,27 @@ def on_generate_prod_md_tpr_file(working_directory_path: str, input_file_name: s
         
     return get_files_in_working_directory(working_directory_path), f"<span style='color:{color};'>" + status + "</span>"
 
+
+def on_generate_prod_md_tpr_file(
+        working_directory_path: str, input_file_name: str,
+        input_topology_file_name: str, parameter_file_name: str,
+        run_input_file_name: str, max_warnings: int,
+        force_field: str | None = None) -> tuple[list[str], str]:
+    """Build a classical protein production TPR from one input snapshot."""
+    try:
+        with reserve_working_directory_maintenance(working_directory_path):
+            files, status = _on_generate_prod_md_tpr_file_reserved(
+                working_directory_path, input_file_name,
+                input_topology_file_name, parameter_file_name,
+                run_input_file_name, max_warnings, force_field)
+        return files, status
+    except Exception as exc:
+        status = "Error generating production MD run input file!\n" + str(exc)
+        return (get_files_in_working_directory(working_directory_path),
+                "<span style='color:red;'>" + status + "</span>")
+
 def on_run_prod_md(working_directory_path: str, run_input_file_name: str, mpi_rank: int, omp_threads: int,
-                   prod_md_nnpot_active: bool, use_gpu: bool,
+                   use_gpu: bool,
                    process_state: ProcessStateDict) -> tuple[Any, ...]:
     """Start production MD, or stop the run that is already in progress."""
     # ---------- STOP ----------
@@ -1930,11 +1976,15 @@ def on_run_prod_md(working_directory_path: str, run_input_file_name: str, mpi_ra
     proc = None
     job_key = None
     try:
-        if prod_md_nnpot_active:
-            mpi_rank = 1
-        mpi_rank, omp_threads = _validate_mdrun_resources(
-            mpi_rank, omp_threads)
+        working_directory_path = validate_working_directory(
+            working_directory_path)
+        run_input_file_name = validate_file_name(
+            run_input_file_name, "production run input file")
+        if not isinstance(run_input_file_name, str):
+            raise ValueError("Select a production .tpr run input file.")
         base_name = os.path.splitext(run_input_file_name)[0]
+        # Own the directory before inspecting the TPR so another session cannot
+        # replace the validated file before Popen consumes it.
         job_key, claimed, active_proc = _claim_process_output(
             working_directory_path, base_name, process_state, "Production MD",
             f"See {base_name}.log for details.")
@@ -1949,6 +1999,11 @@ def on_run_prod_md(working_directory_path: str, run_input_file_name: str, mpi_ra
                 button = gr.update(value="Start", variant="primary")
             return (get_files_in_working_directory(working_directory_path),
                     f"<span style='color:orange;'>{status}</span>", process_state, button)
+        require_classical_tpr(
+            working_directory_path, run_input_file_name,
+            "the protein-only workflow")
+        mpi_rank, omp_threads = _validate_mdrun_resources(
+            mpi_rank, omp_threads)
         resource_status = reserve_process_resources(
             job_key, mpi_rank, omp_threads, use_gpu)
         # -deffnm also changes mdrun's optional -cpi default, so omitting -cpi
@@ -1965,7 +2020,7 @@ def on_run_prod_md(working_directory_path: str, run_input_file_name: str, mpi_ra
                 "-ntomp", str(omp_threads),
                 "-v"
             ]
-            if use_gpu and not prod_md_nnpot_active:
+            if use_gpu:
                 if int(mpi_rank) == 1:
                     # A fully GPU-resident update is only supported with one rank.
                     # With domain decomposition, keep just the generally safe
@@ -2005,7 +2060,7 @@ def on_run_prod_md(working_directory_path: str, run_input_file_name: str, mpi_ra
         return get_files_in_working_directory(working_directory_path), f"<span style='color:red;'>{status}</span>", process_state, gr.update(value="Start", variant="primary")
 
 def on_continue_prod_md(working_directory_path: str, run_input_file_name: str, checkpoint_file_name: str,
-                        mpi_rank: int, omp_threads: int, prod_md_nnpot_active: bool, use_gpu: bool,
+                        mpi_rank: int, omp_threads: int, use_gpu: bool,
                         process_state: ProcessStateDict) -> tuple[Any, ...]:
     """Resume an interrupted production run, or stop the resumed process."""
     # ---------- STOP ----------
@@ -2024,16 +2079,15 @@ def on_continue_prod_md(working_directory_path: str, run_input_file_name: str, c
     proc = None
     job_key = None
     try:
-        if prod_md_nnpot_active:
-            mpi_rank = 1
-        mpi_rank, omp_threads = _validate_mdrun_resources(
-            mpi_rank, omp_threads)
-        run_input_file_name, checkpoint_file_name = require_matching_resume_files(
-            working_directory_path, run_input_file_name, checkpoint_file_name)
+        working_directory_path = validate_working_directory(
+            working_directory_path)
+        run_input_file_name = validate_file_name(
+            run_input_file_name, "production run input file")
+        if not isinstance(run_input_file_name, str):
+            raise ValueError("Select a production .tpr run input file.")
         base_name = os.path.splitext(run_input_file_name)[0]
-        # Initial and continuation runs intentionally use the same key because
-        # both write ``-deffnm <base_name>``.  They must never append to the same
-        # trajectory/checkpoint at the same time.
+        # Reserve before checking either file so their validated contents
+        # remain the files that the eventual mdrun command will consume.
         job_key, claimed, active_proc = _claim_process_output(
             working_directory_path, base_name, process_state, "Production MD",
             f"See {base_name}.log for details.")
@@ -2048,6 +2102,13 @@ def on_continue_prod_md(working_directory_path: str, run_input_file_name: str, c
                 button = gr.update(value="Start", variant="primary")
             return (get_files_in_working_directory(working_directory_path),
                     f"<span style='color:orange;'>{status}</span>", process_state, button)
+        run_input_file_name, checkpoint_file_name = require_matching_resume_files(
+            working_directory_path, run_input_file_name, checkpoint_file_name)
+        require_classical_tpr(
+            working_directory_path, run_input_file_name,
+            "the protein-only workflow")
+        mpi_rank, omp_threads = _validate_mdrun_resources(
+            mpi_rank, omp_threads)
         resource_status = reserve_process_resources(
             job_key, mpi_rank, omp_threads, use_gpu)
         cmd = [
@@ -2059,7 +2120,7 @@ def on_continue_prod_md(working_directory_path: str, run_input_file_name: str, c
             "-append",
             "-v"
         ]
-        if use_gpu and not prod_md_nnpot_active:
+        if use_gpu:
             if int(mpi_rank) == 1:
                 cmd.extend([
                     "-nb", "gpu",
@@ -2589,7 +2650,8 @@ guard_working_directory_reads(globals(), (
     "on_analyze_rmsd", "on_analyze_rmsf", "on_analyze_sasa",
     "on_analyze_gyrate", "on_run_pca", "on_analyze_free_energy_landscape",
 ))
-secure_module_callbacks(globals())
+secure_module_callbacks(
+    globals(), working_directory_root=PROTEIN_MD_DATA_ROOT)
 
 
 def protein_md_simulation_tab_content() -> None:
@@ -2833,10 +2895,6 @@ def protein_md_simulation_tab_content() -> None:
                                             prod_md_time_step_slider = gr.Slider(label="Time Step (ps; no HMR)", minimum=0.001, maximum=0.002, value=0.002, step=0.001)
                                             prod_md_temperature_slider = gr.Slider(label="Target Temperature (K)", minimum=100, maximum=500, value=300, step=10)
                                             prod_md_pressure_slider = gr.Slider(label="Pressure (bar)", minimum=0.1, maximum=10, value=1, step=0.1)
-                                    with gr.Row():
-                                        prod_md_nnpot_active_checkbox = gr.Checkbox(label="Use Machine Learning Potential (NNPot)", value=False)
-                                        prod_md_nnpot_model_dropdown = gr.Dropdown(label="Model", choices=list(SUPPORTED_NNPOT_MODELS), value="ani2x")
-                                        prod_md_nnpot_input_group_textbox = gr.Textbox(label="NNPot Input Group", value="Protein")
                                 with gr.Column():
                                     prod_md_mdp_type_radio = gr.Radio(label="Initial or continuation", choices=["Initial", "Continuation"], value="Initial")
                                     prod_md_random_seed_textbox = gr.Textbox(label="Random seed", value="0", visible=False)
@@ -3100,14 +3158,12 @@ def protein_md_simulation_tab_content() -> None:
 
     # Production MD interaction
     prod_md_mdp_type_radio.change(on_change_mdp_type, prod_md_mdp_type_radio, [prod_md_random_seed_textbox, prod_md_parameter_file_name_textbox])
-    prod_md_nnpot_active_checkbox.change(on_toggle_nnpot, [prod_md_nnpot_active_checkbox, prod_md_nnpot_model_dropdown], status_markdown)
-    prod_md_nnpot_model_dropdown.change(on_toggle_nnpot, [prod_md_nnpot_active_checkbox, prod_md_nnpot_model_dropdown], status_markdown)
-    prod_md_parameter_file_button.click(on_generate_prod_md_mdp_file, [working_directory_path_state, prod_md_time_scale_slider, prod_md_time_step_slider, prod_md_temperature_slider, prod_md_pressure_slider, prod_md_mdp_type_radio, prod_md_random_seed_textbox, prod_md_parameter_file_name_textbox, prod_md_nnpot_active_checkbox, prod_md_nnpot_model_dropdown, prod_md_nnpot_input_group_textbox, force_field_dropdown], [working_directory_file_list_state, status_markdown])
+    prod_md_parameter_file_button.click(on_generate_prod_md_mdp_file, [working_directory_path_state, prod_md_time_scale_slider, prod_md_time_step_slider, prod_md_temperature_slider, prod_md_pressure_slider, prod_md_mdp_type_radio, prod_md_random_seed_textbox, prod_md_parameter_file_name_textbox, force_field_dropdown], [working_directory_file_list_state, status_markdown])
     prod_md_run_input_file_button.click(on_generate_prod_md_tpr_file, [working_directory_path_state, prod_md_input_file_name_dropdown, prod_md_input_topology_file_name_dropdown, prod_md_parameter_file_dropdown, prod_md_run_input_file_name_textbox, max_warns_slider, force_field_dropdown], [working_directory_file_list_state, status_markdown])
-    prod_run_event = run_prod_md_button.click(on_run_prod_md, [working_directory_path_state, prod_md_run_input_file_dropdown, mpi_rank_slider, omp_threads_slider, prod_md_nnpot_active_checkbox, use_gpu, prod_md_initial_process_state], [working_directory_file_list_state, status_markdown, prod_md_initial_process_state, run_prod_md_button])
+    prod_run_event = run_prod_md_button.click(on_run_prod_md, [working_directory_path_state, prod_md_run_input_file_dropdown, mpi_rank_slider, omp_threads_slider, use_gpu, prod_md_initial_process_state], [working_directory_file_list_state, status_markdown, prod_md_initial_process_state, run_prod_md_button])
     prod_run_event.then(_process_timer_update, prod_md_initial_process_state,
                         prod_md_timer, queue=False)
-    prod_continue_event = continue_prod_md_button.click(on_continue_prod_md, [working_directory_path_state, prod_md_run_input_file_dropdown, checkpoint_file_dropdown, mpi_rank_slider, omp_threads_slider, prod_md_nnpot_active_checkbox, use_gpu, prod_md_continuation_process_state], [working_directory_file_list_state, status_markdown, prod_md_continuation_process_state, continue_prod_md_button])
+    prod_continue_event = continue_prod_md_button.click(on_continue_prod_md, [working_directory_path_state, prod_md_run_input_file_dropdown, checkpoint_file_dropdown, mpi_rank_slider, omp_threads_slider, use_gpu, prod_md_continuation_process_state], [working_directory_file_list_state, status_markdown, prod_md_continuation_process_state, continue_prod_md_button])
     prod_continue_event.then(_process_timer_update,
                              prod_md_continuation_process_state,
                              prod_md_timer, queue=False)

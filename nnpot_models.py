@@ -5,12 +5,9 @@ convention, and exposes a forward signature that the GROMACS neural-network
 potential interface can call.
 """
 
-import os
 import torch
 from torch import nn
 from typing import Optional, Tuple
-
-from path_security import MODEL_ROOT
 
 def load_emle_model_classes() -> tuple[type, float, float]:
     """Import EMLE behind a TorchANI 2.8 shim and return its class and unit factors."""
@@ -63,6 +60,10 @@ class GmxANI1xModel(nn.Module):
             strategy="pyaev",
             device=device,
         )
+        self.register_buffer(
+            "supported_atomic_numbers",
+            torch.tensor([1, 6, 7, 8], dtype=torch.int64, device=device),
+        )
 
         # GROMACS and TorchANI use different unit conventions
         self.length_conversion = 10.0   # nm --> Å
@@ -78,6 +79,15 @@ class GmxANI1xModel(nn.Module):
             raise RuntimeError("ANI-1x requires one total NNP-region charge")
         if bool(torch.abs(nnp_charge.reshape(-1)[0]) > 1.0e-4):
             raise RuntimeError("ANI-1x supports neutral NNP regions only")
+
+        atomic_numbers = atomic_numbers.to(
+            dtype=torch.int64, device=positions.device)
+        if atomic_numbers.numel() != positions.shape[0]:
+            raise RuntimeError("ANI-1x requires one atomic number per position")
+        supported = atomic_numbers.reshape(-1, 1) == \
+            self.supported_atomic_numbers.reshape(1, -1)
+        if not bool(torch.all(torch.any(supported, dim=1))):
+            raise RuntimeError("ANI-1x does not support one or more selected elements")
 
         # Prepare the inputs for the model
         atomic_numbers = atomic_numbers.unsqueeze(0)
@@ -105,6 +115,14 @@ class GmxANI2xModel(nn.Module):
             strategy="pyaev",
             device=device,
         )
+        self.register_buffer(
+            "supported_atomic_numbers",
+            torch.tensor(
+                [1, 6, 7, 8, 9, 16, 17],
+                dtype=torch.int64,
+                device=device,
+            ),
+        )
 
         # GROMACS and TorchANI use different unit conventions
         self.length_conversion = 10.0   # nm --> Å
@@ -120,6 +138,15 @@ class GmxANI2xModel(nn.Module):
             raise RuntimeError("ANI-2x requires one total NNP-region charge")
         if bool(torch.abs(nnp_charge.reshape(-1)[0]) > 1.0e-4):
             raise RuntimeError("ANI-2x supports neutral NNP regions only")
+
+        atomic_numbers = atomic_numbers.to(
+            dtype=torch.int64, device=positions.device)
+        if atomic_numbers.numel() != positions.shape[0]:
+            raise RuntimeError("ANI-2x requires one atomic number per position")
+        supported = atomic_numbers.reshape(-1, 1) == \
+            self.supported_atomic_numbers.reshape(1, -1)
+        if not bool(torch.all(torch.any(supported, dim=1))):
+            raise RuntimeError("ANI-2x does not support one or more selected elements")
 
         # Prepare the inputs for the model
         atomic_numbers = atomic_numbers.unsqueeze(0)
@@ -246,59 +273,6 @@ class GmxMACEModel(torch.nn.Module):
 
         return total_energy * self.energy_conversion
 
-class GmxAIMNet2Model(torch.nn.Module):
-    """AIMNet2 wrapped for GROMACS; traced rather than scripted."""
-    def __init__(self, device: str, mult: int = 1, **kwargs: object) -> None:
-        super().__init__()
-        os.environ.setdefault("WARP_CACHE_PATH", str(MODEL_ROOT / "warp-cache"))
-        os.environ.setdefault("AIMNET_CACHE_DIR", str(MODEL_ROOT / "aimnet-cache"))
-        from aimnet.calculators.model_registry import get_model_path
-        from aimnet.models.base import load_model
-
-        model_path = get_model_path("aimnet2")
-        self.model, _ = load_model(model_path, device=device)
-        self.model = self.model.double()
-        self.register_buffer("mult", torch.tensor([mult], dtype=torch.int64, device=device))
-        self.length_conversion = 10.0       # nm (gmx) --> Å (aimnet)
-        self.energy_conversion = 96.4853    # eV (aimnet) --> kJ/mol (gmx)
-
-    def forward(self, positions: torch.Tensor, atomic_numbers: torch.Tensor,
-                nnp_charge: torch.Tensor,
-                cell: Optional[torch.Tensor] = None,
-                pbc: Optional[torch.Tensor] = None) -> torch.Tensor:
-        """Return the potential energy in kJ/mol for GROMACS coordinates given in nm."""
-        # Prepare the model input
-        positions = positions.to(torch.float64) * self.length_conversion
-        atomic_numbers = atomic_numbers.to(dtype=torch.int64, device=positions.device)
-        if cell is not None:
-            cell = cell.to(dtype=torch.float64, device=positions.device) * self.length_conversion
-        else:
-            cell = torch.zeros(3, 3, dtype=torch.float64, device=positions.device)
-        if pbc is not None:
-            pbc = pbc.to(device=positions.device)
-        else:
-            pbc = torch.tensor([False, False, False], dtype=torch.bool, device=positions.device)
-        if nnp_charge.numel() != 1:
-            raise RuntimeError("AIMNet2 requires one total NNP-region charge")
-        charge = nnp_charge.to(dtype=torch.float64, device=positions.device).reshape(1)
-
-        # Prepare input for aimnet model
-        input_data = {
-            "coord": positions.unsqueeze(0),
-            "numbers": atomic_numbers.unsqueeze(0),
-            "mol_idx": torch.zeros(atomic_numbers.shape[0], dtype=torch.int64, device=positions.device).unsqueeze(0),
-            "charge": charge,
-            "mult": self.mult,
-            "cell": cell.unsqueeze(0),
-            "pbc": pbc.unsqueeze(0),
-        }
-
-        result = self.model(input_data)
-
-        energy = result["energy"].reshape(-1)[0] * self.energy_conversion
-
-        return energy
-
 class GmxANI2xEMLEModel(torch.nn.Module):
     """ANI-2x with EMLE embedding, wrapped for GROMACS."""
     def __init__(self, device: str, **kwargs: object) -> None:
@@ -307,6 +281,10 @@ class GmxANI2xEMLEModel(torch.nn.Module):
         kwargs.setdefault("device", torch.device(device))
         self.model = ANI2xEMLE(**kwargs)
         self.is_nnpops = self.model._is_nnpops
+        self.register_buffer(
+            "supported_atomic_numbers",
+            torch.tensor([1, 6, 7, 8, 16], dtype=torch.int64, device=device),
+        )
 
         self.length_conversion = length_conversion
         self.energy_conversion = energy_conversion
@@ -317,6 +295,15 @@ class GmxANI2xEMLEModel(torch.nn.Module):
                 cell: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Return energy plus NNP/MM forces for electrostatic EMLE embedding."""
         device = positions_nn.device
+        # EMLE stores its construction device as plain ``torch.device``
+        # attributes.  Unlike parameters and buffers, those attributes are not
+        # changed when GROMACS moves a loaded TorchScript module between CPU and
+        # GPU.  Refresh every device attribute used by EMLE's forward path so
+        # tensors created internally (notably the integer QM charge) follow the
+        # actual inference device.
+        self.model._device = device
+        self.model._emle._device = device
+        self.model._emle._emle_base._device = device
         # convert units
         positions_nn = positions_nn * self.length_conversion
         positions_mm = positions_mm.to(dtype=positions_nn.dtype, device=device) * self.length_conversion
@@ -324,9 +311,32 @@ class GmxANI2xEMLEModel(torch.nn.Module):
             cell = cell.to(dtype=positions_nn.dtype, device=device) * self.length_conversion
         charges_mm = charges_mm.to(dtype=positions_nn.dtype, device=device)
         atomic_numbers = atomic_numbers.to(dtype=torch.int64, device=device)
+        if atomic_numbers.numel() != positions_nn.shape[0]:
+            raise RuntimeError(
+                "ANI2x-EMLE requires one atomic number per NNP position")
+        supported = atomic_numbers.reshape(-1, 1) == \
+            self.supported_atomic_numbers.reshape(1, -1)
+        if not bool(torch.all(torch.any(supported, dim=1))):
+            raise RuntimeError(
+                "ANI2x-EMLE does not support one or more selected elements")
         if nnp_charge.numel() != 1:
             raise RuntimeError("ANI2x-EMLE requires one total NNP-region charge")
-        qm_charge = nnp_charge.to(dtype=positions_nn.dtype, device=device).reshape(1)
+        charge_value = nnp_charge.to(
+            dtype=positions_nn.dtype, device=device
+        ).reshape(-1)[0]
+        rounded_charge = torch.round(charge_value)
+        if bool(torch.abs(charge_value - rounded_charge) > 1.0e-4):
+            raise RuntimeError("ANI2x-EMLE requires an integer NNP-region charge")
+        if bool(torch.abs(charge_value) > 1.0e-4):
+            raise RuntimeError(
+                "ANI2x-EMLE supports neutral NNP regions only with the current "
+                "GROMACS charge interface")
+        # ANI2xEMLE.forward declares qm_charge as ``int``.  Passing a one-item
+        # Tensor happens to work in eager Python, but TorchScript then rejects
+        # it at runtime because only a zero-dimensional Tensor can be converted
+        # to a scalar.  Materialise the validated scalar while exporting so the
+        # serialized call has the exact contract EMLE declares.
+        qm_charge = int(rounded_charge.item())
 
         if not self.is_nnpops:
             positions_nn = positions_nn.unsqueeze(0)

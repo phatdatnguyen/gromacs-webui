@@ -273,6 +273,14 @@ class BusyFileMutationTests(WorkingDirectoryCase):
 
     def _mdp_writers(self, module):
         force_field = "AMBER99SB-ILDN"
+        if module is protein_workflow:
+            production_writer = lambda: module.on_generate_prod_md_mdp_file(
+                self.directory, 1, 0.002, 300, 1.0, "Initial", -1,
+                "prod.mdp", force_field)
+        else:
+            production_writer = lambda: module.on_generate_prod_md_mdp_file(
+                self.directory, 1, 0.002, 300, 1.0, "Initial", -1,
+                "prod.mdp", False, "ani2x", "Protein", force_field)
         return (
             ("ions.mdp", lambda: module.on_generate_ions_mdp_file(
                 self.directory, "ions.mdp", force_field)),
@@ -282,9 +290,7 @@ class BusyFileMutationTests(WorkingDirectoryCase):
                 self.directory, 1, 0.002, 300, "nvt.mdp", force_field)),
             ("npt.mdp", lambda: module.on_generate_npt_equilibration_mdp_file(
                 self.directory, 1, 0.002, 300, 1.0, "npt.mdp", force_field)),
-            ("prod.mdp", lambda: module.on_generate_prod_md_mdp_file(
-                self.directory, 1, 0.002, 300, 1.0, "Initial", -1,
-                "prod.mdp", False, "ani2x", "Protein", force_field)),
+            ("prod.mdp", production_writer),
         )
 
     def test_live_writer_blocks_every_direct_mdp_writer(self):
@@ -489,6 +495,119 @@ class EnergyMinimisationReservationTests(WorkingDirectoryCase):
                 self.assertFalse(worker.is_alive())
                 run.assert_not_called()
                 self.assertIn("already using this output", results[0][1])
+
+    def test_production_tpr_generation_holds_one_directory_transaction(self):
+        for module in (protein_workflow, complex_workflow):
+            with self.subTest(module=module.__name__):
+                observed: list[bool] = []
+
+                def inspect_reservation(*args, **kwargs):
+                    observed.append(
+                        utils.is_working_directory_busy(self.directory))
+                    return [], "ok"
+
+                with mock.patch.object(
+                        module, "_on_generate_prod_md_tpr_file_reserved",
+                        side_effect=inspect_reservation):
+                    arguments = (
+                        self.directory, "npt.gro", "topol.top", "md.mdp",
+                        "md.tpr", 5, "AMBER99SB-ILDN")
+                    if module is protein_workflow:
+                        result = module.on_generate_prod_md_tpr_file(*arguments)
+                    else:
+                        result = module.on_generate_prod_md_tpr_file(
+                            *arguments, True)
+
+                self.assertEqual(observed, [True])
+                self.assertEqual(result, ([], "ok"))
+                self.assertFalse(
+                    utils.is_working_directory_busy(self.directory))
+
+
+class ProductionLaunchReservationTests(WorkingDirectoryCase):
+    """The TPR/checkpoint inspected by preflight must be the files launched."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        for name in ("md.tpr", "md.cpt"):
+            with open(self.path(name), "wb") as handle:
+                handle.write(b"placeholder")
+
+    def assert_other_thread_cannot_mutate_directory(self) -> None:
+        self.assertTrue(utils.is_working_directory_busy(self.directory))
+        observations: list[str] = []
+
+        def attempt_mutation() -> None:
+            try:
+                with utils.reserve_working_directory_maintenance(self.directory):
+                    observations.append("admitted")
+            except utils.WorkingDirectoryBusyError:
+                observations.append("blocked")
+
+        worker = __import__("threading").Thread(target=attempt_mutation)
+        worker.start()
+        worker.join(timeout=2)
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(observations, ["blocked"])
+
+    def test_initial_launch_claims_directory_before_tpr_preflight(self):
+        for module in (protein_workflow, complex_workflow):
+            with self.subTest(module=module.__name__):
+                def fail_preflight(*_args, **_kwargs):
+                    self.assert_other_thread_cannot_mutate_directory()
+                    raise RuntimeError("preflight failed")
+
+                state = utils.ProcessStateDict()
+                preflight_name = (
+                    "require_classical_tpr" if module is protein_workflow
+                    else "resolve_nnpot_launch_state")
+                with mock.patch.object(
+                        module, preflight_name,
+                        side_effect=fail_preflight), \
+                        mock.patch.object(module, "subprocess") as process:
+                    if module is protein_workflow:
+                        result = module.on_run_prod_md(
+                            self.directory, "md.tpr", 1, 1, True, state)
+                    else:
+                        result = module.on_run_prod_md(
+                            self.directory, "md.tpr", 1, 1, False, True, state)
+                    _, status, _, _ = result
+
+                process.Popen.assert_not_called()
+                self.assertIn("preflight failed", status)
+                self.assertFalse(utils.is_working_directory_busy(self.directory))
+
+    def test_continuation_claims_directory_before_resume_file_checks(self):
+        for module in (protein_workflow, complex_workflow):
+            with self.subTest(module=module.__name__):
+                def fail_resume_check(*_args, **_kwargs):
+                    self.assert_other_thread_cannot_mutate_directory()
+                    raise RuntimeError("resume check failed")
+
+                state = utils.ProcessStateDict()
+                preflight_name = (
+                    "require_classical_tpr" if module is protein_workflow
+                    else "resolve_nnpot_launch_state")
+                with mock.patch.object(
+                        module, "require_matching_resume_files",
+                        side_effect=fail_resume_check), \
+                        mock.patch.object(
+                            module, preflight_name) as preflight, \
+                        mock.patch.object(module, "subprocess") as process:
+                    if module is protein_workflow:
+                        result = module.on_continue_prod_md(
+                            self.directory, "md.tpr", "md.cpt", 1, 1,
+                            True, state)
+                    else:
+                        result = module.on_continue_prod_md(
+                            self.directory, "md.tpr", "md.cpt", 1, 1,
+                            False, True, state)
+                    _, status, _, _ = result
+
+                preflight.assert_not_called()
+                process.Popen.assert_not_called()
+                self.assertIn("resume check failed", status)
+                self.assertFalse(utils.is_working_directory_busy(self.directory))
 
 
 if __name__ == "__main__":

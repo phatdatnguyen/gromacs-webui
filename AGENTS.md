@@ -31,7 +31,9 @@ The UI guides users through the complete MD workflow: topology generation → so
 1. User uploads protein structure (PDB) via Gradio file input
 2. User specifies parameters (force field, water model, temperatures, etc.)
 3. Event handlers call GROMACS CLI tools via `subprocess.Popen()`
-4. GROMACS output (structures, topologies, trajectories) stored in `./data/<working_directory>/`
+4. GROMACS output is stored under the workflow-specific root:
+   `./data/protein_md/<working_directory>/` or
+   `./data/protein_ligand_complex_md/<working_directory>/`
 5. File list updated after each step (triggers `on_file_list_change()`)
 6. Results viewed via NGL Viewer (for structures) or matplotlib (for analysis)
 7. MD trajectories analyzed using MDAnalysis, results exported as CSV
@@ -56,12 +58,15 @@ with process_state["lock"]:
 ```
 
 ### Path Traversal Protection
-Working directory paths must be validated to prevent escape from `./data/`:
+Working directory paths must be validated against the active workflow root to
+prevent both traversal and cross-workflow access. The callback wrappers use
+`secure_module_callbacks(..., working_directory_root=...)`; do not replace that
+with string-prefix checks.
 ```python
-base = os.path.abspath("./data")
-working_directory_path = os.path.abspath(os.path.join("./data/", working_directory))
-if not (working_directory_path == base or working_directory_path.startswith(base + os.sep)):
-    raise ValueError("Invalid path")
+workflow_root = PROTEIN_MD_DATA_ROOT  # or PROTEIN_LIGAND_COMPLEX_MD_DATA_ROOT
+working_directory_path = (workflow_root / working_directory).resolve()
+if working_directory_path.parent != workflow_root:
+    raise ValueError("Invalid working directory")
 ```
 
 ### GROMACS Group Selection (genion)
@@ -96,7 +101,9 @@ Server auto-detects available port (default 7860, increments if busy) and prints
 ## Directory Structure
 
 ```
-./data/                  # Working directories for simulations (created at runtime)
+./data/
+├── protein_md/          # Protein-only jobs
+└── protein_ligand_complex_md/  # Protein-ligand complex jobs
 ./static/                # Generated visualization files (PDB, HTML), cleaned on startup
 ./gromacs-env/           # Conda environment (conda install artifacts)
 protein_md_simulation.py  # Protein workflow

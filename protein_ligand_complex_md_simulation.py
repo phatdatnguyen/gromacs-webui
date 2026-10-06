@@ -27,7 +27,7 @@ from typing import Any
 # What gr.update() hands back to Gradio.
 GradioUpdate = dict[str, Any]
 from path_security import (
-    DATA_ROOT,
+    PROTEIN_LIGAND_COMPLEX_MD_DATA_ROOT,
     STATIC_ROOT,
     atomic_replace_editable_text_file,
     cleanup_stale_static_assets,
@@ -37,6 +37,9 @@ from path_security import (
     static_asset_basename,
     validate_file_name,
 )
+
+
+WORKFLOW_DATA_ROOT = PROTEIN_LIGAND_COMPLEX_MD_DATA_ROOT
 
 
 MAX_STANDARD_TIME_STEP_PS = 0.002
@@ -241,7 +244,9 @@ def _grompp_success(message: str, max_warnings: int,
     if continuation_warning:
         warnings.append(continuation_warning)
     if warnings:
-        return message + " " + " ".join(warnings), "orange"
+        warning_text = " ".join(warnings)
+        print("WARNING: " + warning_text)
+        return message + " " + warning_text, "orange"
     return message, "green"
 
 
@@ -260,20 +265,40 @@ def _validate_grompp_inputs(working_directory_path: str,
     return parameter_path, topology_path
 
 
-def _custom_force_field_warning(topology_path: str) -> str | None:
-    """Explain the policy boundary when a job-local custom family is used."""
+def _mdp_compatibility_warning(parameter_path: str,
+                               topology_path: str) -> str | None:
+    """Collect non-blocking force-field/MDP compatibility warnings."""
+    warnings = []
     try:
         force_field = get_topology_force_field_name(topology_path)
     except (OSError, ValueError):
         # Some callback unit tests replace the validator with a fixture tuple.
         # A real successful validation always leaves a readable topology here.
-        return None
+        force_field = None
     if force_field and get_force_field_family(force_field) is None:
-        return (
+        warnings.append(
             f"Custom force field '{force_field}' detected: automatic "
             "family-specific cutoff compatibility checks are unavailable; "
             "you are responsible for verifying the MDP against that force field.")
-    return None
+    try:
+        electrostatics_warning = get_mdp_electrostatics_warning(
+            parameter_path, topology_path)
+    except (OSError, ValueError):
+        # Input validation has already completed for real callbacks.  Keep this
+        # best-effort warning collector tolerant of isolated callback fixtures.
+        electrostatics_warning = None
+    if electrostatics_warning:
+        warnings.append(electrostatics_warning)
+    try:
+        dispersion_warning = get_mdp_dispersion_correction_warning(
+            parameter_path, topology_path)
+    except (OSError, ValueError):
+        # Input validation has already completed for real callbacks.  Keep this
+        # best-effort warning collector tolerant of isolated callback fixtures.
+        dispersion_warning = None
+    if dispersion_warning:
+        warnings.append(dispersion_warning)
+    return " ".join(warnings) or None
 
 
 def _publish_staged_files_unlocked(staged_files: Sequence[tuple[str, str]],
@@ -397,18 +422,15 @@ def _validate_gaff_amber_compatibility(
 
 def _ligand_topology_uses_gaff(ligand_topology_path: str) -> bool:
     """Recognize ACPYPE/GAFF provenance without blocking unrelated ligand ITPs."""
-    with open(ligand_topology_path, encoding="utf-8", errors="replace") as handle:
-        header = handle.read(16384)
-    return re.search(
-        r"\b(?:ACPYPE|GAFF2?|General\s+Amber\s+Force\s+Field)\b",
-        header,
-        flags=re.IGNORECASE,
-    ) is not None
+    return ligand_itp_uses_acpype_gaff(ligand_topology_path)
 
 def get_working_directories() -> list[str]:
-    """Names of the job directories that already exist under ./data, sorted by name."""
-    DATA_ROOT.mkdir(parents=True, exist_ok=True)
-    return sorted((entry.name for entry in DATA_ROOT.iterdir() if entry.is_dir()), key=str.lower)
+    """Return complex-MD job directories, sorted by name."""
+    WORKFLOW_DATA_ROOT.mkdir(parents=True, exist_ok=True)
+    return sorted(
+        (entry.name for entry in WORKFLOW_DATA_ROOT.iterdir() if entry.is_dir()),
+        key=str.lower,
+    )
 
 def get_files_in_working_directory(working_directory_path: str | None) -> list[str]:
     """Visible files in a job directory, hiding backups and tool scratch files.
@@ -457,17 +479,19 @@ def _validate_mdrun_resources(mpi_rank: int,
     return mpi_rank, omp_threads
 
 def on_open_working_directory(working_directory: str | None) -> tuple[Any, ...]:
-    """Create or open a job directory under ./data and enable the file actions."""
+    """Create or open a job in the protein-ligand complex data directory."""
     if working_directory is None or working_directory.strip() == "":
         gr.Warning("Please specify a working directory.")
         return None, None, None, None, None, None
 
     try:
         validate_file_name(working_directory, "working directory")
-        working_directory_path = str((DATA_ROOT / working_directory).resolve())
-        if DATA_ROOT not in Path(working_directory_path).parents:
+        working_directory_path = str(
+            (WORKFLOW_DATA_ROOT / working_directory).resolve())
+        if WORKFLOW_DATA_ROOT not in Path(working_directory_path).parents:
             raise ValueError(
-                "Invalid working directory: path must stay inside ./data/")
+                "Invalid working directory: path must stay inside "
+                "./data/protein_ligand_complex_md/")
         os.makedirs(working_directory_path, exist_ok=True)
         files = get_files_in_working_directory(working_directory_path)
     except (OSError, ValueError) as exc:
@@ -1259,6 +1283,12 @@ def on_generate_ligand_topology(working_directory_path: str, ligand_input_file_n
                     raise FileNotFoundError(
                         f"Expected ACPYPE output was not created: {required_name}"
                     )
+            # ACPYPE omits the atomic-number column from its custom atom types.
+            # Classical GROMACS runs tolerate that, but NNPot then receives -1
+            # instead of the ligand elements. Repair the staged ITP before both
+            # its flat and diagnostic copies are published.
+            repair_ligand_atomic_numbers_best_effort(
+                os.path.join(ligand_dir, f'{ligand_output_file_name}_GMX.itp'))
             ligand_posre_file_name = f'posre_{ligand_output_file_name}.itp'
             ligand_posre_source = os.path.join(ligand_dir, ligand_posre_file_name)
             ligand_posre_destination = os.path.join(
@@ -1506,7 +1536,8 @@ def on_generate_ions_tpr_file(working_directory_path: str, input_file_name: str,
         parameter_path, topology_path = _validate_grompp_inputs(
             working_directory_path, parameter_file_name,
             input_topology_file_name, force_field)
-        compatibility_warning = _custom_force_field_warning(topology_path)
+        compatibility_warning = _mdp_compatibility_warning(
+            parameter_path, topology_path)
         cmd = [
             "gmx", "grompp",
             "-f", parameter_path,
@@ -1670,7 +1701,8 @@ def on_generate_energy_minimization_tpr_file(working_directory_path: str, input_
         parameter_path, topology_path = _validate_grompp_inputs(
             working_directory_path, parameter_file_name,
             input_topology_file_name, force_field)
-        compatibility_warning = _custom_force_field_warning(topology_path)
+        compatibility_warning = _mdp_compatibility_warning(
+            parameter_path, topology_path)
         cmd = [
             "gmx", "grompp",
             "-f", parameter_path,
@@ -1773,7 +1805,8 @@ def on_generate_nvt_equilibration_tpr_file(working_directory_path: str, input_fi
         parameter_path, topology_path = _validate_grompp_inputs(
             working_directory_path, parameter_file_name,
             input_topology_file_name, force_field)
-        compatibility_warning = _custom_force_field_warning(topology_path)
+        compatibility_warning = _mdp_compatibility_warning(
+            parameter_path, topology_path)
         cmd = [
             "gmx", "grompp",
             "-f", parameter_path,
@@ -2003,7 +2036,8 @@ def on_generate_npt_equilibration_tpr_file(working_directory_path: str, input_fi
         parameter_path, topology_path = _validate_grompp_inputs(
             working_directory_path, parameter_file_name,
             input_topology_file_name, force_field)
-        compatibility_warning = _custom_force_field_warning(topology_path)
+        compatibility_warning = _mdp_compatibility_warning(
+            parameter_path, topology_path)
         cmd = [
             "gmx", "grompp",
             "-f", parameter_path,
@@ -2113,16 +2147,37 @@ def on_run_npt_equilibration(working_directory_path: str, run_input_file_name: s
 
         return get_files_in_working_directory(working_directory_path), f"<span style='color:red;'>{status}</span>", process_state, gr.update(value="Start", variant="primary")
 
-def on_toggle_nnpot(nnpot_active: bool, nnpot_model_name: str = "ani2x") -> str:
-    """Acknowledge the neural-network potential choice in the status line."""
+def on_toggle_nnpot(nnpot_active: bool, nnpot_model_name: str = "ani2x",
+                    current_time_step: float = 0.002) -> tuple[str, GradioUpdate]:
+    """Acknowledge NNPot and keep its unconstrained timestep scientifically safe."""
+    try:
+        current_time_step = float(current_time_step)
+        if not math.isfinite(current_time_step) or current_time_step <= 0:
+            raise ValueError("Time step must be finite and positive.")
+    except (TypeError, ValueError):
+        current_time_step = MAX_NNPOT_TIME_STEP_PS if nnpot_active else 0.002
+    minimum_time_step = MIN_NNPOT_TIME_STEP_PS if nnpot_active else 0.001
+    maximum_time_step = (MAX_NNPOT_TIME_STEP_PS if nnpot_active
+                         else MAX_STANDARD_TIME_STEP_PS)
+    time_step_update = gr.update(
+        minimum=minimum_time_step,
+        maximum=maximum_time_step,
+        step=(0.0001 if nnpot_active else 0.001),
+        value=max(minimum_time_step,
+                  min(current_time_step, maximum_time_step)),
+        label=("Time Step (ps; NNP, unconstrained)" if nnpot_active
+               else "Time Step (ps; no HMR)"),
+    )
     if not nnpot_active:
-        return ""
+        return "", time_step_update
     unavailable_reason = get_nnpot_unavailable_reason(nnpot_model_name)
     if unavailable_reason is not None:
         safe_reason = html.escape(unavailable_reason).replace("\n", "<br>")
-        return f"<span style='color:red;'>{safe_reason}</span>"
-    return ("<span style='color:green;'>Machine learning potential enabled. "
-            "The selected model will be built when you generate the production MD parameter file.</span>")
+        return f"<span style='color:red;'>{safe_reason}</span>", time_step_update
+    return (("<span style='color:green;'>Machine learning potential enabled. "
+             "The selected model will be built when you generate the production "
+             "MD parameter file. NNP bonds are unconstrained, so the time step "
+             "is limited to 1 fs.</span>"), time_step_update)
 
 def on_change_mdp_type(prod_md_mdp_type_radio: str) -> tuple[GradioUpdate, str]:
     """Switch the production MDP between an initial run and a continuation."""
@@ -2138,6 +2193,13 @@ def on_generate_prod_md_mdp_file(working_directory_path: str, time_scale: float,
     """Write the production MD MDP, building the neural potential if requested."""
     try:
         time_step = _validate_standard_time_step(time_step)
+        if (nnpot_active
+                and time_step > MAX_NNPOT_TIME_STEP_PS + 1.0e-12):
+            raise ValueError(
+                "NNPot production requires a time step no larger than "
+                f"{MAX_NNPOT_TIME_STEP_PS:g} ps (1 fs) because learned-region "
+                "bonds are unconstrained."
+            )
     except Exception as exc:
         status = "Error generating production MD parameter file!\n" + str(exc)
         return get_files_in_working_directory(working_directory_path), "<span style='color:red;'>" + status + "</span>"
@@ -2147,18 +2209,24 @@ def on_generate_prod_md_mdp_file(working_directory_path: str, time_scale: float,
 
     # Build (or reuse) the requested NNPot model via the universal wrapper and
     # collect the matching nnpot-model-input* keywords before writing the MDP.
-    nnpot_modelfile_path = None
+    shared_nnpot_model_path = None
     if nnpot_active:
         try:
-            nnpot_modelfile_path = download_nnpot_model(nnpot_model_name)
+            shared_nnpot_model_path = download_nnpot_model(nnpot_model_name)
         except Exception as exc:
             status = "Error generating NNPot model!\n" + str(exc)
             return get_files_in_working_directory(working_directory_path), "<span style='color:red;'>" + status + "</span>"
 
     try:
-        file_content = get_default_prod_md_mdp_file_content(time_scale_ps=time_scale*1000, time_step_ps=time_step, temperature=temperature, pressure=pressure, mdp_type=mdp_type, random_seed=random_seed, with_ligand=True, nnpot_active=nnpot_active, nnpot_modelfile_path=nnpot_modelfile_path, nnpot_input_group=nnpot_input_group, nnpot_model_name=nnpot_model_name, force_field=force_field)
         file_path = os.path.join(working_directory_path, parameter_file_name)
         with reserve_working_directory_maintenance(working_directory_path):
+            nnpot_modelfile_path = None
+            if nnpot_active:
+                assert shared_nnpot_model_path is not None
+                nnpot_modelfile_path = snapshot_nnpot_model_for_job(
+                    working_directory_path, nnpot_model_name,
+                    shared_nnpot_model_path)
+            file_content = get_default_prod_md_mdp_file_content(time_scale_ps=time_scale*1000, time_step_ps=time_step, temperature=temperature, pressure=pressure, mdp_type=mdp_type, random_seed=random_seed, with_ligand=True, nnpot_active=nnpot_active, nnpot_modelfile_path=nnpot_modelfile_path, nnpot_input_group=nnpot_input_group, nnpot_model_name=nnpot_model_name, force_field=force_field)
             atomic_write_text_file(file_path, file_content)
         status = "Production MD parameter file generated successfully."
     except Exception as exc:
@@ -2167,17 +2235,31 @@ def on_generate_prod_md_mdp_file(working_directory_path: str, time_scale: float,
     
     return get_files_in_working_directory(working_directory_path), "<span style='color:green;'>" + status + "</span>"
 
-def on_generate_prod_md_tpr_file(working_directory_path: str, input_file_name: str, input_topology_file_name: str,
-                                 parameter_file_name: str, run_input_file_name: str,
-                                 max_warnings: int,
-                                 force_field: str | None = None) -> tuple[list[str], str]:
+def _on_generate_prod_md_tpr_file_reserved(
+        working_directory_path: str, input_file_name: str,
+        input_topology_file_name: str, parameter_file_name: str,
+        run_input_file_name: str, max_warnings: int,
+        force_field: str | None = None,
+        use_gpu: bool | None = None) -> tuple[list[str], str]:
     """Run grompp to build the production MD run input file."""
     try:
         max_warnings = _normalise_max_warnings(max_warnings)
         parameter_path, topology_path = _validate_grompp_inputs(
             working_directory_path, parameter_file_name,
             input_topology_file_name, force_field)
-        compatibility_warning = _custom_force_field_warning(topology_path)
+        nnpot_environment = None
+        nnpot_active = mdp_uses_nnpot(parameter_path)
+        if nnpot_active:
+            if use_gpu is None:
+                use_gpu = is_gromacs_cuda_gpu_available()
+            model_file = read_mdp_option(parameter_path, "nnpot-modelfile")
+            exporter_version = get_nnpot_model_exporter_torch_version(
+                working_directory_path, model_file)
+            nnpot_environment = get_nnpot_mdrun_environment(
+                bool(use_gpu), exporter_torch_version=exporter_version,
+                check_torch_version=exporter_version is not None)
+        compatibility_warning = _mdp_compatibility_warning(
+            parameter_path, topology_path)
         cmd = [
             "gmx", "grompp",
             "-f", parameter_path,
@@ -2193,11 +2275,27 @@ def on_generate_prod_md_tpr_file(working_directory_path: str, input_file_name: s
         if checkpoint_path is not None:
             cmd.extend(["-t", checkpoint_path])
 
+        validated_nnpot_charge = None
+        if nnpot_active:
+            validated_nnpot_charge = validate_nnpot_input_group_charge(
+                working_directory_path,
+                parameter_path,
+                os.path.join(working_directory_path, input_file_name),
+                topology_path,
+                checkpoint_path,
+                max_warnings,
+            )
+
         print(f"Running command: {' '.join(cmd)}")
 
         gromos_warning = run_grompp_with_gromos_warning_policy(
             cmd, working_directory_path, topology_path, max_warnings,
-            runner=run_checked_command)
+            runner=run_checked_command, environment=nnpot_environment)
+        if nnpot_active:
+            assert validated_nnpot_charge is not None
+            record_nnpot_tpr_charge_attestation(
+                working_directory_path, run_input_file_name,
+                parameter_path, validated_nnpot_charge)
         continuation_warning = " ".join(
             warning for warning in (compatibility_warning, gromos_warning)
             if warning) or None
@@ -2219,6 +2317,26 @@ def on_generate_prod_md_tpr_file(working_directory_path: str, input_file_name: s
         
     return get_files_in_working_directory(working_directory_path), f"<span style='color:{color};'>" + status + "</span>"
 
+
+def on_generate_prod_md_tpr_file(
+        working_directory_path: str, input_file_name: str,
+        input_topology_file_name: str, parameter_file_name: str,
+        run_input_file_name: str, max_warnings: int,
+        force_field: str | None = None,
+        use_gpu: bool | None = None) -> tuple[list[str], str]:
+    """Build a production TPR from one immutable snapshot of the job inputs."""
+    try:
+        with reserve_working_directory_maintenance(working_directory_path):
+            files, status = _on_generate_prod_md_tpr_file_reserved(
+                working_directory_path, input_file_name,
+                input_topology_file_name, parameter_file_name,
+                run_input_file_name, max_warnings, force_field, use_gpu)
+        return files, status
+    except Exception as exc:
+        status = "Error generating production MD run input file!\n" + str(exc)
+        return (get_files_in_working_directory(working_directory_path),
+                "<span style='color:red;'>" + status + "</span>")
+
 def on_run_prod_md(working_directory_path: str, run_input_file_name: str, mpi_rank: int, omp_threads: int,
                    prod_md_nnpot_active: bool, use_gpu: bool,
                    process_state: ProcessStateDict) -> tuple[Any, ...]:
@@ -2239,11 +2357,16 @@ def on_run_prod_md(working_directory_path: str, run_input_file_name: str, mpi_ra
     proc = None
     job_key = None
     try:
-        if prod_md_nnpot_active:
-            mpi_rank = 1
-        mpi_rank, omp_threads = _validate_mdrun_resources(
-            mpi_rank, omp_threads)
+        working_directory_path = validate_working_directory(
+            working_directory_path)
+        run_input_file_name = validate_file_name(
+            run_input_file_name, "production run input file")
+        if not isinstance(run_input_file_name, str):
+            raise ValueError("Select a production .tpr run input file.")
         base_name = os.path.splitext(run_input_file_name)[0]
+        # Own the directory before inspecting the TPR.  Otherwise another
+        # session could replace it after validation but before Popen and make
+        # the launch use a different NNPot/classical configuration.
         job_key, claimed, active_proc = _claim_process_output(
             working_directory_path, base_name, process_state, "Production MD",
             f"See {base_name}.log for details.")
@@ -2258,6 +2381,15 @@ def on_run_prod_md(working_directory_path: str, run_input_file_name: str, mpi_ra
                 button = gr.update(value="Start", variant="primary")
             return (get_files_in_working_directory(working_directory_path),
                     f"<span style='color:orange;'>{status}</span>", process_state, button)
+        nnpot_launch_metadata: dict[str, str | None] = {}
+        prod_md_nnpot_active = resolve_nnpot_launch_state(
+            working_directory_path, run_input_file_name,
+            prod_md_nnpot_active,
+            launch_metadata=nnpot_launch_metadata)
+        if prod_md_nnpot_active:
+            mpi_rank = 1
+        mpi_rank, omp_threads = _validate_mdrun_resources(
+            mpi_rank, omp_threads)
         resource_status = reserve_process_resources(
             job_key, mpi_rank, omp_threads, use_gpu)
         # -deffnm also changes mdrun's optional -cpi default, so omitting -cpi
@@ -2296,8 +2428,19 @@ def on_run_prod_md(working_directory_path: str, run_input_file_name: str, mpi_ra
 
             print(f"Running command: {' '.join(cmd)}")
 
+            child_environment = (
+                get_nnpot_mdrun_environment(
+                    use_gpu,
+                    exporter_torch_version=nnpot_launch_metadata.get(
+                        "exporter_torch_version"),
+                    check_torch_version=bool(nnpot_launch_metadata),
+                )
+                if prod_md_nnpot_active
+                else None
+            )
             proc = subprocess.Popen(cmd, cwd=working_directory_path, text=True,
-                                    start_new_session=True)
+                                    start_new_session=True,
+                                    env=child_environment)
         _activate_process(proc, process_state, job_key, "Production MD",
                           working_directory_path, f"See {base_name}.log for details.")
 
@@ -2332,15 +2475,15 @@ def on_continue_prod_md(working_directory_path: str, run_input_file_name: str, c
     proc = None
     job_key = None
     try:
-        if prod_md_nnpot_active:
-            mpi_rank = 1
-        mpi_rank, omp_threads = _validate_mdrun_resources(
-            mpi_rank, omp_threads)
-        run_input_file_name, checkpoint_file_name = require_matching_resume_files(
-            working_directory_path, run_input_file_name, checkpoint_file_name)
+        working_directory_path = validate_working_directory(
+            working_directory_path)
+        run_input_file_name = validate_file_name(
+            run_input_file_name, "production run input file")
+        if not isinstance(run_input_file_name, str):
+            raise ValueError("Select a production .tpr run input file.")
         base_name = os.path.splitext(run_input_file_name)[0]
-        # Initial and continuation runs share this key: both write the same
-        # trajectory, log and checkpoint under ``-deffnm <base_name>``.
+        # Reserve before checking either file so their validated contents
+        # remain the files that the eventual mdrun command will consume.
         job_key, claimed, active_proc = _claim_process_output(
             working_directory_path, base_name, process_state, "Production MD",
             f"See {base_name}.log for details.")
@@ -2355,6 +2498,17 @@ def on_continue_prod_md(working_directory_path: str, run_input_file_name: str, c
                 button = gr.update(value="Start", variant="primary")
             return (get_files_in_working_directory(working_directory_path),
                     f"<span style='color:orange;'>{status}</span>", process_state, button)
+        run_input_file_name, checkpoint_file_name = require_matching_resume_files(
+            working_directory_path, run_input_file_name, checkpoint_file_name)
+        nnpot_launch_metadata: dict[str, str | None] = {}
+        prod_md_nnpot_active = resolve_nnpot_launch_state(
+            working_directory_path, run_input_file_name,
+            prod_md_nnpot_active,
+            launch_metadata=nnpot_launch_metadata)
+        if prod_md_nnpot_active:
+            mpi_rank = 1
+        mpi_rank, omp_threads = _validate_mdrun_resources(
+            mpi_rank, omp_threads)
         resource_status = reserve_process_resources(
             job_key, mpi_rank, omp_threads, use_gpu)
         cmd = [
@@ -2385,8 +2539,19 @@ def on_continue_prod_md(working_directory_path: str, run_input_file_name: str, c
 
         print(f"Running command: {' '.join(cmd)}")
 
+        child_environment = (
+            get_nnpot_mdrun_environment(
+                use_gpu,
+                exporter_torch_version=nnpot_launch_metadata.get(
+                    "exporter_torch_version"),
+                check_torch_version=bool(nnpot_launch_metadata),
+            )
+            if prod_md_nnpot_active
+            else None
+        )
         proc = subprocess.Popen(cmd, cwd=working_directory_path, text=True,
-                                start_new_session=True)
+                                start_new_session=True,
+                                env=child_environment)
         _activate_process(proc, process_state, job_key, "Production MD",
                           working_directory_path, f"See {base_name}.log for details.")
 
@@ -3573,7 +3738,8 @@ guard_working_directory_reads(globals(), (
     "on_analyze_rmsf", "on_analyze_sasa", "on_analyze_gyrate", "on_run_pca",
     "on_analyze_free_energy_landscape", "on_load_mmpbsa_results",
 ))
-secure_module_callbacks(globals())
+secure_module_callbacks(
+    globals(), working_directory_root=WORKFLOW_DATA_ROOT)
 
 
 def protein_ligand_complex_md_simulation_tab_content() -> None:
@@ -4197,10 +4363,10 @@ def protein_ligand_complex_md_simulation_tab_content() -> None:
 
     # Production MD interaction
     prod_md_mdp_type_radio.change(on_change_mdp_type, prod_md_mdp_type_radio, [prod_md_random_seed_textbox, prod_md_parameter_file_name_textbox])
-    prod_md_nnpot_active_checkbox.change(on_toggle_nnpot, [prod_md_nnpot_active_checkbox, prod_md_nnpot_model_dropdown], status_markdown)
-    prod_md_nnpot_model_dropdown.change(on_toggle_nnpot, [prod_md_nnpot_active_checkbox, prod_md_nnpot_model_dropdown], status_markdown)
+    prod_md_nnpot_active_checkbox.change(on_toggle_nnpot, [prod_md_nnpot_active_checkbox, prod_md_nnpot_model_dropdown, prod_md_time_step_slider], [status_markdown, prod_md_time_step_slider])
+    prod_md_nnpot_model_dropdown.change(on_toggle_nnpot, [prod_md_nnpot_active_checkbox, prod_md_nnpot_model_dropdown, prod_md_time_step_slider], [status_markdown, prod_md_time_step_slider])
     prod_md_parameter_file_button.click(on_generate_prod_md_mdp_file, [working_directory_path_state, prod_md_time_scale_slider, prod_md_time_step_slider, prod_md_temperature_slider, prod_md_pressure_slider, prod_md_mdp_type_radio, prod_md_random_seed_textbox, prod_md_parameter_file_name_textbox, prod_md_nnpot_active_checkbox, prod_md_nnpot_model_dropdown, prod_md_nnpot_input_group_textbox, protein_force_field_dropdown], [working_directory_file_list_state, status_markdown])
-    prod_md_run_input_file_button.click(on_generate_prod_md_tpr_file, [working_directory_path_state, prod_md_input_file_name_dropdown, prod_md_input_topology_file_name_dropdown, prod_md_parameter_file_dropdown, prod_md_run_input_file_name_textbox, max_warns_slider, protein_force_field_dropdown], [working_directory_file_list_state, status_markdown])
+    prod_md_run_input_file_button.click(on_generate_prod_md_tpr_file, [working_directory_path_state, prod_md_input_file_name_dropdown, prod_md_input_topology_file_name_dropdown, prod_md_parameter_file_dropdown, prod_md_run_input_file_name_textbox, max_warns_slider, protein_force_field_dropdown, use_gpu], [working_directory_file_list_state, status_markdown])
     prod_run_event = run_prod_md_button.click(on_run_prod_md, [working_directory_path_state, prod_md_run_input_file_dropdown, mpi_rank_slider, omp_threads_slider, prod_md_nnpot_active_checkbox, use_gpu, prod_md_initial_process_state], [working_directory_file_list_state, status_markdown, prod_md_initial_process_state, run_prod_md_button])
     prod_run_event.then(_process_timer_update, prod_md_initial_process_state,
                         prod_md_timer, queue=False)

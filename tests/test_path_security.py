@@ -73,6 +73,35 @@ class PathSecurityTests(unittest.TestCase):
             secured(str(path_security.DATA_ROOT / "job"), "../../outside")
         self.assertFalse(called)
 
+    def test_callback_can_be_confined_to_one_workflow_data_root(self):
+        protein_root = path_security.DATA_ROOT / "protein_md"
+        complex_root = path_security.DATA_ROOT / "protein_ligand_complex_md"
+        protein_job = protein_root / "protein_job"
+        complex_job = complex_root / "complex_job"
+        protein_job.mkdir(parents=True, exist_ok=True)
+        complex_job.mkdir(parents=True, exist_ok=True)
+        self.addCleanup(protein_job.rmdir)
+        self.addCleanup(complex_job.rmdir)
+
+        def callback(working_directory_path):
+            return working_directory_path
+
+        secured = path_security.secure_working_directory_callback(
+            callback, working_directory_root=protein_root)
+        self.assertEqual(secured(str(protein_job)), str(protein_job.resolve()))
+        with self.assertRaisesRegex(ValueError, "protein_md workflow"):
+            secured(str(complex_job))
+        with self.assertRaises(ValueError):
+            secured(str(protein_root))
+
+    def test_callback_workflow_root_must_itself_stay_inside_data(self):
+        def callback(working_directory_path):
+            return working_directory_path
+
+        with self.assertRaisesRegex(ValueError, "must stay inside ./data"):
+            path_security.secure_working_directory_callback(
+                callback, working_directory_root="/tmp")
+
     def test_static_asset_names_are_safe_and_unique_per_render(self):
         path_security.DATA_ROOT.mkdir(exist_ok=True)
         with tempfile.TemporaryDirectory(dir=path_security.DATA_ROOT) as directory:

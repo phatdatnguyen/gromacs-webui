@@ -91,6 +91,42 @@ class RunInputTests(WorkingDirectoryTestCase):
         self.assertIn("successfully", self.plain_text(status))
         self.assertIn("em.tpr", files)
 
+    def test_amber_dispcorr_no_builds_a_real_run_input_with_a_warning(self):
+        workflow.on_generate_energy_minimization_mdp_file(
+            self.working_directory_path, "em-no-tail.mdp", "AMBER99SB-ILDN")
+        mdp_path = self.path("em-no-tail.mdp")
+        with open(mdp_path) as handle:
+            content = handle.read()
+        with open(mdp_path, "w") as handle:
+            handle.write(content.replace(
+                "DispCorr        = EnerPres", "DispCorr        = no"))
+
+        files, status = workflow.on_generate_energy_minimization_tpr_file(
+            self.working_directory_path, "boxed.gro", "topology.top",
+            "em-no-tail.mdp", "em-no-tail.tpr", 0, "AMBER99SB-ILDN")
+
+        self.assertIn("em-no-tail.tpr", files)
+        self.assertIn("color:orange", status)
+        self.assertIn("DispCorr=no", self.plain_text(status))
+
+    def test_amber_cutoff_electrostatics_builds_a_real_run_input_with_a_warning(self):
+        workflow.on_generate_energy_minimization_mdp_file(
+            self.working_directory_path, "em-cutoff.mdp", "AMBER99SB-ILDN")
+        mdp_path = self.path("em-cutoff.mdp")
+        with open(mdp_path) as handle:
+            content = handle.read()
+        with open(mdp_path, "w") as handle:
+            handle.write(content.replace(
+                "coulombtype     = PME", "coulombtype     = Cut-off"))
+
+        files, status = workflow.on_generate_energy_minimization_tpr_file(
+            self.working_directory_path, "boxed.gro", "topology.top",
+            "em-cutoff.mdp", "em-cutoff.tpr", 0, "AMBER99SB-ILDN")
+
+        self.assertIn("em-cutoff.tpr", files)
+        self.assertIn("color:orange", status)
+        self.assertIn("coulombtype=Cut-off", self.plain_text(status))
+
     def test_restrained_nvt_run_input_builds(self):
         """define = -DPOSRES only works if grompp can resolve the posre include."""
         workflow.on_generate_nvt_equilibration_mdp_file(self.working_directory_path, 1, 0.002, 300,

@@ -34,7 +34,8 @@ UNK_LIGAND_PDB = textwrap.dedent("""\
 class WorkingDirectoryCallbackTests(WorkingDirectoryTestCase):
     def test_opening_a_directory_creates_it_and_enables_the_actions(self):
         result = workflow.on_open_working_directory("_unittest_new_job")
-        self.addCleanup(lambda: os.rmdir(os.path.join("data", "_unittest_new_job")))
+        created_path = workflow.PROTEIN_MD_DATA_ROOT / "_unittest_new_job"
+        self.addCleanup(lambda: created_path.exists() and created_path.rmdir())
 
         self.assertEqual(len(result), 5)
         dropdown, path, files, clean_button, upload = result
@@ -55,18 +56,21 @@ class WorkingDirectoryCallbackTests(WorkingDirectoryTestCase):
 
     def test_existing_file_cannot_be_opened_as_a_job_directory(self):
         name = "_unittest_job_name_is_a_file"
-        path = os.path.join("data", name)
-        with open(path, "w", encoding="utf-8") as handle:
-            handle.write("not a directory")
-        self.addCleanup(lambda: os.path.exists(path) and os.remove(path))
-
-        for module, output_count in ((workflow, 5), (complex_workflow, 6)):
-            with self.subTest(module=module.__name__), \
-                    unittest.mock.patch.object(module.gr, "Warning") as warning:
-                self.assertEqual(
-                    module.on_open_working_directory(name),
-                    (None,) * output_count)
-                warning.assert_called_once()
+        cases = (
+            (workflow, workflow.PROTEIN_MD_DATA_ROOT, 5),
+            (complex_workflow, complex_workflow.WORKFLOW_DATA_ROOT, 6),
+        )
+        for module, workflow_root, output_count in cases:
+            with self.subTest(module=module.__name__):
+                workflow_root.mkdir(parents=True, exist_ok=True)
+                path = workflow_root / name
+                path.write_text("not a directory", encoding="utf-8")
+                self.addCleanup(lambda target=path: target.exists() and target.unlink())
+                with unittest.mock.patch.object(module.gr, "Warning") as warning:
+                    self.assertEqual(
+                        module.on_open_working_directory(name),
+                        (None,) * output_count)
+                    warning.assert_called_once()
 
     def test_file_listing_hides_backups_and_zone_identifiers(self):
         for name in ("keep.gro", "#backup.gro.1#", "note.txt:Zone.Identifier"):
@@ -80,11 +84,8 @@ class WorkingDirectoryCallbackTests(WorkingDirectoryTestCase):
         self.assertNotIn("subdir", files)
         self.assertFalse([name for name in files if name.endswith("Zone.Identifier")])
 
-    def test_both_tabs_hide_exactly_the_same_files(self):
-        """A job directory is browsable from either tab, so the two listings have
-        to agree. They drifted once: only the complex tab hid the MM-PBSA scratch
-        files, so the same job showed 109 files in one tab and 80 in the other.
-        """
+    def test_both_workflows_apply_the_same_file_visibility_rules(self):
+        """Shared file filtering must not drift between the independent tabs."""
         for name in ("protein.gro", "topol.top", "FINAL_RESULTS_MMPBSA.dat",
                      "_GMXMMPBSA_COM.pdb", "_GMXMMPBSA_LIG.prmtop",
                      "#backup.gro.1#", "notes.txt:Zone.Identifier"):
@@ -115,11 +116,19 @@ class WorkingDirectoryCallbackTests(WorkingDirectoryTestCase):
                 self.assertEqual(files, ["alpha.top", "Bravo.mdp", "charlie.tpr", "zulu.gro"])
 
     def test_working_directories_are_sorted_by_name(self):
-        for module in (workflow, complex_workflow):
-            with self.subTest(module=module.__name__):
+        cases = (
+            (workflow, workflow.PROTEIN_MD_DATA_ROOT),
+            (complex_workflow, complex_workflow.WORKFLOW_DATA_ROOT),
+        )
+        for module, workflow_root in cases:
+            workflow_root.mkdir(parents=True, exist_ok=True)
+            with self.subTest(module=module.__name__), \
+                    tempfile.TemporaryDirectory(
+                        prefix="_unittest_picker_", dir=workflow_root
+                    ) as directory:
                 directories = module.get_working_directories()
                 self.assertEqual(directories, sorted(directories, key=str.lower))
-                self.assertIn(self.working_directory_name, directories)
+                self.assertIn(os.path.basename(directory), directories)
 
 
 class FileActionTests(WorkingDirectoryTestCase):
@@ -325,14 +334,30 @@ class AsyncProcessHandlerTests(WorkingDirectoryTestCase):
                 key = utils.get_process_job_key(self.working_directory_path, "md")
                 self.addCleanup(utils.release_process_job, key, proc)
 
+                preflight_name = (
+                    "require_classical_tpr" if module is workflow
+                    else "resolve_nnpot_launch_state")
                 with unittest.mock.patch.object(module, "subprocess") as fake_subprocess, \
+                        unittest.mock.patch.object(
+                            module, preflight_name,
+                            return_value=False), \
                         unittest.mock.patch.object(module, "threading"):
                     fake_subprocess.Popen.return_value = proc
-                    module.on_run_prod_md(self.working_directory_path, "md.tpr", 1, 1,
-                                          False, False, initial_state)
-                    _, status, returned_state, button = module.on_continue_prod_md(
-                        self.working_directory_path, "md.tpr", "md.cpt", 1, 1,
-                        False, False, continuation_state)
+                    if module is workflow:
+                        module.on_run_prod_md(
+                            self.working_directory_path, "md.tpr", 1, 1,
+                            False, initial_state)
+                        result = module.on_continue_prod_md(
+                            self.working_directory_path, "md.tpr", "md.cpt", 1,
+                            1, False, continuation_state)
+                    else:
+                        module.on_run_prod_md(
+                            self.working_directory_path, "md.tpr", 1, 1,
+                            False, False, initial_state)
+                        result = module.on_continue_prod_md(
+                            self.working_directory_path, "md.tpr", "md.cpt", 1,
+                            1, False, False, continuation_state)
+                    _, status, returned_state, button = result
 
                 fake_subprocess.Popen.assert_called_once()
                 self.assertIs(returned_state["proc"], proc)
@@ -401,8 +426,8 @@ class MdpCallbackTests(WorkingDirectoryTestCase):
             (workflow, "on_generate_npt_equilibration_mdp_file",
              (100, 0.003, 300, 1.0, "unsafe_npt.mdp", "AMBER99SB-ILDN")),
             (workflow, "on_generate_prod_md_mdp_file",
-             (1, 0.003, 300, 1.0, "Initial", 0, "unsafe_md.mdp", False,
-              "ani2x", "Protein", "AMBER99SB-ILDN")),
+             (1, 0.003, 300, 1.0, "Initial", 0, "unsafe_md.mdp",
+              "AMBER99SB-ILDN")),
             (complex_workflow, "on_generate_nvt_equilibration_mdp_file",
              (100, 0.003, 300, "unsafe_complex_nvt.mdp", "AMBER99SB-ILDN")),
             (complex_workflow, "on_generate_npt_equilibration_mdp_file",
@@ -457,6 +482,56 @@ class WorkflowSafetyContractTests(WorkingDirectoryTestCase):
                 self.assertIn("color:orange", status)
                 self.assertIn("Expert override", self.plain_text(status))
                 self.assertIn("2 warning", self.plain_text(status))
+
+    def test_amber_dispcorr_no_reaches_every_grompp_handler_with_warning(self):
+        """DispCorr=no is an expert choice, not a preprocessing failure."""
+        with open(self.path("topol.top"), "w") as handle:
+            handle.write('#include "amber99sb-ildn.ff/forcefield.itp"\n')
+        with open(self.path("step.mdp"), "w") as handle:
+            handle.write(
+                "integrator = steep\ncutoff-scheme = Verlet\n"
+                "rlist = 1.0\nrvdw = 1.0\nrcoulomb = 1.0\n"
+                "coulombtype = PME\nDispCorr = no\n")
+
+        for module in (workflow, complex_workflow):
+            for handler_name in self.GROMPP_HANDLERS:
+                with self.subTest(module=module.__name__, handler=handler_name), \
+                        unittest.mock.patch.object(
+                            module, "run_checked_command") as run:
+                    _, status = getattr(module, handler_name)(
+                        self.working_directory_path,
+                        *self.tpr_arguments(
+                            max_warnings=0, force_field="AMBER99SB-ILDN"))
+
+                run.assert_called_once()
+                self.assertIn("color:orange", status)
+                plain_status = self.plain_text(status)
+                self.assertIn("generated successfully", plain_status)
+                self.assertIn("DispCorr=no", plain_status)
+                self.assertIn("allowed by explicit user choice", plain_status)
+
+    def test_protein_production_rejects_an_nnpot_mdp_before_grompp(self):
+        with open(self.path("topol.top"), "w") as handle:
+            handle.write('#include "amber99sb-ildn.ff/forcefield.itp"\n')
+        with open(self.path("step.mdp"), "w") as handle:
+            handle.write(
+                "integrator = md\ndt = 0.001\ncutoff-scheme = Verlet\n"
+                "rlist = 1.0\nrvdw = 1.0\nrcoulomb = 1.0\n"
+                "coulombtype = PME\nDispCorr = EnerPres\n"
+                "nnpot-active = true\n")
+
+        with unittest.mock.patch.object(
+                workflow, "run_checked_command") as run:
+            _, status = workflow.on_generate_prod_md_tpr_file(
+                self.working_directory_path, "input.gro", "topol.top",
+                "step.mdp", "step.tpr", 0, "AMBER99SB-ILDN")
+
+        run.assert_not_called()
+        self.assertIn("color:red", status)
+        plain_status = self.plain_text(status)
+        self.assertIn("only in the Protein-Ligand Complex workflow", plain_status)
+        self.assertNotIn("step.tpr", workflow.get_files_in_working_directory(
+            self.working_directory_path))
 
     def test_ion_grompp_accepts_the_normal_charge_warning_with_default_value(self):
         """Ion placement necessarily preprocesses the still-charged system."""
@@ -907,8 +982,11 @@ class ShippedSafetyDefaultsTests(unittest.TestCase):
             if getattr(handler.fn, "__name__", "") not in expected:
                 continue
             found.append((handler.fn.__module__, handler.fn.__name__))
-            self.assertIn(getattr(handler.inputs[-1], "label", None),
-                          ("Force Field",))
+            self.assertIn(
+                "Force Field",
+                [getattr(component, "label", None)
+                 for component in handler.inputs],
+            )
         self.assertEqual(len(found), len(expected) * 2)
 
     def test_add_ions_is_wired_to_the_max_warnings_slider(self):
@@ -1319,7 +1397,7 @@ class LigandUploadTests(WorkingDirectoryTestCase):
         self.assertNotIn("renamed", self.plain_text(status))
 
     def test_a_ligand_with_an_empty_residue_field_is_named_lig(self):
-        """The regression that made data/3BAJ_5a unanalysable.
+        """The regression that made the 3BAJ_5a complex job unanalysable.
 
         Real ligand PDBs come with columns 18-20 blank. Those records were being
         skipped by the guard that leaves a bare "TER" alone, so the file reached
@@ -1395,6 +1473,42 @@ class LigandTopologyGenerationTests(WorkingDirectoryTestCase):
         self.assertIn("successfully", self.plain_text(status))
         with open(self.path("posre_drug.itp")) as handle:
             self.assertIn("[ position_restraints ]", handle.read())
+
+    def test_acpype_ligand_atomtypes_are_published_with_atomic_numbers(self):
+        ligand_itp = textwrap.dedent("""\
+            ; generated by acpype
+            [ atomtypes ]
+            c3 c3 0.00000 0.00000 A 0.339967 0.457730
+
+            [ moleculetype ]
+            Drug_X 3
+
+            [ atoms ]
+            1 c3 1 LIG C1 1 0.0 12.011
+            """)
+
+        def fake_acpype(_cmd, cwd):
+            ligand_directory = os.path.join(cwd, "drug.acpype")
+            os.makedirs(ligand_directory)
+            with open(os.path.join(ligand_directory, "drug_GMX.gro"), "w") as handle:
+                handle.write("Ligand\n1\n    1LIG     C1    1   0.0 0.0 0.0\n1 1 1\n")
+            with open(os.path.join(ligand_directory, "drug_GMX.itp"), "w") as handle:
+                handle.write(ligand_itp)
+
+        with unittest.mock.patch.object(
+            complex_workflow, "run_checked_command", side_effect=fake_acpype
+        ):
+            _, status = complex_workflow.on_generate_ligand_topology(
+                self.working_directory_path, "drug.pdb", "drug", 0, "bcc", "gaff2"
+            )
+
+        self.assertIn("successfully", self.plain_text(status))
+        for path in (
+            self.path("drug_GMX.itp"),
+            os.path.join(self.path("drug.acpype"), "drug_GMX.itp"),
+        ):
+            with self.subTest(path=path), open(path) as handle:
+                self.assertRegex(handle.read(), r"(?m)^c3\s+c3\s+6\s+0\.00000")
 
 
 class IonValidationWarningPolicyTests(WorkingDirectoryTestCase):
@@ -1829,6 +1943,52 @@ class EnergyMinimizationHardwareTests(WorkingDirectoryTestCase):
                         self.assertEqual(cmd[cmd.index(task) + 1], "cpu")
 
 
+class NNPotUiTests(unittest.TestCase):
+    def test_timestep_slider_update_is_valid_in_both_modes(self):
+        for active, expected in (
+                (True, (0.0001, 0.001, 0.001, 0.0001)),
+                (False, (0.001, 0.002, 0.002, 0.001))):
+            with self.subTest(active=active), unittest.mock.patch.object(
+                    complex_workflow, "get_nnpot_unavailable_reason",
+                    return_value=None):
+                _, update = complex_workflow.on_toggle_nnpot(
+                    active, "ani2x", 0.002)
+
+            values = (
+                update["minimum"], update["maximum"],
+                update["value"], update["step"])
+            self.assertEqual(values, expected)
+            self.assertLess(update["minimum"], update["maximum"])
+            # Gradio rejects degenerate ranges at component construction; this
+            # catches update payloads that would fail in the browser.
+            complex_workflow.gr.Slider(
+                minimum=update["minimum"], maximum=update["maximum"],
+                value=update["value"], step=update["step"])
+
+    def test_protein_workflow_has_no_positive_nnpot_api_or_controls(self):
+        import inspect
+        import gradio as gr
+        import webui
+
+        self.assertNotIn("on_toggle_nnpot", workflow.__dict__)
+        for handler_name in (
+                "on_generate_prod_md_mdp_file", "on_generate_prod_md_tpr_file",
+                "on_run_prod_md", "on_continue_prod_md"):
+            parameters = inspect.signature(
+                getattr(workflow, handler_name)).parameters
+            self.assertFalse(
+                [name for name in parameters if "nnpot" in name.lower()],
+                f"{handler_name} still exposes NNPot inputs")
+
+        nnpot_checkboxes = [
+            block for block in webui.blocks.blocks.values()
+            if isinstance(block, gr.Checkbox)
+            and getattr(block, "label", None)
+            == "Use Machine Learning Potential (NNPot)"
+        ]
+        self.assertEqual(len(nnpot_checkboxes), 1)
+
+
 class ResourceValidationTests(WorkingDirectoryTestCase):
     """Slider bounds are presentation only; callbacks must distrust API input."""
 
@@ -1855,12 +2015,33 @@ class ResourceValidationTests(WorkingDirectoryTestCase):
                 self.working_directory_path, "md.tpr", mpi_rank, omp_threads,
                 False, state)
         if handler_name == "on_run_prod_md":
+            preflight_name = (
+                "require_classical_tpr" if module is workflow
+                else "resolve_nnpot_launch_state")
+            with unittest.mock.patch.object(
+                    module, preflight_name, return_value=nnpot):
+                if module is workflow:
+                    return handler(
+                        self.working_directory_path, "md.tpr", mpi_rank,
+                        omp_threads, False, state)
+                return handler(
+                    self.working_directory_path, "md.tpr", mpi_rank, omp_threads,
+                    nnpot, False, state)
+        for name in ("md.tpr", "md.cpt"):
+            with open(self.path(name), "ab"):
+                pass
+        preflight_name = (
+            "require_classical_tpr" if module is workflow
+            else "resolve_nnpot_launch_state")
+        with unittest.mock.patch.object(
+                module, preflight_name, return_value=nnpot):
+            if module is workflow:
+                return handler(
+                    self.working_directory_path, "md.tpr", "md.cpt", mpi_rank,
+                    omp_threads, False, state)
             return handler(
-                self.working_directory_path, "md.tpr", mpi_rank, omp_threads,
-                nnpot, False, state)
-        return handler(
-            self.working_directory_path, "md.tpr", "md.cpt", mpi_rank,
-            omp_threads, nnpot, False, state)
+                self.working_directory_path, "md.tpr", "md.cpt", mpi_rank,
+                omp_threads, nnpot, False, state)
 
     def test_every_mdrun_callback_rejects_nonpositive_resources_before_launch(self):
         for module in (workflow, complex_workflow):
@@ -1909,18 +2090,18 @@ class ResourceValidationTests(WorkingDirectoryTestCase):
                     module._validate_mdrun_resources(2, 3)
 
     def test_nnpot_forces_one_rank_before_resource_validation(self):
-        for module in (workflow, complex_workflow):
-            for handler_name in ("on_run_prod_md", "on_continue_prod_md"):
-                with self.subTest(module=module.__name__, handler=handler_name), \
-                        unittest.mock.patch.object(
-                            module, "_validate_mdrun_resources",
-                            side_effect=ValueError("validation sentinel")) as validate, \
-                        unittest.mock.patch.object(module, "subprocess") as process:
-                    result = self.invoke(
-                        module, handler_name, 10**9, 1, nnpot=True)
-                validate.assert_called_once_with(1, 1)
-                process.Popen.assert_not_called()
-                self.assertIn("validation sentinel", self.plain_text(result[1]))
+        for handler_name in ("on_run_prod_md", "on_continue_prod_md"):
+            with self.subTest(handler=handler_name), \
+                    unittest.mock.patch.object(
+                        complex_workflow, "_validate_mdrun_resources",
+                        side_effect=ValueError("validation sentinel")) as validate, \
+                    unittest.mock.patch.object(
+                        complex_workflow, "subprocess") as process:
+                result = self.invoke(
+                    complex_workflow, handler_name, 10**9, 1, nnpot=True)
+            validate.assert_called_once_with(1, 1)
+            process.Popen.assert_not_called()
+            self.assertIn("validation sentinel", self.plain_text(result[1]))
 
 
 class GpuCheckboxTests(WorkingDirectoryTestCase):
@@ -1929,7 +2110,8 @@ class GpuCheckboxTests(WorkingDirectoryTestCase):
     RUN_HANDLERS = ("on_run_nvt_equilibration", "on_run_npt_equilibration",
                     "on_run_prod_md", "on_continue_prod_md")
 
-    def launch(self, module, handler_name, use_gpu, nnpot=False, mpi_rank=1):
+    def launch(self, module, handler_name, use_gpu, nnpot=False, mpi_rank=1,
+               tpr_nnpot=None):
         import inspect
         handler = getattr(module, handler_name)
         arguments = {}
@@ -1958,9 +2140,19 @@ class GpuCheckboxTests(WorkingDirectoryTestCase):
                 with open(self.path(name), "wb") as handle:
                     handle.write(b"test")
 
+        if tpr_nnpot is None:
+            tpr_nnpot = nnpot
+        preflight_name = (
+            "require_classical_tpr" if module is workflow
+            else "resolve_nnpot_launch_state")
+        preflight_result = None if module is workflow else tpr_nnpot
         with unittest.mock.patch.object(module, "subprocess") as fake_subprocess, \
+                unittest.mock.patch.object(
+                    module, preflight_name,
+                    return_value=preflight_result), \
                 unittest.mock.patch.object(module, "threading"):
             handler(**arguments)
+            self.last_launch_kwargs = fake_subprocess.Popen.call_args.kwargs
             return fake_subprocess.Popen.call_args.args[0]
 
     def assertTaskAssignment(self, cmd, task, hardware):
@@ -1996,17 +2188,102 @@ class GpuCheckboxTests(WorkingDirectoryTestCase):
 
     def test_a_neural_network_run_is_left_on_auto_when_the_box_is_ticked(self):
         """Its own offload set is unsafe here, but the model still wants the GPU."""
-        for module in (workflow, complex_workflow):
-            with self.subTest(module=module.__name__):
-                cmd = self.launch(module, "on_run_prod_md", use_gpu=True, nnpot=True)
-                self.assertNotIn("-nb", cmd)
-                self.assertNotIn("-pme", cmd)
+        cmd = self.launch(
+            complex_workflow, "on_run_prod_md", use_gpu=True, nnpot=True)
+        self.assertNotIn("-nb", cmd)
+        self.assertNotIn("-pme", cmd)
 
     def test_a_neural_network_run_still_honours_an_unticked_box(self):
-        for module in (workflow, complex_workflow):
-            with self.subTest(module=module.__name__):
-                cmd = self.launch(module, "on_run_prod_md", use_gpu=False, nnpot=True)
-                self.assertTaskAssignment(cmd, "-nb", "cpu")
+        cmd = self.launch(
+            complex_workflow, "on_run_prod_md", use_gpu=False, nnpot=True)
+        self.assertTaskAssignment(cmd, "-nb", "cpu")
+
+    def test_neural_network_child_environment_honours_gpu_checkbox(self):
+        for handler_name in ("on_run_prod_md", "on_continue_prod_md"):
+            for use_gpu, expected_device in ((True, "gpu"), (False, "cpu")):
+                with self.subTest(handler=handler_name, use_gpu=use_gpu):
+                    self.launch(
+                        complex_workflow, handler_name, use_gpu=use_gpu,
+                        nnpot=True)
+                    environment = self.last_launch_kwargs["env"]
+                    self.assertIsInstance(environment, dict)
+                    self.assertEqual(
+                        environment["GMX_NN_DEVICE"], expected_device)
+
+    def test_tpr_nnpot_state_overrides_an_unchecked_stale_checkbox(self):
+        for handler_name in ("on_run_prod_md", "on_continue_prod_md"):
+            with self.subTest(handler=handler_name):
+                cmd = self.launch(
+                    complex_workflow, handler_name, use_gpu=True, nnpot=False,
+                    mpi_rank=4, tpr_nnpot=True)
+                self.assertEqual(cmd[cmd.index("-ntmpi") + 1], "1")
+                self.assertEqual(
+                    self.last_launch_kwargs["env"]["GMX_NN_DEVICE"], "gpu")
+
+    def test_non_nnpot_tpr_overrides_a_checked_stale_checkbox(self):
+        for handler_name in ("on_run_prod_md", "on_continue_prod_md"):
+            with self.subTest(handler=handler_name):
+                cmd = self.launch(
+                    complex_workflow, handler_name, use_gpu=True, nnpot=True,
+                    tpr_nnpot=False)
+                self.assertTaskAssignment(cmd, "-nb", "gpu")
+                self.assertIsNone(self.last_launch_kwargs["env"])
+
+    def test_an_unsafe_legacy_tpr_is_rejected_before_mdrun(self):
+        for handler_name in ("on_run_prod_md", "on_continue_prod_md"):
+            if handler_name == "on_continue_prod_md":
+                for name in ("md.tpr", "md.cpt"):
+                    with open(self.path(name), "ab"):
+                        pass
+            state = utils.ProcessStateDict()
+            arguments = [self.working_directory_path, "md.tpr"]
+            if handler_name == "on_continue_prod_md":
+                arguments.append("md.cpt")
+            arguments.extend((1, 1, False, True, state))
+            with self.subTest(handler=handler_name), \
+                    unittest.mock.patch.object(
+                        complex_workflow, "resolve_nnpot_launch_state",
+                        side_effect=RuntimeError("unsafe legacy NNPot TPR")), \
+                    unittest.mock.patch.object(
+                        complex_workflow, "subprocess") as process:
+                result = getattr(complex_workflow, handler_name)(*arguments)
+
+            process.Popen.assert_not_called()
+            self.assertIn("unsafe legacy NNPot TPR", self.plain_text(result[1]))
+            self.assertFalse(state["running"])
+
+    def test_protein_workflow_rejects_an_nnpot_tpr_before_mdrun(self):
+        for name in ("md.tpr", "md.cpt"):
+            with open(self.path(name), "wb") as handle:
+                handle.write(b"test")
+        nnpot_dump = (
+            "inputrec:\n"
+            "  nnpot:\n"
+            "    active = true\n"
+            "    modelfile = custom-model.pt\n")
+
+        for handler_name in ("on_run_prod_md", "on_continue_prod_md"):
+            state = utils.ProcessStateDict()
+            arguments = [self.working_directory_path, "md.tpr"]
+            if handler_name == "on_continue_prod_md":
+                arguments.append("md.cpt")
+            arguments.extend((1, 1, True, state))
+            with self.subTest(handler=handler_name), \
+                    unittest.mock.patch.object(
+                        utils, "run_checked_command",
+                        return_value=subprocess.CompletedProcess(
+                            ["gmx", "dump"], 0, stdout=nnpot_dump,
+                            stderr="")) as inspect_tpr, \
+                    unittest.mock.patch.object(
+                        workflow, "subprocess") as process:
+                result = getattr(workflow, handler_name)(*arguments)
+
+            inspect_tpr.assert_called_once()
+            self.assertEqual(inspect_tpr.call_args.args[0][:3], [
+                "gmx", "dump", "-s"])
+            process.Popen.assert_not_called()
+            self.assertIn("not supported", self.plain_text(result[1]))
+            self.assertFalse(state["running"])
 
 
 class MdrunWorkingDirectoryTests(WorkingDirectoryTestCase):
@@ -2043,8 +2320,17 @@ class MdrunWorkingDirectoryTests(WorkingDirectoryTestCase):
                 with open(self.path(name), "wb") as handle:
                     handle.write(b"test")
 
+        preflight_name = (
+            "require_classical_tpr" if module is workflow
+            else "resolve_nnpot_launch_state")
+        preflight_result = (
+            None if module is workflow
+            else bool(arguments.get("prod_md_nnpot_active")))
         with unittest.mock.patch.object(module, "subprocess") as fake_subprocess, \
                 unittest.mock.patch.object(module, "run_checked_command") as run, \
+                unittest.mock.patch.object(
+                    module, preflight_name,
+                    return_value=preflight_result), \
                 unittest.mock.patch.object(module, "threading"):
             handler(**arguments)
             if run.called:

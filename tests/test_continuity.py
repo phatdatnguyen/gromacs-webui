@@ -19,6 +19,13 @@ class MdpContinuityTests(WorkingDirectoryTestCase):
         # narrowly scoped compatibility allowance.
         with open(self.path("topol.top"), "w") as handle:
             handle.write('#include "amber99sb-ildn.ff/forcefield.itp"\n')
+        # Production grompp now inspects the validated MDP to decide whether
+        # the NNPot-specific environment and charge preflight are required.
+        # Keep this continuity fixture explicitly classical.
+        with open(self.path("md.mdp"), "w") as handle:
+            handle.write("integrator = md\nnnpot-active = no\n")
+        with open(self.path("npt.mdp"), "w") as handle:
+            handle.write("integrator = md\nDispCorr = EnerPres\n")
 
     def test_only_nvt_generates_fresh_velocities(self):
         nvt = utils.get_default_nvt_equilibration_mdp_file_content()
@@ -120,9 +127,15 @@ class ProductionResumeTests(WorkingDirectoryTestCase):
         for module in (protein_workflow, complex_workflow):
             with self.subTest(module=module.__name__), \
                     unittest.mock.patch.object(module, "subprocess") as subprocess_module:
-                _, status, state, button = module.on_continue_prod_md(
-                    self.working_directory_path, "md.tpr", "other.cpt",
-                    1, 1, False, False, utils.ProcessStateDict())
+                if module is protein_workflow:
+                    result = module.on_continue_prod_md(
+                        self.working_directory_path, "md.tpr", "other.cpt",
+                        1, 1, False, utils.ProcessStateDict())
+                else:
+                    result = module.on_continue_prod_md(
+                        self.working_directory_path, "md.tpr", "other.cpt",
+                        1, 1, False, False, utils.ProcessStateDict())
+                _, status, state, button = result
 
             subprocess_module.Popen.assert_not_called()
             self.assertIn("does not match", self.plain_text(status))

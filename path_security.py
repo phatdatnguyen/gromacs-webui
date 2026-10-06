@@ -25,6 +25,13 @@ import pandas as pd
 
 PROJECT_ROOT: Path = Path(__file__).resolve().parent
 DATA_ROOT: Path = (PROJECT_ROOT / "data").resolve()
+PROTEIN_MD_DATA_ROOT: Path = (DATA_ROOT / "protein_md").resolve()
+PROTEIN_LIGAND_COMPLEX_MD_DATA_ROOT: Path = (
+    DATA_ROOT / "protein_ligand_complex_md").resolve()
+WORKFLOW_DATA_ROOTS = frozenset({
+    PROTEIN_MD_DATA_ROOT,
+    PROTEIN_LIGAND_COMPLEX_MD_DATA_ROOT,
+})
 STATIC_ROOT: Path = (PROJECT_ROOT / "static").resolve()
 MODEL_ROOT: Path = (PROJECT_ROOT / "models").resolve()
 
@@ -513,18 +520,50 @@ def atomic_replace_editable_text_file(
             os.unlink(temporary_path)
 
 
-def secure_working_directory_callback(callback: Callable[..., Any]) -> Callable[..., Any]:
-    """Validate path-like callback arguments before any filesystem operation."""
+def secure_working_directory_callback(
+        callback: Callable[..., Any],
+        working_directory_root: str | os.PathLike[str] | None = None,
+) -> Callable[..., Any]:
+    """Validate path-like callback arguments before any filesystem operation.
+
+    ``working_directory_root`` narrows a workflow's callbacks to direct job
+    descendants of its own data directory.  The ordinary filesystem helpers
+    intentionally continue to accept any location below :data:`DATA_ROOT`,
+    because they are shared by both workflows; the callback boundary is where
+    client-controlled state must be kept in the selected workflow.
+    """
     signature = inspect.signature(callback)
     if "working_directory_path" not in signature.parameters:
         return callback
 
+    allowed_root: Path | None = None
+    if working_directory_root is not None:
+        allowed_root = Path(working_directory_root).resolve()
+        if allowed_root != DATA_ROOT and DATA_ROOT not in allowed_root.parents:
+            raise ValueError(
+                "A callback working-directory root must stay inside ./data/."
+            )
+
     def validated(args: Any, kwargs: Any) -> inspect.BoundArguments:
         """Validate the client-supplied paths and return the bound arguments."""
         bound = signature.bind(*args, **kwargs)
-        bound.arguments["working_directory_path"] = validate_working_directory(
-            bound.arguments["working_directory_path"]
-        )
+        validated_directory = validate_working_directory(
+            bound.arguments["working_directory_path"])
+        if allowed_root is not None:
+            resolved_directory = Path(validated_directory)
+            # A job is a direct child of its workflow container.  Direct jobs
+            # under the historical top-level data directory remain accepted as
+            # a compatibility bridge for callers/tests that predate the split,
+            # but the two reserved workflow containers are never themselves a
+            # job and one workflow can never enter the other's subtree.
+            if (resolved_directory in WORKFLOW_DATA_ROOTS
+                    or resolved_directory.parent not in {
+                        allowed_root, DATA_ROOT}):
+                raise ValueError(
+                    "Invalid working directory: path must stay inside the "
+                    f"{allowed_root.name} workflow data directory."
+                )
+        bound.arguments["working_directory_path"] = validated_directory
         local_paths: dict[str, str] = {}
         extension_contracts = CALLBACK_FILE_EXTENSION_CONTRACTS.get(
             callback.__name__, {})
@@ -597,8 +636,12 @@ def secure_working_directory_callback(callback: Callable[..., Any]) -> Callable[
     return secured
 
 
-def secure_module_callbacks(namespace: MutableMapping[str, Any]) -> None:
-    """Wrap all already-defined UI callbacks that receive a working directory."""
+def secure_module_callbacks(
+        namespace: MutableMapping[str, Any],
+        working_directory_root: str | os.PathLike[str] | None = None,
+) -> None:
+    """Wrap UI callbacks, optionally confining them to one workflow root."""
     for name, callback in list(namespace.items()):
         if name.startswith("on_") and callable(callback):
-            namespace[name] = secure_working_directory_callback(callback)
+            namespace[name] = secure_working_directory_callback(
+                callback, working_directory_root=working_directory_root)
