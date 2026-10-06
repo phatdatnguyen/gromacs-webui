@@ -253,7 +253,8 @@ class NNPotSnapshotTests(unittest.TestCase):
         digest = hashlib.sha256(b"tpr").hexdigest()
         directory = Path(self.job.name) / utils.NNPOT_TPR_ATTESTATION_DIRECTORY
         directory.mkdir(mode=0o700)
-        manifest_path = directory / f"{digest}.json"
+        manifest_path = directory / utils._nnpot_tpr_attestation_artifact_name(
+            digest, ".json")
         manifest_path.write_text(json.dumps({
             "schema_version": utils.NNPOT_TPR_ATTESTATION_SCHEMA_VERSION,
             "tpr_sha256": digest,
@@ -265,6 +266,88 @@ class NNPotSnapshotTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "does not prove.*neutral"):
             utils.verify_nnpot_tpr_charge_attestation(
                 self.job.name, "md.tpr", "Protein")
+
+    def test_managed_tpr_attestation_snapshots_the_exact_nnpot_index(self):
+        tpr_path = Path(self.job.name) / "md.tpr"
+        tpr_path.write_bytes(b"managed nnpot tpr")
+        parameter_path = Path(self.job.name) / "md.mdp"
+        parameter_path.write_text(
+            "nnpot-active = true\nnnpot-input-group = nnpot\n",
+            encoding="utf-8")
+        working_index = Path(self.job.name) / utils.NNPOT_INDEX_FILE_NAME
+        original_index = "[ System ]\n1 2\n[ nnpot ]\n1 2\n"
+        working_index.write_text(original_index, encoding="utf-8")
+
+        manifest_path = Path(utils.record_nnpot_tpr_charge_attestation(
+            self.job.name, "md.tpr", str(parameter_path), 0.0,
+            index_file_path=str(working_index)))
+        snapshot_path = Path(utils.get_nnpot_tpr_index_snapshot_path(
+            self.job.name, "md.tpr", utils.NNPOT_INPUT_GROUP_NAME))
+
+        self.assertEqual(snapshot_path.read_text(encoding="utf-8"), original_index)
+        self.assertEqual(snapshot_path.stat().st_mode & 0o777, 0o400)
+        metadata = json.loads(manifest_path.read_text(encoding="utf-8"))
+        self.assertEqual(
+            metadata["index_sha256"], hashlib.sha256(
+                original_index.encode("utf-8")).hexdigest())
+        self.assertEqual(metadata["index_snapshot"], snapshot_path.name)
+
+        working_index.write_text(
+            "[ System ]\n1 2\n[ nnpot ]\n2\n", encoding="utf-8")
+        self.assertEqual(
+            Path(utils.get_nnpot_tpr_index_snapshot_path(
+                self.job.name, "md.tpr", utils.NNPOT_INPUT_GROUP_NAME)),
+            snapshot_path)
+        self.assertEqual(snapshot_path.read_text(encoding="utf-8"), original_index)
+
+    def test_managed_tpr_attestation_rejects_a_modified_index_snapshot(self):
+        tpr_path = Path(self.job.name) / "md.tpr"
+        tpr_path.write_bytes(b"managed nnpot tpr")
+        parameter_path = Path(self.job.name) / "md.mdp"
+        parameter_path.write_text(
+            "nnpot-active = true\nnnpot-input-group = nnpot\n",
+            encoding="utf-8")
+        working_index = Path(self.job.name) / utils.NNPOT_INDEX_FILE_NAME
+        working_index.write_text(
+            "[ System ]\n1 2\n[ nnpot ]\n1 2\n", encoding="utf-8")
+        utils.record_nnpot_tpr_charge_attestation(
+            self.job.name, "md.tpr", str(parameter_path), 0.0,
+            index_file_path=str(working_index))
+        snapshot_path = Path(utils.get_nnpot_tpr_index_snapshot_path(
+            self.job.name, "md.tpr", utils.NNPOT_INPUT_GROUP_NAME))
+        snapshot_path.chmod(0o600)
+        snapshot_path.write_text("[ nnpot ]\n2\n", encoding="utf-8")
+
+        with self.assertRaisesRegex(RuntimeError, "snapshot.*changed"):
+            utils.get_nnpot_tpr_index_snapshot_path(
+                self.job.name, "md.tpr", utils.NNPOT_INPUT_GROUP_NAME)
+
+    def test_identical_tpr_reuses_attested_equivalent_index_snapshot(self):
+        tpr_path = Path(self.job.name) / "md.tpr"
+        tpr_path.write_bytes(b"identical managed nnpot tpr")
+        parameter_path = Path(self.job.name) / "md.mdp"
+        parameter_path.write_text(
+            "nnpot-active = true\nnnpot-input-group = nnpot\n",
+            encoding="utf-8")
+        working_index = Path(self.job.name) / utils.NNPOT_INDEX_FILE_NAME
+        original_index = "[ System ]\n1 2\n[ nnpot ]\n1 2\n"
+        working_index.write_text(original_index, encoding="utf-8")
+        first_manifest = Path(utils.record_nnpot_tpr_charge_attestation(
+            self.job.name, "md.tpr", str(parameter_path), 0.0,
+            index_file_path=str(working_index)))
+        snapshot_path = Path(utils.get_nnpot_tpr_index_snapshot_path(
+            self.job.name, "md.tpr", utils.NNPOT_INPUT_GROUP_NAME))
+        original_snapshot_inode = snapshot_path.stat().st_ino
+
+        working_index.write_text(
+            original_index + "[ unused ]\n2\n", encoding="utf-8")
+        second_manifest = Path(utils.record_nnpot_tpr_charge_attestation(
+            self.job.name, "md.tpr", str(parameter_path), 0.0,
+            index_file_path=str(working_index)))
+
+        self.assertEqual(second_manifest, first_manifest)
+        self.assertEqual(snapshot_path.stat().st_ino, original_snapshot_inode)
+        self.assertEqual(snapshot_path.read_text(encoding="utf-8"), original_index)
 
     def test_tpr_charge_attestation_rejects_a_different_input_group(self):
         tpr_path = Path(self.job.name) / "md.tpr"
@@ -284,15 +367,26 @@ class NNPotSnapshotTests(unittest.TestCase):
         job = tempfile.TemporaryDirectory(
             prefix="nnpot_handler_", dir=DATA_ROOT)
         self.addCleanup(job.cleanup)
+        (Path(job.name) / "complex.gro").write_text(
+            "placeholder structure\n", encoding="utf-8")
+
+        def write_index(_structure, output, _choice, _directory):
+            Path(output).write_text(
+                "[ System ]\n1 2\n[ nnpot ]\n1 2\n", encoding="utf-8")
+            return 2, 0
+
         package_patch, gromacs_patch = self.provenance()
         with mock.patch.object(
                 complex_workflow, "download_nnpot_model",
                 return_value=str(self.model_path)), \
+                mock.patch.object(
+                    complex_workflow, "generate_nnpot_index_file",
+                    side_effect=write_index), \
                 package_patch, gromacs_patch:
             _, status = complex_workflow.on_generate_prod_md_mdp_file(
                 job.name, 1, 0.001, 300, 1.0, "Initial", -1,
-                "md.mdp", True, "ani2x", "Protein",
-                "AMBER99SB-ILDN")
+                "md.mdp", True, "ani2x", "Ligand",
+                "AMBER99SB-ILDN", "complex.gro")
 
         self.assertIn("successfully", status)
         content = (Path(job.name) / "md.mdp").read_text(

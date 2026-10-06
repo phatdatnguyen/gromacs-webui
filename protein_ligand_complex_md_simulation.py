@@ -2189,7 +2189,8 @@ def on_change_mdp_type(prod_md_mdp_type_radio: str) -> tuple[GradioUpdate, str]:
 def on_generate_prod_md_mdp_file(working_directory_path: str, time_scale: float, time_step: float,
                                  temperature: float, pressure: float, mdp_type: str, random_seed: int,
                                  parameter_file_name: str, nnpot_active: bool, nnpot_model_name: str,
-                                 nnpot_input_group: str, force_field: str) -> tuple[list[str], str]:
+                                 nnpot_input_group: str, force_field: str,
+                                 input_structure_file_name: str | None = None) -> tuple[list[str], str]:
     """Write the production MD MDP, building the neural potential if requested."""
     try:
         time_step = _validate_standard_time_step(time_step)
@@ -2207,6 +2208,36 @@ def on_generate_prod_md_mdp_file(working_directory_path: str, time_scale: float,
     if parameter_file_name is None or str(parameter_file_name).strip() == "":
         parameter_file_name = "md_initial.mdp" if mdp_type == "Initial" else "md_continue.mdp"
 
+    input_structure_path = None
+    if nnpot_active:
+        try:
+            if nnpot_input_group not in NNPOT_INDEX_REGION_CHOICES:
+                raise ValueError(
+                    "Choose either Ligand or Ligand and binding residues for "
+                    "the NNPot input region."
+                )
+            input_structure_file_name = validate_file_name(
+                input_structure_file_name, "input structure file name")
+            if input_structure_file_name is None:
+                raise ValueError(
+                    "Select the production input .pdb or .gro structure before "
+                    "generating an NNPot parameter file."
+                )
+            input_structure_path = os.path.join(
+                working_directory_path, input_structure_file_name)
+            if (os.path.islink(input_structure_path)
+                    or not os.path.isfile(input_structure_path)
+                    or os.path.dirname(os.path.realpath(input_structure_path))
+                    != os.path.realpath(working_directory_path)):
+                raise ValueError(
+                    f"Selected production input structure "
+                    f"'{input_structure_file_name}' is not a regular file in "
+                    "this working directory."
+                )
+        except Exception as exc:
+            status = "Error generating production MD parameter file!\n" + str(exc)
+            return get_files_in_working_directory(working_directory_path), "<span style='color:red;'>" + status + "</span>"
+
     # Build (or reuse) the requested NNPot model via the universal wrapper and
     # collect the matching nnpot-model-input* keywords before writing the MDP.
     shared_nnpot_model_path = None
@@ -2223,12 +2254,71 @@ def on_generate_prod_md_mdp_file(working_directory_path: str, time_scale: float,
             nnpot_modelfile_path = None
             if nnpot_active:
                 assert shared_nnpot_model_path is not None
+                assert input_structure_path is not None
+                # Recheck the selected snapshot after waiting for the job's
+                # maintenance reservation.  The index and MDP must describe
+                # the same immutable choice presented to this callback.
+                if (os.path.islink(input_structure_path)
+                        or not os.path.isfile(input_structure_path)
+                        or os.path.dirname(os.path.realpath(input_structure_path))
+                        != os.path.realpath(working_directory_path)):
+                    raise ValueError(
+                        "The selected production input structure is no longer "
+                        "a regular file in this working directory."
+                    )
                 nnpot_modelfile_path = snapshot_nnpot_model_for_job(
                     working_directory_path, nnpot_model_name,
                     shared_nnpot_model_path)
-            file_content = get_default_prod_md_mdp_file_content(time_scale_ps=time_scale*1000, time_step_ps=time_step, temperature=temperature, pressure=pressure, mdp_type=mdp_type, random_seed=random_seed, with_ligand=True, nnpot_active=nnpot_active, nnpot_modelfile_path=nnpot_modelfile_path, nnpot_input_group=nnpot_input_group, nnpot_model_name=nnpot_model_name, force_field=force_field)
-            atomic_write_text_file(file_path, file_content)
-        status = "Production MD parameter file generated successfully."
+            file_content = get_default_prod_md_mdp_file_content(time_scale_ps=time_scale*1000, time_step_ps=time_step, temperature=temperature, pressure=pressure, mdp_type=mdp_type, random_seed=random_seed, with_ligand=True, nnpot_active=nnpot_active, nnpot_modelfile_path=nnpot_modelfile_path, nnpot_input_group=(NNPOT_INPUT_GROUP_NAME if nnpot_active else nnpot_input_group), nnpot_model_name=nnpot_model_name, force_field=force_field)
+            if nnpot_active:
+                index_file_name = get_nnpot_index_file_name(parameter_file_name)
+                index_file_path = os.path.join(
+                    working_directory_path, index_file_name)
+                staged_paths: list[str] = []
+                try:
+                    parameter_descriptor, staged_parameter_path = tempfile.mkstemp(
+                        prefix=".nnpot_mdp_stage_", suffix=".mdp",
+                        dir=working_directory_path)
+                    os.close(parameter_descriptor)
+                    staged_paths.append(staged_parameter_path)
+                    index_descriptor, staged_index_path = tempfile.mkstemp(
+                        prefix=".nnpot_index_stage_", suffix=".ndx",
+                        dir=working_directory_path)
+                    os.close(index_descriptor)
+                    staged_paths.append(staged_index_path)
+                    atom_count, binding_residue_count = generate_nnpot_index_file(
+                        input_structure_path, staged_index_path,
+                        nnpot_input_group, working_directory_path)
+                    bound_file_content = bind_nnpot_index_to_mdp_content(
+                        file_content, staged_index_path)
+                    atomic_write_text_file(
+                        staged_parameter_path, bound_file_content)
+                    _publish_staged_files([
+                        (staged_parameter_path, file_path),
+                        (staged_index_path, index_file_path),
+                    ])
+                finally:
+                    for staged_path in staged_paths:
+                        try:
+                            os.remove(staged_path)
+                        except FileNotFoundError:
+                            pass
+                status = (
+                    f"Production MD parameter file {parameter_file_name} and "
+                    f"NNPot index file {index_file_name} generated successfully. "
+                    f"Group '{NNPOT_INPUT_GROUP_NAME}' contains {atom_count} atoms."
+                )
+                if nnpot_input_group == "Ligand and binding residues":
+                    status += (
+                        f" It includes the ligand and {binding_residue_count} "
+                        "complete protein binding-site residues within "
+                        f"{NNPOT_BINDING_RESIDUE_CUTOFF_NM:g} nm."
+                    )
+                else:
+                    status += " It includes ligand atoms only."
+            else:
+                atomic_write_text_file(file_path, file_content)
+                status = "Production MD parameter file generated successfully."
     except Exception as exc:
         status = "Error generating production MD parameter file!\n" + str(exc)
         return get_files_in_working_directory(working_directory_path), "<span style='color:red;'>" + status + "</span>"
@@ -2249,7 +2339,36 @@ def _on_generate_prod_md_tpr_file_reserved(
             input_topology_file_name, force_field)
         nnpot_environment = None
         nnpot_active = mdp_uses_nnpot(parameter_path)
+        nnpot_index_path = None
         if nnpot_active:
+            input_group = read_mdp_option(
+                parameter_path, "nnpot-input-group")
+            if input_group != NNPOT_INPUT_GROUP_NAME:
+                raise ValueError(
+                    "NNPot production MDP files must use "
+                    f"nnpot-input-group = {NNPOT_INPUT_GROUP_NAME}. Regenerate "
+                    "the production parameter file to create its matching index."
+                )
+            nnpot_index_file_name = get_nnpot_index_file_name(
+                parameter_file_name)
+            nnpot_index_path = os.path.join(
+                working_directory_path, nnpot_index_file_name)
+            if (os.path.islink(nnpot_index_path)
+                    or not os.path.isfile(nnpot_index_path)
+                    or os.path.dirname(os.path.realpath(nnpot_index_path))
+                    != os.path.realpath(working_directory_path)):
+                raise ValueError(
+                    f"Matching NNPot index file '{nnpot_index_file_name}' is "
+                    "missing or is not a regular file. Regenerate the production "
+                    "parameter file."
+                )
+            validate_nnpot_index_for_structure(
+                nnpot_index_path,
+                os.path.join(working_directory_path, input_file_name),
+                working_directory_path,
+            )
+            validate_nnpot_index_matches_mdp(
+                parameter_path, nnpot_index_path)
             if use_gpu is None:
                 use_gpu = is_gromacs_cuda_gpu_available()
             model_file = read_mdp_option(parameter_path, "nnpot-modelfile")
@@ -2274,6 +2393,9 @@ def _on_generate_prod_md_tpr_file_reserved(
         checkpoint_path = get_matching_checkpoint_path(working_directory_path, input_file_name)
         if checkpoint_path is not None:
             cmd.extend(["-t", checkpoint_path])
+        if nnpot_active:
+            assert nnpot_index_path is not None
+            cmd.extend(["-n", nnpot_index_path])
 
         validated_nnpot_charge = None
         if nnpot_active:
@@ -2284,6 +2406,7 @@ def _on_generate_prod_md_tpr_file_reserved(
                 topology_path,
                 checkpoint_path,
                 max_warnings,
+                index_file_path=nnpot_index_path,
             )
 
         print(f"Running command: {' '.join(cmd)}")
@@ -2295,7 +2418,8 @@ def _on_generate_prod_md_tpr_file_reserved(
             assert validated_nnpot_charge is not None
             record_nnpot_tpr_charge_attestation(
                 working_directory_path, run_input_file_name,
-                parameter_path, validated_nnpot_charge)
+                parameter_path, validated_nnpot_charge,
+                index_file_path=nnpot_index_path)
         continuation_warning = " ".join(
             warning for warning in (compatibility_warning, gromos_warning)
             if warning) or None
@@ -4019,7 +4143,16 @@ def protein_ligand_complex_md_simulation_tab_content() -> None:
                                     with gr.Row():
                                         prod_md_nnpot_active_checkbox = gr.Checkbox(label="Use Machine Learning Potential (NNPot)", value=False)
                                         prod_md_nnpot_model_dropdown = gr.Dropdown(label="Model", choices=list(SUPPORTED_NNPOT_MODELS), value="ani2x")
-                                        prod_md_nnpot_input_group_textbox = gr.Textbox(label="NNPot Input Group", value="Protein")
+                                        prod_md_nnpot_input_group_dropdown = gr.Dropdown(
+                                            label="NNPot Input Group",
+                                            choices=list(NNPOT_INDEX_REGION_CHOICES),
+                                            value="Ligand",
+                                            info=("Binding residues include complete protein "
+                                                  "residues within "
+                                                  f"{NNPOT_BINDING_RESIDUE_CUTOFF_NM:g} nm of "
+                                                  "the ligand in the selected production input "
+                                                  "structure below."),
+                                        )
                                 with gr.Column():
                                     prod_md_mdp_type_radio = gr.Radio(label="Initial or continuation", choices=["Initial", "Continuation"], value="Initial")
                                     prod_md_random_seed_textbox = gr.Textbox(label="Random seed", value="0", visible=False)
@@ -4365,7 +4498,7 @@ def protein_ligand_complex_md_simulation_tab_content() -> None:
     prod_md_mdp_type_radio.change(on_change_mdp_type, prod_md_mdp_type_radio, [prod_md_random_seed_textbox, prod_md_parameter_file_name_textbox])
     prod_md_nnpot_active_checkbox.change(on_toggle_nnpot, [prod_md_nnpot_active_checkbox, prod_md_nnpot_model_dropdown, prod_md_time_step_slider], [status_markdown, prod_md_time_step_slider])
     prod_md_nnpot_model_dropdown.change(on_toggle_nnpot, [prod_md_nnpot_active_checkbox, prod_md_nnpot_model_dropdown, prod_md_time_step_slider], [status_markdown, prod_md_time_step_slider])
-    prod_md_parameter_file_button.click(on_generate_prod_md_mdp_file, [working_directory_path_state, prod_md_time_scale_slider, prod_md_time_step_slider, prod_md_temperature_slider, prod_md_pressure_slider, prod_md_mdp_type_radio, prod_md_random_seed_textbox, prod_md_parameter_file_name_textbox, prod_md_nnpot_active_checkbox, prod_md_nnpot_model_dropdown, prod_md_nnpot_input_group_textbox, protein_force_field_dropdown], [working_directory_file_list_state, status_markdown])
+    prod_md_parameter_file_button.click(on_generate_prod_md_mdp_file, [working_directory_path_state, prod_md_time_scale_slider, prod_md_time_step_slider, prod_md_temperature_slider, prod_md_pressure_slider, prod_md_mdp_type_radio, prod_md_random_seed_textbox, prod_md_parameter_file_name_textbox, prod_md_nnpot_active_checkbox, prod_md_nnpot_model_dropdown, prod_md_nnpot_input_group_dropdown, protein_force_field_dropdown, prod_md_input_file_name_dropdown], [working_directory_file_list_state, status_markdown])
     prod_md_run_input_file_button.click(on_generate_prod_md_tpr_file, [working_directory_path_state, prod_md_input_file_name_dropdown, prod_md_input_topology_file_name_dropdown, prod_md_parameter_file_dropdown, prod_md_run_input_file_name_textbox, max_warns_slider, protein_force_field_dropdown, use_gpu], [working_directory_file_list_state, status_markdown])
     prod_run_event = run_prod_md_button.click(on_run_prod_md, [working_directory_path_state, prod_md_run_input_file_dropdown, mpi_rank_slider, omp_threads_slider, prod_md_nnpot_active_checkbox, use_gpu, prod_md_initial_process_state], [working_directory_file_list_state, status_markdown, prod_md_initial_process_state, run_prod_md_button])
     prod_run_event.then(_process_timer_update, prod_md_initial_process_state,

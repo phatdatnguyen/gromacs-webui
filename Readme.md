@@ -69,11 +69,21 @@ modifies it and rejects charged groups, including for ANI2x-EMLE. MACE-OFF uses
 GROMACS' periodic neighbor pairs at its 0.5 nm cutoff, and ANI2x-EMLE uses
 electrostatic embedding with the surrounding MM atoms.
 
-In the complex workflow, define the fixed NNP input group as the intended
-ligand-binding region rather than the whole `Protein` or `System`. Use complete
-residues when a protein binding-site residue is included, and account for the
-link atoms introduced at covalent NNP/MM boundaries. Group membership cannot
-change during a run. Choose the group with the model's supported elements and
+In the complex workflow, the WebUI creates the fixed `nnpot` input group when
+it generates an NNP production MDP. Choose **Ligand** for the ligand alone, or
+**Ligand and binding residues** to add every complete protein residue having an
+atom within 0.5 nm of the ligand in the selected production input structure.
+The resulting `nnpot.ndx` file is supplied explicitly to GROMACS. The generated
+MDP records its index digest, so TPR generation refuses a `nnpot.ndx` belonging
+to another MDP. When a TPR is generated, the WebUI also stores an immutable,
+hash-bound snapshot of the exact index used by `grompp`; launch-time checks use
+that snapshot rather than a later replacement of `nnpot.ndx`. Regenerate the
+MDP and index after changing the atom ordering/identity or region choice, then
+regenerate the TPR. Coordinates, velocities, and the box may change without
+invalidating the index, so ordinary continuation structures remain compatible.
+Membership is fixed from the structure used to create the index and cannot gain
+or lose residues as atoms move during a run; account for link atoms at covalent
+NNP/MM boundaries. Choose the region with the model's supported elements and
 charge limitations in mind:
 
 | Model | Supported elements | Charge requirement |

@@ -717,10 +717,10 @@ class CharmmForceFieldTests(WorkingDirectoryTestCase):
         if "Could not find force field" in text:
             self.skipTest("charmm36 is not installed in this GROMACS tree")
         # Two symptoms of the same instability: sometimes pdb2gmx reports a
-        # missing atom type, sometimes it corrupts its heap and aborts (SIGABRT,
-        # "free(): invalid pointer", exit status -6). Both are inside GROMACS.
+        # missing atom type, sometimes it crashes natively (SIGABRT/SIGSEGV,
+        # "free(): invalid pointer", exit status -6/-11). Both are inside GROMACS.
         for symptom in ("atomtype database", "free(): invalid pointer",
-                        "exit status -6", "double free"):
+                        "exit status -6", "exit status -11", "double free"):
             if symptom in text:
                 self.skipTest(f"charmm36 failed to load ({symptom})")
         if "file ffbonded.itp" in text and "Unknown " in text:

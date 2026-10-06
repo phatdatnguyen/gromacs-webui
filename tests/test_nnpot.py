@@ -861,6 +861,50 @@ class NNPotElementPreflightTests(unittest.TestCase):
     def test_supported_elements_pass(self):
         self.assertIsNone(self._validate({0: 6, 1: 8}))
 
+    def test_managed_group_selection_receives_the_attested_index(self):
+        dump = self.DUMP.replace(
+            "input-group = Protein_LIG", "input-group = nnpot")
+        dump_process = utils.subprocess.CompletedProcess(
+            ["gmx", "dump"], 0, stdout=dump, stderr="")
+        commands = []
+        with tempfile.TemporaryDirectory() as stage:
+            snapshot_path = Path(stage) / "attested.ndx"
+            snapshot_path.write_text(
+                "[ nnpot ]\n1 2\n", encoding="utf-8")
+
+            def fake_run(command, cwd, **_kwargs):
+                commands.append(list(command))
+                if command[1] == "dump":
+                    return dump_process
+                if command[1] == "select":
+                    Path(command[command.index("-on") + 1]).write_text(
+                        "[ nnpot ]\n1 2\n", encoding="utf-8")
+                    return utils.subprocess.CompletedProcess(
+                        command, 0, stdout="", stderr="")
+                self.fail(f"Unexpected GROMACS command: {command}")
+
+            with mock.patch.object(
+                utils, "validate_working_directory", return_value="/safe/job"
+            ), mock.patch.object(
+                utils, "validate_local_file_path", return_value="/safe/job/md.tpr"
+            ), mock.patch.object(
+                utils, "get_nnpot_tpr_index_snapshot_path",
+                return_value=str(snapshot_path)
+            ), mock.patch.object(
+                utils, "run_checked_command", side_effect=fake_run
+            ), mock.patch.object(
+                utils, "_stream_tpr_nnpot_group_data",
+                return_value=({0: 6, 1: 8}, 0)
+            ):
+                utils.validate_tpr_nnpot_elements(
+                    "/safe/job", "md.tpr", "/models/ani1x.pt")
+
+        select_command = next(
+            command for command in commands if command[1] == "select")
+        self.assertEqual(
+            select_command[select_command.index("-n") + 1],
+            str(snapshot_path))
+
     def test_constraint_touching_nnp_group_is_rejected(self):
         with self.assertRaisesRegex(
                 RuntimeError, r"3 constraint interaction\(s\) touching"):

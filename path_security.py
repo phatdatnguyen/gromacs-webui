@@ -218,6 +218,9 @@ for _callback_name in _MDP_BUILD_CALLBACKS:
     CALLBACK_FILE_EXTENSION_CONTRACTS[_callback_name] = {
         "parameter_file_name": (".mdp",),
     }
+CALLBACK_FILE_EXTENSION_CONTRACTS["on_generate_prod_md_mdp_file"].update({
+    "input_structure_file_name": _STRUCTURE_EXTENSIONS,
+})
 for _callback_name in _MDRUN_CALLBACKS:
     CALLBACK_FILE_EXTENSION_CONTRACTS[_callback_name] = {
         "run_input_file_name": (".tpr",),

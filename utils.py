@@ -79,6 +79,18 @@ NNPOT_MODEL_BUILD_LOCK = threading.Lock()
 MAX_NNPOT_TIME_STEP_PS: float = 0.001
 MIN_NNPOT_TIME_STEP_PS: float = 0.0001
 NNPOT_CHARGE_TOLERANCE_E: float = 1.0e-3
+NNPOT_INPUT_GROUP_NAME: str = "nnpot"
+NNPOT_INDEX_FILE_NAME: str = "nnpot.ndx"
+NNPOT_INDEX_DIGEST_COMMENT_KEY: str = (
+    "gromacs-webui-nnpot-index-sha256"
+)
+NNPOT_INDEX_REGION_CHOICES: tuple[str, ...] = (
+    "Ligand",
+    "Ligand and binding residues",
+)
+NNPOT_BINDING_RESIDUE_CUTOFF_NM: float = 0.5
+NNPOT_INDEX_METADATA_SCHEMA_VERSION: int = 1
+LIGAND_RESNAME: str = "LIG"
 
 # Hardware discovery runs while the Gradio layout is created.  Keep every
 # external probe short so a broken driver cannot indefinitely delay start-up.
@@ -814,14 +826,40 @@ def _gmx_group_selection_expression(group_name: str) -> str:
     return f'group "{escaped}"'
 
 
-def _read_ndx_atom_indices(index_file_path: str) -> set[int]:
-    """Read one generated NDX group and return zero-based global atom indices."""
-    indices: set[int] = set()
+_NDX_GROUP_HEADER_RE = re.compile(r"^\s*\[\s*(.*?)\s*\]\s*$")
+
+
+def _read_ndx_groups(index_file_path: str) -> list[tuple[str, list[int]]]:
+    """Parse an NDX file into ordered groups with one-based atom indices."""
+    groups: list[tuple[str, list[int]]] = []
+    group_name: str | None = None
+    group_indices: list[int] = []
+
+    def finish_group() -> None:
+        nonlocal group_name, group_indices
+        if group_name is not None:
+            groups.append((group_name, group_indices))
+        group_name = None
+        group_indices = []
+
     with open(index_file_path, encoding="utf-8", errors="replace") as handle:
-        for line in handle:
-            content = line.strip()
-            if not content or content.startswith("["):
+        for raw_line in handle:
+            content = raw_line.split(";", 1)[0].strip()
+            if not content:
                 continue
+            header = _NDX_GROUP_HEADER_RE.fullmatch(content)
+            if header is not None:
+                finish_group()
+                group_name = header.group(1).strip()
+                if not group_name:
+                    raise RuntimeError(
+                        "GROMACS wrote an index file with an empty group name."
+                    )
+                continue
+            if group_name is None:
+                raise RuntimeError(
+                    "GROMACS wrote atom indices before the first NDX group."
+                )
             for token in content.split():
                 try:
                     one_based_index = int(token)
@@ -835,9 +873,52 @@ def _read_ndx_atom_indices(index_file_path: str) -> set[int]:
                         "GROMACS wrote a non-positive atom index while validating "
                         "the NNPot input group."
                     )
-                indices.add(one_based_index - 1)
+                group_indices.append(one_based_index)
+    finish_group()
+    if not groups:
+        raise RuntimeError("GROMACS wrote an index file with no groups.")
+    return groups
+
+
+def _read_ndx_atom_indices(
+        index_file_path: str, group_name: str | None = None) -> set[int]:
+    """Return zero-based atoms from all groups or one exact named NDX group."""
+    groups = _read_ndx_groups(index_file_path)
+    if group_name is None:
+        selected_groups = groups
+    else:
+        selected_groups = [group for group in groups if group[0] == group_name]
+        if not selected_groups:
+            raise RuntimeError(
+                f"The index file has no exact group named {group_name!r}."
+            )
+        if len(selected_groups) != 1:
+            raise RuntimeError(
+                f"The index file contains more than one group named "
+                f"{group_name!r}."
+            )
+
+    for selected_name, group_indices in selected_groups:
+        if len(group_indices) != len(set(group_indices)):
+            selected_label = (
+                f"index group {selected_name!r}" if group_name is None
+                else f"NNPot input group {group_name!r}"
+            )
+            raise RuntimeError(
+                f"The {selected_label} contains duplicate atom indices."
+            )
+    flattened_indices = [
+        one_based_index
+        for _, group_indices in selected_groups
+        for one_based_index in group_indices
+    ]
+    indices = {one_based_index - 1 for one_based_index in flattened_indices}
     if not indices:
-        raise RuntimeError("The selected NNPot input group contains no atoms.")
+        selected_label = (
+            "selected NNPot input group" if group_name is None
+            else f"NNPot input group {group_name!r}"
+        )
+        raise RuntimeError(f"The {selected_label} contains no atoms.")
     return indices
 
 
@@ -980,7 +1061,8 @@ def validate_nnpot_input_group_charge(
         input_structure_path: str,
         topology_file_path: str,
         checkpoint_path: str | None,
-        max_warnings: int) -> float:
+        max_warnings: int,
+        index_file_path: str | None = None) -> float:
     """Require a neutral pre-NNP group using an unmodified probe topology.
 
     Stock GROMACS 2026.4 serializes ``nnp-charge`` internally but exposes no
@@ -995,6 +1077,20 @@ def validate_nnpot_input_group_charge(
         raise ValueError(
             "The NNPot parameter file has no non-empty nnpot-input-group."
         )
+    expected_index_atoms: set[int] | None = None
+    if index_file_path is not None:
+        if not isinstance(index_file_path, str) or not index_file_path.strip():
+            raise ValueError("The NNPot index file path must not be empty.")
+        if not os.path.isabs(index_file_path):
+            index_file_path = os.path.join(
+                working_directory_path, index_file_path)
+        index_file_path = os.path.realpath(index_file_path)
+        if os.path.dirname(index_file_path) != working_directory_path:
+            raise ValueError(
+                "The NNPot index file must be inside the working directory."
+            )
+        expected_index_atoms = _read_ndx_atom_indices(
+            index_file_path, input_group)
     model_file = read_mdp_option(parameter_file_path, "nnpot-modelfile")
     model_name = get_nnpot_model_name_from_path(model_file) or "selected model"
 
@@ -1029,15 +1125,26 @@ def validate_nnpot_input_group_charge(
         ]
         if checkpoint_path is not None:
             command.extend(["-t", checkpoint_path])
+        if index_file_path is not None:
+            command.extend(["-n", index_file_path])
         run_checked_command(command, cwd=working_directory_path)
 
         index_path = os.path.join(stage, "nnp_group.ndx")
-        run_checked_command([
+        select_command = [
             "gmx", "select", "-s", probe_tpr_path,
             "-select", _gmx_group_selection_expression(input_group),
             "-on", index_path,
-        ], cwd=working_directory_path)
+        ]
+        if index_file_path is not None:
+            select_command.extend(["-n", index_file_path])
+        run_checked_command(select_command, cwd=working_directory_path)
         selected_indices = _read_ndx_atom_indices(index_path)
+        if (expected_index_atoms is not None
+                and selected_indices != expected_index_atoms):
+            raise RuntimeError(
+                f"GROMACS did not preserve every atom in NNPot input group "
+                f"{input_group!r} while building the charge-validation TPR."
+            )
         charges = _stream_tpr_charges(
             probe_tpr_path, working_directory_path, selected_indices)
 
@@ -1069,7 +1176,7 @@ def _atomic_number_label(atomic_number: int) -> str:
 def validate_tpr_nnpot_elements(
         working_directory_path: str, run_input_file_name: str | None,
         model_file: str | None) -> None:
-    """Validate the actual TPR input group before launching an NNP model."""
+    """Validate the actual, attested TPR input group before NNP launch."""
     model_name = _nnpot_model_name_from_path(model_file)
 
     working_directory_path = validate_working_directory(working_directory_path)
@@ -1086,14 +1193,36 @@ def validate_tpr_nnpot_elements(
             "Regenerate the production MDP and TPR."
         )
 
+    index_file_path = None
+    if input_group == NNPOT_INPUT_GROUP_NAME:
+        index_file_path = get_nnpot_tpr_index_snapshot_path(
+            working_directory_path, run_input_file_name, input_group)
+        if index_file_path is None:
+            raise RuntimeError(
+                "The selected NNPot TPR has no attested input index. "
+                "Regenerate the production MDP and TPR."
+            )
+
     with tempfile.TemporaryDirectory(prefix="gromacs_webui_nnp_group_") as stage:
         index_path = os.path.join(stage, "nnp_group.ndx")
-        run_checked_command([
+        select_command = [
             "gmx", "select", "-s", tpr_path,
             "-select", _gmx_group_selection_expression(input_group),
             "-on", index_path,
-        ], cwd=working_directory_path)
+        ]
+        if index_file_path is not None:
+            select_command.extend(["-n", index_file_path])
+        run_checked_command(select_command, cwd=working_directory_path)
         selected_indices = _read_ndx_atom_indices(index_path)
+        if index_file_path is not None:
+            expected_indices = _read_ndx_atom_indices(
+                index_file_path, input_group)
+            if selected_indices != expected_indices:
+                raise RuntimeError(
+                    "GROMACS did not preserve the attested NNPot group while "
+                    "reading the selected production TPR. Regenerate the "
+                    "production TPR."
+                )
 
     atomic_numbers, touching_constraints = _stream_tpr_nnpot_group_data(
         tpr_path, working_directory_path, selected_indices)
@@ -1616,7 +1745,7 @@ def _download_nnpot_model_locked(model_name: str) -> str:
 NNPOT_SNAPSHOT_DIRECTORY = ".nnpot_models"
 NNPOT_SNAPSHOT_SCHEMA_VERSION = 1
 NNPOT_TPR_ATTESTATION_DIRECTORY = ".nnpot_tpr_attestations"
-NNPOT_TPR_ATTESTATION_SCHEMA_VERSION = 1
+NNPOT_TPR_ATTESTATION_SCHEMA_VERSION = 2
 _NNPOT_SNAPSHOT_PUBLISH_LOCK = threading.Lock()
 
 
@@ -2145,10 +2274,49 @@ def _nnpot_tpr_attestation_directory(
     return directory
 
 
+def _nnpot_tpr_attestation_artifact_name(
+        tpr_sha256: str, extension: str) -> str:
+    """Name one schema-versioned artifact bound to a TPR digest."""
+    if not re.fullmatch(r"[0-9a-f]{64}", tpr_sha256):
+        raise ValueError("Invalid NNPot TPR digest.")
+    if extension != ".json":
+        raise ValueError("Invalid NNPot TPR attestation extension.")
+    return (
+        f"{tpr_sha256}.v{NNPOT_TPR_ATTESTATION_SCHEMA_VERSION}{extension}"
+    )
+
+
+def _nnpot_tpr_index_snapshot_name(
+        tpr_sha256: str, index_sha256: str) -> str:
+    """Name an immutable index by both its TPR and content digests."""
+    if (not re.fullmatch(r"[0-9a-f]{64}", tpr_sha256)
+            or not re.fullmatch(r"[0-9a-f]{64}", index_sha256)):
+        raise ValueError("Invalid NNPot TPR or index digest.")
+    return (
+        f"{tpr_sha256}.{index_sha256}."
+        f"v{NNPOT_TPR_ATTESTATION_SCHEMA_VERSION}.ndx"
+    )
+
+
+def _validate_nnpot_tpr_index_snapshot(
+        snapshot_path: str, expected_sha256: str) -> None:
+    """Require an immutable-looking, hash-matching attested index snapshot."""
+    if not re.fullmatch(r"[0-9a-f]{64}", expected_sha256):
+        raise RuntimeError("The attested NNPot index digest is invalid.")
+    if (os.path.islink(snapshot_path)
+            or not os.path.isfile(snapshot_path)
+            or os.path.realpath(snapshot_path) != os.path.abspath(snapshot_path)
+            or _sha256_file(snapshot_path) != expected_sha256):
+        raise RuntimeError(
+            "The index snapshot bound to the selected NNPot TPR is missing or "
+            "has changed. Regenerate the production TPR."
+        )
+
+
 def _validate_nnpot_tpr_charge_attestation(
         manifest_path: str, tpr_sha256: str,
         input_group: str) -> dict[str, Any]:
-    """Validate a TPR-bound record of the original NNP group's charge."""
+    """Validate TPR-bound charge and managed-index provenance."""
     if os.path.islink(manifest_path) or not os.path.isfile(manifest_path):
         raise RuntimeError(
             f"NNPot charge attestation {manifest_path!r} is not a regular file."
@@ -2186,12 +2354,40 @@ def _validate_nnpot_tpr_charge_attestation(
             "the original topology group was neutral. Regenerate the production "
             "TPR from a neutral NNP input group."
         )
+
+    index_sha256 = metadata.get("index_sha256")
+    index_snapshot = metadata.get("index_snapshot")
+    if input_group.strip() == NNPOT_INPUT_GROUP_NAME:
+        expected_snapshot = (
+            _nnpot_tpr_index_snapshot_name(tpr_sha256, index_sha256)
+            if isinstance(index_sha256, str)
+            and re.fullmatch(r"[0-9a-f]{64}", index_sha256)
+            else None
+        )
+        if (not isinstance(index_sha256, str)
+                or not re.fullmatch(r"[0-9a-f]{64}", index_sha256)
+                or index_snapshot != expected_snapshot):
+            raise RuntimeError(
+                f"NNPot charge attestation {manifest_path!r} does not bind "
+                "the managed input index used to build the selected TPR. "
+                "Regenerate the production TPR."
+            )
+        snapshot_path = os.path.join(
+            os.path.dirname(manifest_path), expected_snapshot)
+        _validate_nnpot_tpr_index_snapshot(
+            snapshot_path, index_sha256)
+    elif index_sha256 is not None or index_snapshot is not None:
+        raise RuntimeError(
+            f"NNPot charge attestation {manifest_path!r} has unexpected index "
+            "provenance. Regenerate the production TPR."
+        )
     return metadata
 
 
 def record_nnpot_tpr_charge_attestation(
         working_directory_path: str, run_input_file_name: str,
-        parameter_file_path: str, original_group_charge: float) -> str:
+        parameter_file_path: str, original_group_charge: float,
+        *, index_file_path: str | None = None) -> str:
     """Bind a successful neutral-group preflight to the generated NNP TPR.
 
     Electrostatic embedding removes the NNP atoms' original classical charges
@@ -2224,16 +2420,95 @@ def record_nnpot_tpr_charge_attestation(
         )
 
     tpr_sha256 = _sha256_file(tpr_path)
+    directory = _nnpot_tpr_attestation_directory(
+        working_directory_path, create=True)
+    manifest_path = os.path.join(
+        directory,
+        _nnpot_tpr_attestation_artifact_name(tpr_sha256, ".json"),
+    )
+    index_sha256 = None
+    index_snapshot = None
+    if input_group == NNPOT_INPUT_GROUP_NAME:
+        if index_file_path is None:
+            raise RuntimeError(
+                "The managed NNPot index used by grompp was not supplied for "
+                "TPR attestation. Regenerate the production TPR."
+            )
+        managed_index_path = _resolve_managed_nnpot_index_path(
+            working_directory_path)
+        candidate_index_path = index_file_path if os.path.isabs(
+            index_file_path) else os.path.join(
+                working_directory_path, index_file_path)
+        if (os.path.islink(candidate_index_path)
+                or os.path.realpath(candidate_index_path)
+                != managed_index_path):
+            raise RuntimeError(
+                f"The NNPot TPR must be attested with the managed "
+                f"'{NNPOT_INDEX_FILE_NAME}' used by grompp."
+            )
+
+        index_sha256 = _sha256_file(managed_index_path)
+        index_snapshot = _nnpot_tpr_index_snapshot_name(
+            tpr_sha256, index_sha256)
+        # The TPR digest is the authoritative identity.  If an earlier build
+        # already attested these exact TPR bytes, retain its immutable index
+        # snapshot.  A later NDX may differ in comments, formatting, or unused
+        # groups while encoding the same NNP membership and therefore produce
+        # the same TPR; replacing or rejecting the existing proof would add no
+        # safety and would make an otherwise idempotent rebuild fail.
+        if os.path.lexists(manifest_path):
+            _validate_nnpot_tpr_charge_attestation(
+                manifest_path, tpr_sha256, input_group)
+            return manifest_path
+        snapshot_path = os.path.join(directory, index_snapshot)
+        snapshot_descriptor, temporary_snapshot_path = tempfile.mkstemp(
+            prefix=".index.", suffix=".ndx.tmp", dir=directory)
+        source_descriptor = -1
+        try:
+            source_descriptor = os.open(
+                managed_index_path,
+                os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+            )
+            if not stat.S_ISREG(os.fstat(source_descriptor).st_mode):
+                raise RuntimeError(
+                    "The managed NNPot index used by grompp is not a regular "
+                    "file."
+                )
+            with os.fdopen(source_descriptor, "rb") as source, \
+                    os.fdopen(snapshot_descriptor, "wb") as destination:
+                source_descriptor = -1
+                snapshot_descriptor = -1
+                shutil.copyfileobj(source, destination, length=1024 * 1024)
+                destination.flush()
+                os.fsync(destination.fileno())
+            os.chmod(temporary_snapshot_path, 0o400)
+            _validate_nnpot_tpr_index_snapshot(
+                temporary_snapshot_path, index_sha256)
+            _publish_nnpot_artifact_without_replacement(
+                temporary_snapshot_path, snapshot_path,
+                lambda: _validate_nnpot_tpr_index_snapshot(
+                    snapshot_path, index_sha256))
+            _validate_nnpot_tpr_index_snapshot(
+                snapshot_path, index_sha256)
+        finally:
+            if source_descriptor >= 0:
+                os.close(source_descriptor)
+            if snapshot_descriptor >= 0:
+                os.close(snapshot_descriptor)
+            try:
+                os.unlink(temporary_snapshot_path)
+            except FileNotFoundError:
+                pass
+
     metadata = {
         "schema_version": NNPOT_TPR_ATTESTATION_SCHEMA_VERSION,
         "tpr_sha256": tpr_sha256,
         "input_group": input_group,
         "original_group_charge_e": charge,
         "neutrality_tolerance_e": NNPOT_CHARGE_TOLERANCE_E,
+        "index_sha256": index_sha256,
+        "index_snapshot": index_snapshot,
     }
-    directory = _nnpot_tpr_attestation_directory(
-        working_directory_path, create=True)
-    manifest_path = os.path.join(directory, f"{tpr_sha256}.json")
     descriptor, temporary_path = tempfile.mkstemp(
         prefix=".charge.", suffix=".json.tmp", dir=directory)
     try:
@@ -2249,6 +2524,8 @@ def record_nnpot_tpr_charge_attestation(
             temporary_path, manifest_path,
             lambda: _validate_nnpot_tpr_charge_attestation(
                 manifest_path, tpr_sha256, input_group))
+        _validate_nnpot_tpr_charge_attestation(
+            manifest_path, tpr_sha256, input_group)
     finally:
         if descriptor >= 0:
             os.close(descriptor)
@@ -2259,11 +2536,11 @@ def record_nnpot_tpr_charge_attestation(
     return manifest_path
 
 
-def verify_nnpot_tpr_charge_attestation(
+def _load_nnpot_tpr_attestation(
         working_directory_path: str,
         run_input_file_name: str | None,
-        input_group: str) -> float:
-    """Require neutral-charge provenance for an NNP-active production TPR."""
+        input_group: str) -> dict[str, Any]:
+    """Load and validate the current schema's attestation for one NNP TPR."""
     working_directory_path = validate_working_directory(working_directory_path)
     if not input_group:
         raise RuntimeError(
@@ -2283,7 +2560,10 @@ def verify_nnpot_tpr_charge_attestation(
             "topology group's charge. Regenerate the production TPR with the "
             "current WebUI before launching it."
         ) from exc
-    manifest_path = os.path.join(directory, f"{tpr_sha256}.json")
+    manifest_path = os.path.join(
+        directory,
+        _nnpot_tpr_attestation_artifact_name(tpr_sha256, ".json"),
+    )
     if not os.path.lexists(manifest_path):
         raise RuntimeError(
             "The selected NNPot TPR has no trusted record of the original "
@@ -2291,9 +2571,33 @@ def verify_nnpot_tpr_charge_attestation(
             "for charged source groups, so regenerate the production TPR with "
             "the current WebUI before launching it."
         )
-    metadata = _validate_nnpot_tpr_charge_attestation(
+    return _validate_nnpot_tpr_charge_attestation(
         manifest_path, tpr_sha256, input_group)
+
+
+def verify_nnpot_tpr_charge_attestation(
+        working_directory_path: str,
+        run_input_file_name: str | None,
+        input_group: str) -> float:
+    """Require neutral-charge and index provenance for an active NNP TPR."""
+    metadata = _load_nnpot_tpr_attestation(
+        working_directory_path, run_input_file_name, input_group)
     return float(metadata["original_group_charge_e"])
+
+
+def get_nnpot_tpr_index_snapshot_path(
+        working_directory_path: str,
+        run_input_file_name: str | None,
+        input_group: str) -> str | None:
+    """Return the verified immutable index snapshot used to build a TPR."""
+    metadata = _load_nnpot_tpr_attestation(
+        working_directory_path, run_input_file_name, input_group)
+    snapshot_name = metadata.get("index_snapshot")
+    if snapshot_name is None:
+        return None
+    directory = _nnpot_tpr_attestation_directory(
+        validate_working_directory(working_directory_path), create=False)
+    return os.path.join(directory, snapshot_name)
 
 MAX_CAPTURED_COMMAND_OUTPUT_BYTES = 2 * 1024 * 1024
 _COMMAND_OUTPUT_TRUNCATION_MARKER = (
@@ -2683,6 +2987,508 @@ def list_gmx_index_groups(structure_file_name: str,
             groups.append((match.group(2), int(match.group(3))))
 
     return groups
+
+
+def get_nnpot_index_file_name(
+        parameter_file_name: str | None = None) -> str:
+    """Return the one managed, job-local NNPot index filename.
+
+    ``parameter_file_name`` remains accepted for source compatibility with
+    older callers, but the index is intentionally named ``nnpot.ndx``.  A
+    successful TPR build takes its own immutable, hash-bound snapshot, so
+    replacing this working copy later cannot make an old TPR validate the
+    wrong atom selection.
+    """
+    return NNPOT_INDEX_FILE_NAME
+
+
+def _resolve_managed_nnpot_index_path(
+        working_directory_path: str) -> str:
+    """Return the fixed working NNPot index, rejecting links and escapes."""
+    working_directory_path = validate_working_directory(
+        working_directory_path)
+    candidate = os.path.join(
+        working_directory_path, NNPOT_INDEX_FILE_NAME)
+    if (os.path.islink(candidate)
+            or not os.path.isfile(candidate)
+            or os.path.dirname(os.path.realpath(candidate))
+            != working_directory_path):
+        raise RuntimeError(
+            f"Managed NNPot index file '{NNPOT_INDEX_FILE_NAME}' is missing "
+            "or is not a regular job-local file. Regenerate the production "
+            "MD parameter file."
+        )
+    return os.path.realpath(candidate)
+
+
+def _read_gmx_selected_residue_indices(file_path: str) -> list[int]:
+    """Read the one-frame residue-index record written by ``gmx select -oi``."""
+    records: list[list[int]] = []
+    with open(file_path, encoding="utf-8", errors="replace") as handle:
+        for raw_line in handle:
+            content = raw_line.strip()
+            if not content or content.startswith(("#", "@")):
+                continue
+            fields = content.split()
+            if len(fields) < 2:
+                raise RuntimeError(
+                    "gmx select wrote a malformed binding-residue index record."
+                )
+            try:
+                float(fields[0])
+                count = int(fields[1])
+                residue_indices = [int(value) for value in fields[2:]]
+            except ValueError as exc:
+                raise RuntimeError(
+                    "gmx select wrote an invalid binding-residue index record."
+                ) from exc
+            if count < 0 or len(residue_indices) != count:
+                raise RuntimeError(
+                    "gmx select wrote an inconsistent binding-residue count."
+                )
+            if any(index <= 0 for index in residue_indices):
+                raise RuntimeError(
+                    "gmx select wrote a non-positive binding-residue index."
+                )
+            if len(set(residue_indices)) != len(residue_indices):
+                raise RuntimeError(
+                    "gmx select wrote duplicate binding-residue indices."
+                )
+            records.append(residue_indices)
+    if len(records) != 1:
+        raise RuntimeError(
+            "Expected one binding-residue record from the selected structure, "
+            f"but gmx select wrote {len(records)}."
+        )
+    return records[0]
+
+
+def _resolve_nnpot_job_file_path(
+        path: str, working_directory_path: str, description: str,
+        *, direct_child: bool) -> str:
+    """Resolve a path inside the NNPot job without following an escape."""
+    if not isinstance(path, str) or not path.strip():
+        raise ValueError(f"The {description} path must not be empty.")
+    candidate = path if os.path.isabs(path) else os.path.join(
+        working_directory_path, path)
+    resolved = os.path.realpath(candidate)
+    try:
+        is_inside_job = os.path.commonpath(
+            (working_directory_path, resolved)) == working_directory_path
+    except ValueError:
+        is_inside_job = False
+    if (not is_inside_job or resolved == working_directory_path
+            or (direct_child
+                and os.path.dirname(resolved) != working_directory_path)):
+        location = "directly inside" if direct_child else "inside"
+        raise ValueError(
+            f"The {description} must be {location} the working directory."
+        )
+    return resolved
+
+
+_NNPOT_INDEX_METADATA_PREFIX = "gromacs-webui-nnpot-"
+_NNPOT_INDEX_METADATA_RE = re.compile(
+    r"^\s*;\s*gromacs-webui-nnpot-([a-z0-9-]+)\s*=\s*(.*?)\s*$"
+)
+_SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+
+
+def get_nnpot_structure_atom_identity_fingerprint(
+        structure_path: str) -> tuple[str, int]:
+    """Hash ordered atom identities while deliberately ignoring coordinates.
+
+    NNPot index membership is positional, so it remains valid when a
+    continuation structure has new coordinates, velocities, or a new box, but
+    not when atoms have been reordered, added, removed, or renamed.  Residue
+    ordinals (rather than file residue numbers or chain labels) keep equivalent
+    PDB/GRO representations compatible while preserving residue boundaries.
+    """
+    import hashlib
+
+    try:
+        universe = mda.Universe(structure_path)
+    except Exception as exc:
+        raise RuntimeError(
+            "Could not read atom identities from the selected production "
+            f"structure: {exc}"
+        ) from exc
+
+    digest = hashlib.sha256()
+    digest.update(b"gromacs-webui-nnpot-atom-identities-v1\n")
+    atom_count = 0
+    try:
+        for atom in universe.atoms:
+            residue_index = int(atom.resindex)
+            residue_name = str(atom.resname).strip()
+            atom_name = str(atom.name).strip()
+            if not residue_name or not atom_name:
+                raise RuntimeError(
+                    "The selected production structure contains an atom with "
+                    "a missing residue or atom name."
+                )
+            record = json.dumps(
+                (residue_index, residue_name, atom_name),
+                ensure_ascii=True, separators=(",", ":"),
+            )
+            digest.update(record.encode("ascii"))
+            digest.update(b"\n")
+            atom_count += 1
+    finally:
+        trajectory = getattr(universe, "trajectory", None)
+        close = getattr(trajectory, "close", None)
+        if callable(close):
+            close()
+
+    if atom_count == 0:
+        raise RuntimeError(
+            "The selected production structure contains no atoms."
+        )
+    return digest.hexdigest(), atom_count
+
+
+def _prepend_nnpot_index_metadata(
+        index_file_path: str, atom_identity_sha256: str,
+        atom_count: int, region_choice: str) -> None:
+    """Prepend GROMACS-compatible comments describing the index provenance."""
+    if not _SHA256_RE.fullmatch(atom_identity_sha256):
+        raise ValueError("Invalid NNPot atom-identity fingerprint.")
+    if (not isinstance(atom_count, int) or isinstance(atom_count, bool)
+            or atom_count < 1):
+        raise ValueError("Invalid NNPot structure atom count.")
+    if region_choice not in NNPOT_INDEX_REGION_CHOICES:
+        raise ValueError("Invalid NNPot index region metadata.")
+
+    directory = os.path.dirname(index_file_path)
+    descriptor, temporary_path = tempfile.mkstemp(
+        prefix=".nnpot_metadata_", suffix=".ndx", dir=directory)
+    try:
+        with os.fdopen(descriptor, "wb") as destination:
+            descriptor = -1
+            header = (
+                f"; {_NNPOT_INDEX_METADATA_PREFIX}schema = "
+                f"{NNPOT_INDEX_METADATA_SCHEMA_VERSION}\n"
+                f"; {_NNPOT_INDEX_METADATA_PREFIX}atom-identity-sha256 = "
+                f"{atom_identity_sha256}\n"
+                f"; {_NNPOT_INDEX_METADATA_PREFIX}atom-count = {atom_count}\n"
+                f"; {_NNPOT_INDEX_METADATA_PREFIX}region = {region_choice}\n"
+            )
+            destination.write(header.encode("ascii"))
+            with open(index_file_path, "rb") as source:
+                shutil.copyfileobj(source, destination)
+            destination.flush()
+            os.fsync(destination.fileno())
+        os.replace(temporary_path, index_file_path)
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+        try:
+            os.unlink(temporary_path)
+        except FileNotFoundError:
+            pass
+
+
+def _read_nnpot_index_metadata(index_file_path: str) -> dict[str, str | int]:
+    """Read and strictly validate managed provenance comments from an NDX."""
+    values: dict[str, str] = {}
+    with open(index_file_path, encoding="utf-8", errors="replace") as handle:
+        for raw_line in handle:
+            stripped = raw_line.strip()
+            if stripped.startswith("["):
+                break
+            if _NNPOT_INDEX_METADATA_PREFIX not in stripped:
+                continue
+            match = _NNPOT_INDEX_METADATA_RE.fullmatch(raw_line.rstrip("\r\n"))
+            if match is None:
+                raise RuntimeError(
+                    "The NNPot index has malformed managed metadata. "
+                    "Regenerate the production parameter file and its matching "
+                    "NNPot index."
+                )
+            key, value = match.groups()
+            if key in values:
+                raise RuntimeError(
+                    "The NNPot index has duplicate managed metadata. "
+                    "Regenerate the production parameter file and its matching "
+                    "NNPot index."
+                )
+            values[key] = value
+
+    required = {"schema", "atom-identity-sha256", "atom-count", "region"}
+    if not required.issubset(values):
+        raise RuntimeError(
+            "The NNPot index has no complete managed atom-identity metadata. "
+            "Regenerate the production parameter file and its matching NNPot "
+            "index."
+        )
+    if values["schema"] != str(NNPOT_INDEX_METADATA_SCHEMA_VERSION):
+        raise RuntimeError(
+            "The NNPot index uses unsupported managed metadata. Regenerate the "
+            "production parameter file and its matching NNPot index."
+        )
+    fingerprint = values["atom-identity-sha256"]
+    if not _SHA256_RE.fullmatch(fingerprint):
+        raise RuntimeError(
+            "The NNPot index has a malformed atom-identity fingerprint. "
+            "Regenerate the production parameter file and its matching NNPot "
+            "index."
+        )
+    try:
+        atom_count = int(values["atom-count"])
+    except ValueError as exc:
+        raise RuntimeError(
+            "The NNPot index has a malformed structure atom count. Regenerate "
+            "the production parameter file and its matching NNPot index."
+        ) from exc
+    if atom_count < 1 or str(atom_count) != values["atom-count"]:
+        raise RuntimeError(
+            "The NNPot index has a malformed structure atom count. Regenerate "
+            "the production parameter file and its matching NNPot index."
+        )
+    region = values["region"]
+    if region not in NNPOT_INDEX_REGION_CHOICES:
+        raise RuntimeError(
+            "The NNPot index has an invalid managed region choice. Regenerate "
+            "the production parameter file and its matching NNPot index."
+        )
+    return {
+        "schema": NNPOT_INDEX_METADATA_SCHEMA_VERSION,
+        "atom-identity-sha256": fingerprint,
+        "atom-count": atom_count,
+        "region": region,
+    }
+
+
+def validate_nnpot_index_for_structure(
+        index_file_path: str, structure_path: str,
+        working_directory_path: str) -> dict[str, str | int]:
+    """Validate managed NNPot metadata, groups, and atom-layout compatibility."""
+    working_directory_path = validate_working_directory(
+        working_directory_path)
+    index_file_path = _resolve_nnpot_job_file_path(
+        index_file_path, working_directory_path, "NNPot index file",
+        direct_child=True)
+    structure_path = _resolve_nnpot_job_file_path(
+        structure_path, working_directory_path, "production input structure",
+        direct_child=True)
+    if not os.path.isfile(index_file_path):
+        raise RuntimeError("The matching NNPot index file does not exist.")
+    if not os.path.isfile(structure_path):
+        raise RuntimeError("The selected production input structure does not exist.")
+
+    metadata = _read_nnpot_index_metadata(index_file_path)
+    fingerprint, atom_count = get_nnpot_structure_atom_identity_fingerprint(
+        structure_path)
+    if (metadata["atom-count"] != atom_count
+            or metadata["atom-identity-sha256"] != fingerprint):
+        raise RuntimeError(
+            "The matching NNPot index was generated for a different atom "
+            "ordering or identity than the selected production input structure. "
+            "Regenerate the production parameter file and its matching NNPot "
+            "index using this structure."
+        )
+
+    groups = _read_ndx_groups(index_file_path)
+    names = [name for name, _ in groups]
+    if len(names) != len(set(names)):
+        raise RuntimeError(
+            "The NNPot index contains duplicate group names. Regenerate it or "
+            "give every edited group a unique name."
+        )
+    by_name = {name: indices for name, indices in groups}
+    system_atoms = by_name.get("System")
+    nnpot_atoms = by_name.get(NNPOT_INPUT_GROUP_NAME)
+    if not system_atoms:
+        raise RuntimeError(
+            "The NNPot index has no nonempty System group. Regenerate the "
+            "production parameter file and its matching NNPot index."
+        )
+    if not nnpot_atoms:
+        raise RuntimeError(
+            f"The NNPot index has no nonempty {NNPOT_INPUT_GROUP_NAME!r} group. "
+            "Regenerate the production parameter file and its matching NNPot "
+            "index."
+        )
+    if len(system_atoms) != len(set(system_atoms)):
+        raise RuntimeError("The NNPot index System group contains duplicate atoms.")
+    if len(nnpot_atoms) != len(set(nnpot_atoms)):
+        raise RuntimeError(
+            f"The NNPot input group {NNPOT_INPUT_GROUP_NAME!r} contains "
+            "duplicate atom indices."
+        )
+    expected_system = set(range(1, atom_count + 1))
+    if set(system_atoms) != expected_system:
+        raise RuntimeError(
+            "The NNPot index System group does not match every atom in the "
+            "selected production input structure. Regenerate the production "
+            "parameter file and its matching NNPot index."
+        )
+    if not set(nnpot_atoms).issubset(expected_system):
+        raise RuntimeError(
+            "The NNPot input group contains atoms outside the selected "
+            "production input structure."
+        )
+    return metadata
+
+
+def generate_nnpot_index_file(
+        structure_path: str,
+        output_path: str,
+        region_choice: str,
+        working_directory_path: str,
+        runner: Callable[..., Any] | None = None) -> tuple[int, int]:
+    """Create default GROMACS groups plus the exact, nonempty ``nnpot`` group.
+
+    The binding-residue option selects whole protein residues having any atom
+    within 0.5 nm of the ligand under periodic boundary conditions.  The
+    returned tuple is ``(NNPot atom count, binding protein residue count)``.
+    """
+    if region_choice not in NNPOT_INDEX_REGION_CHOICES:
+        raise ValueError(
+            f"Invalid NNPot region {region_choice!r}. Choose one of: "
+            + ", ".join(NNPOT_INDEX_REGION_CHOICES)
+        )
+    working_directory_path = validate_working_directory(
+        working_directory_path)
+    structure_path = _resolve_nnpot_job_file_path(
+        structure_path, working_directory_path, "NNPot input structure",
+        direct_child=True)
+    output_path = _resolve_nnpot_job_file_path(
+        output_path, working_directory_path, "NNPot index file",
+        direct_child=False)
+    if not os.path.isfile(structure_path):
+        raise ValueError("The NNPot input structure does not exist.")
+    if runner is None:
+        runner = run_checked_command
+    atom_identity_sha256, structure_atom_count = \
+        get_nnpot_structure_atom_identity_fingerprint(structure_path)
+
+    binding_residue_indices: list[int] = []
+    with tempfile.TemporaryDirectory(
+            prefix=".nnpot_index_", dir=working_directory_path) as stage:
+        if region_choice == "Ligand and binding residues":
+            residue_index_path = os.path.join(stage, "binding_residues.dat")
+            cutoff = f"{NNPOT_BINDING_RESIDUE_CUTOFF_NM:g}"
+            selection = (
+                "res_com of same residue as (group \"Protein\" and within "
+                f"{cutoff} of resname {LIGAND_RESNAME})"
+            )
+            runner([
+                "gmx", "select",
+                "-s", structure_path,
+                "-select", selection,
+                "-oi", residue_index_path,
+                "-resnr", "index",
+                "-xvg", "none",
+                "-pbc",
+                "-rmpbc",
+            ], cwd=working_directory_path)
+            binding_residue_indices = _read_gmx_selected_residue_indices(
+                residue_index_path)
+
+        raw_index_path = os.path.join(stage, "raw.ndx")
+        if binding_residue_indices:
+            residue_list = " ".join(
+                str(index) for index in binding_residue_indices)
+            make_group_command = (
+                f"ri {residue_list} | r {LIGAND_RESNAME}\nq\n")
+        else:
+            make_group_command = f"r {LIGAND_RESNAME}\nq\n"
+        runner([
+            "gmx", "make_ndx", "-f", structure_path,
+            "-o", raw_index_path,
+        ], cwd=working_directory_path, stdin_input=make_group_command)
+
+        raw_groups = _read_ndx_groups(raw_index_path)
+        if len(raw_groups) < 2:
+            raise RuntimeError(
+                "gmx make_ndx did not create a custom NNPot group."
+            )
+        default_groups = raw_groups[:-1]
+        _, raw_custom_atoms = raw_groups[-1]
+        ligand_groups = [
+            atoms for name, atoms in default_groups
+            if name == LIGAND_RESNAME
+        ]
+        if len(ligand_groups) != 1 or not ligand_groups[0]:
+            raise RuntimeError(
+                f"The selected structure must contain one nonempty "
+                f"{LIGAND_RESNAME!r} ligand group."
+            )
+        if (not raw_custom_atoms
+                or not set(ligand_groups[0]).issubset(raw_custom_atoms)):
+            raise RuntimeError(
+                "gmx make_ndx did not include every ligand atom in the NNPot "
+                "region."
+            )
+        if len(set(raw_custom_atoms)) != len(raw_custom_atoms):
+            raise RuntimeError(
+                "gmx make_ndx wrote duplicate atoms in the NNPot region."
+            )
+
+        candidate_index_path = os.path.join(stage, "candidate.ndx")
+        custom_group_number = len(raw_groups) - 1
+        runner([
+            "gmx", "make_ndx", "-n", raw_index_path,
+            "-o", candidate_index_path,
+        ], cwd=working_directory_path, stdin_input=(
+            f"name {custom_group_number} {NNPOT_INPUT_GROUP_NAME}\nq\n"))
+
+        final_groups = _read_ndx_groups(candidate_index_path)
+        if len(final_groups) != len(raw_groups):
+            raise RuntimeError(
+                "Renaming the NNPot group changed the number of index groups."
+            )
+        if final_groups[:-1] != default_groups:
+            raise RuntimeError(
+                "Renaming the NNPot group did not preserve every default "
+                "GROMACS index group."
+            )
+        final_names = [name for name, _ in final_groups]
+        if len(final_names) != len(set(final_names)):
+            raise RuntimeError(
+                "The generated NNPot index contains duplicate group names."
+            )
+        system_groups = [
+            atoms for name, atoms in final_groups if name == "System"]
+        nnpot_groups = [
+            atoms for name, atoms in final_groups
+            if name == NNPOT_INPUT_GROUP_NAME]
+        if len(system_groups) != 1 or not system_groups[0]:
+            raise RuntimeError(
+                "The generated NNPot index has no unique, nonempty System group."
+            )
+        if (len(system_groups[0]) != structure_atom_count
+                or set(system_groups[0])
+                != set(range(1, structure_atom_count + 1))):
+            raise RuntimeError(
+                "The generated NNPot index System group does not match every "
+                "atom in the selected production input structure."
+            )
+        if len(nnpot_groups) != 1 or not nnpot_groups[0]:
+            raise RuntimeError(
+                f"The generated index has no unique, nonempty "
+                f"{NNPOT_INPUT_GROUP_NAME!r} group."
+            )
+        if final_groups[-1][0] != NNPOT_INPUT_GROUP_NAME:
+            raise RuntimeError(
+                "gmx make_ndx renamed the wrong NNPot index group."
+            )
+        if nnpot_groups[0] != raw_custom_atoms:
+            raise RuntimeError(
+                "Renaming the NNPot group changed its atom membership."
+            )
+        if not set(nnpot_groups[0]).issubset(system_groups[0]):
+            raise RuntimeError(
+                "The generated NNPot group contains atoms outside System."
+            )
+
+        _prepend_nnpot_index_metadata(
+            candidate_index_path, atom_identity_sha256,
+            structure_atom_count, region_choice)
+        os.replace(candidate_index_path, output_path)
+
+    return len(nnpot_groups[0]), len(binding_residue_indices)
 
 def describe_selection_candidates(structure_file_name: str,
                                   working_directory_path: str) -> str:
@@ -4435,6 +5241,60 @@ def read_mdp_option(file_path: str, option_name: str) -> str | None:
     return value
 
 
+def bind_nnpot_index_to_mdp_content(
+        mdp_content: str, index_file_path: str) -> str:
+    """Add a managed comment binding an NNP MDP to its working index."""
+    if NNPOT_INDEX_DIGEST_COMMENT_KEY in mdp_content.lower():
+        raise ValueError(
+            "The generated NNPot MDP already contains managed index metadata."
+        )
+    digest = _sha256_file(index_file_path)
+    separator = "" if mdp_content.endswith("\n") else "\n"
+    return (
+        mdp_content + separator
+        + f"; {NNPOT_INDEX_DIGEST_COMMENT_KEY} = {digest}\n"
+    )
+
+
+def read_nnpot_index_digest_from_mdp(parameter_file_path: str) -> str:
+    """Read exactly one well-formed managed index digest from an NNP MDP."""
+    pattern = re.compile(
+        rf"^\s*;\s*{re.escape(NNPOT_INDEX_DIGEST_COMMENT_KEY)}"
+        r"\s*=\s*([0-9a-f]{64})\s*$",
+        re.IGNORECASE,
+    )
+    digests: list[str] = []
+    with open(parameter_file_path, encoding="utf-8", errors="replace") as handle:
+        for raw_line in handle:
+            if NNPOT_INDEX_DIGEST_COMMENT_KEY not in raw_line.lower():
+                continue
+            match = pattern.fullmatch(raw_line.rstrip("\r\n"))
+            if match is None:
+                raise RuntimeError(
+                    "The NNPot parameter file has malformed managed index "
+                    "metadata. Regenerate the production parameter file."
+                )
+            digests.append(match.group(1).lower())
+    if len(digests) != 1:
+        raise RuntimeError(
+            "The NNPot parameter file does not contain exactly one managed "
+            "index digest. Regenerate the production parameter file."
+        )
+    return digests[0]
+
+
+def validate_nnpot_index_matches_mdp(
+        parameter_file_path: str, index_file_path: str) -> None:
+    """Reject a fixed working index that was generated with another MDP."""
+    expected_sha256 = read_nnpot_index_digest_from_mdp(parameter_file_path)
+    if _sha256_file(index_file_path) != expected_sha256:
+        raise RuntimeError(
+            f"Managed NNPot index '{NNPOT_INDEX_FILE_NAME}' does not match the "
+            "selected production parameter file. Regenerate that parameter "
+            "file before generating its TPR."
+        )
+
+
 def mdp_uses_nnpot(file_path: str) -> bool:
     """Whether an MDP explicitly enables GROMACS' NNPot module."""
     value = read_mdp_option(file_path, "nnpot-active")
@@ -4587,7 +5447,7 @@ def get_default_prod_md_mdp_file_content(time_scale_ps: float = 1000, time_step_
                                          mdp_type: str = "Initial", random_seed: int = 0,
                                          with_ligand: bool = False, nnpot_active: bool = False,
                                          nnpot_modelfile_path: str | None = "models/ani2x.pt",
-                                         nnpot_input_group: str = "Protein",
+                                         nnpot_input_group: str = NNPOT_INPUT_GROUP_NAME,
                                          nnpot_model_name: str = "ani2x",
                                          force_field: str | None = None) -> str:
     """MDP for unrestrained production MD, optionally driven by a neural potential."""
@@ -4718,8 +5578,6 @@ def require_matching_resume_files(working_directory_path: str,
     if not os.path.isfile(checkpoint_path):
         raise ValueError(f"Checkpoint file '{checkpoint_file_name}' does not exist.")
     return run_input_file_name, checkpoint_file_name
-
-LIGAND_RESNAME: str = "LIG"
 
 # gmx_MMPBSA runs in the job directory, because a topology's #include lines only
 # resolve beside it, and leaves dozens of these behind. They are working files,
